@@ -4,13 +4,12 @@ from .problemBase import problemBase
 
 import numpy as np
 
-
+# this class is for tip cantilever beam with 30x20x20 elements and mid load. The load is applied at the middle of the tip of the cantilever beam. The fixed boundary condition is applied at the left end of the beam. The material properties are defined as follows: Young's modulus E = 1.0, Poisson's ratio nu = 0.3, and penalization factor penal = 3. The mesh is defined as a grid with element size of 1.0 in all directions. The problem is defined in 3D space with 3 degrees of freedom per node.
 class TipCantilever_30_20_20_midLoad(problemBase):
     problemName = 'TipCantilever_30_20_20_midLoad'
 
     def __init__(self):
         super().__init__()
-        self.name = 'TipCantilever_30_20_20_midLoad'
         self.mesh, self.boundaryCondition, self.materialProperty = self.mbbSettings()
 
 
@@ -39,8 +38,10 @@ class TipCantilever_30_20_20_midLoad(problemBase):
         physics = 'Structural'
 
         ndof = 3 * (nelx + 1) * (nely + 1) * (nelz + 1)
-        dofs = np.arange(ndof)
+        # this line gets the coordinates of the nodes in the mesh. The mesh is defined as a grid with element size of 1.0 in all directions. The coordinates are stored in a 2D array where each row corresponds to a node and the columns correspond to the x, y, and z coordinates of the node.
         [il, jl, kl] = np.meshgrid(nelx, 0, np.arange(0, nelz + 1))
+        #the code above, gets the node id of the node where the load is applied. The load is applied at the middle of the tip of the cantilever beam. The node id is calculated based 
+        # on the element size and the number of elements in each direction. The node id is then used to determine the degree of freedom (DOF) indices for applying the load in the finite element analysis.
         # form matlab index to python index
         force_nid = kl * (nelx + 1) * (nely + 1) + il * (nely + 1) + (nely + 1 - jl) - 1 - 10
         force_dof = 3 * force_nid.flatten() + 1

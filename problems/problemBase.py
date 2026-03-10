@@ -4,7 +4,8 @@ import numpy as np
 from scipy.io import loadmat
 import inspect
 
-
+#this class is the base class for all problems. It defines the interface and common properties for all problems. 
+# Each problem should inherit from this class and implement the necessary methods and properties.
 class problemBase(ABC):
     def __init__(self):
         self.name = self.__class__.__name__

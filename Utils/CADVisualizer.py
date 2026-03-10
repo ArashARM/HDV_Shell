@@ -5,7 +5,6 @@ try:
     pv.set_jupyter_backend("trame")
 except Exception:
     pass
-
 class CADVisualizer:
     """
     Visualization utilities for shell meshes, boundary conditions,

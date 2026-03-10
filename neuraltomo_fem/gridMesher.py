@@ -9,7 +9,8 @@ class GridMesh:
     def __init__(self, problem):
         self.mesh = problem.mesh
         self.initMesh()
-
+        
+        # if bc is not None, then initialize the boundary condition
         if (problem.boundaryCondition != None):
             self.bc = problem.boundaryCondition
             self.initBC()
@@ -19,6 +20,18 @@ class GridMesh:
             self.init_B_C()
 
     # -----------------------#
+    # This function initializes the mesh by calculating and eturning:
+    # 1)self.nelx, self.nely, self.nelz: number of elements in x, y, z directions
+    # 2)self.elemSize: size of each element in x, y, z directions
+    # 3)self.numElems: total number of elements
+    # 4)self.numNodes: total number of nodes
+    # 5)self.elemNodes: (numElems, 8) array of node indices for each element
+    # 6)self.elemArea: (numElems,) array of area for each element
+    # 7)self.netArea: total area of the mesh
+    # 8)self.nodeXYZ: (numNodes, 3) array of x, y, z coordinates for each node
+    # 9)self.elemCenters: (numElems, 3) array of x, y, z coordinates for the center of each element 
+    # 10)self.elemCentersUpSampling: (numElems*8, 3) array of x, y, z coordinates for the center of each sub-element (for upsampling)
+    # 11)self.bb_xmin, self.bb_xmax, self.bb_ymin, self.bb_ymax, self.bb_zmin, self.bb_zmax: bounding box of the mesh in x, y, z directions
     def initMesh(self):
         self.nelx = self.mesh['nelx']
         self.nely = self.mesh['nely']
@@ -66,6 +79,14 @@ class GridMesh:
         self.bb_zmin, self.bb_zmax = 0, self.nelz * self.elemSize[2]
 
     # -----------------------#
+    # this function initializes the boundary condition by calculating and returning:
+    # 1)self.ndof: total number of degrees of freedom (DOF) in the system
+    # 2)self.fixed: array of fixed DOF indices
+    # 3)self.free: array of free DOF indices
+    # 4)self.f: (ndof, 1) array of external forces applied to the system
+    # 5)self.numDOFPerElem: number of DOF per element (for 8-node hexahedral elements with 3 DOF per node, this is 8*3=24)
+    # 6)self.edofMat: (numElems, numDOFPerElem) array of DOF indices for each element (used for assembling the global stiffness matrix)
+    # 7)self.iK, self.jK: (numElems*numDOFPerElem**2,) arrays of row and column indices for assembling the global stiffness matrix in COO format
     def initBC(self):
         self.ndof = self.bc['numDOFPerNode'] * self.numNodes
         self.fixed = self.bc['fixed']

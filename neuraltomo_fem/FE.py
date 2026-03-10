@@ -8,8 +8,8 @@ from scipy.sparse.linalg import spsolve
 import torch
 from neuraltomo_fem.gridMesher import GridMesh
 
-from neuraltomo_fem.Km2Compliance import *
 
+from neuraltomo_fem.Km2Compliance import *
 #from anisotropicFE import angle2Ke
 from neuraltomo_fem.anisotropicFE_new import H8_anisotropic_K
 # from quadMesher import QuadMesh
@@ -19,6 +19,7 @@ class FE:
     # -----------------------#
     def __init__(self, problem, device='cuda'):
         if problem.mesh['type'] == 'grid':
+            #returns: 1) edofMat: (numElems, numDOFPerElem) 2) iK, jK: (numElems*numDOFPerElem**2,) 3) KE: (numDOFPerElem, numDOFPerElem) 4) f: (ndof, 1)
             self.mesh = GridMesh(problem)
         # elif(mesh['type'] == 'quad'):
         #    self.mesh = QuadMesh(mesh, matProp, bc)
@@ -29,7 +30,21 @@ class FE:
         else:
             self.H8 = H8_anisotropic_K(device, **problem.materialProperty.__dict__)
 
+    # This function precomputes the indices for assembling the global stiffness matrix K from the element stiffness matrices. 
+    # It also prepares the force vector f for the free degrees of freedom. 
+    # The indices are filtered to exclude fixed degrees of freedom, and a mapping is created to convert global DOF indices to the reduced system indices used in the linear solve.
     def init_Matrix_idx(self, device):
+        """
+        Precompute matrix assembly indices for a structured 3D hexahedral mesh.
+
+        Creates:
+        self.edofMat : (nele, 24) tensor
+            Global DOF indices for each element (8 nodes * 3 dof/node)
+        self.iK : (nele*24*24,) tensor
+            Row indices for sparse stiffness assembly
+        self.jK : (nele*24*24,) tensor
+            Column indices for sparse stiffness assembly
+        """
         self.Ksize = self.mesh.ndof - self.mesh.fixed.flatten().shape[0]
         row_indices_np = self.mesh.iK  # NumPy array of row indices
         col_indices_np = self.mesh.jK  # NumPy array of column indices'
@@ -88,6 +103,8 @@ class FE:
             T = self.H8.T
 
         #i = self.sparseKIdx
+        # selects only the valid entries of sK that correspond to the free DOFs, effectively removing contributions from fixed DOFs.
+        #  This is crucial for correctly assembling the reduced stiffness matrix used in the linear solve.
         d = sK[self.valid_mask]
 
         f = self.mesh.f[self.mesh.free, 0]
