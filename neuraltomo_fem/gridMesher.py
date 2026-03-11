@@ -6,6 +6,7 @@ import matplotlib.pyplot as plt
 import pyvista as pv
 
 class GridMesh:
+    
     def __init__(self, problem):
         self.mesh = problem.mesh
         self.initMesh()
