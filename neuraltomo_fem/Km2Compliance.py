@@ -22,7 +22,7 @@ from scipy.sparse import csc_matrix, eye
 # particularly those involving symmetric positive-definite matrices.
 from sksparse.cholmod import cholesky
 mkl.set_num_threads(16)
-useMKL = True
+useMKL = False
 
 class Sk2Complicance(torch.autograd.Function):
     @staticmethod

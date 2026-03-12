@@ -353,6 +353,10 @@ class VoronoiDecoder(nn.Module):
         """
         return lo + (hi - lo) * torch.sigmoid(x_raw / temp)
 
+    def map_to_3d(self,t_uv, Xu, Xv, eps=1e-8):
+        # t_uv: (N,2), Xu/Xv: (N,3)
+        T = t_uv[:, 0:1] * Xu + t_uv[:, 1:2] * Xv
+        return F.normalize(T, eps=eps)
     def _pair_gated_Q(
         self,
         w_soft: torch.Tensor,             # (N,S)
@@ -405,15 +409,15 @@ class VoronoiDecoder(nn.Module):
     def forward(
         self,
         points_uv: torch.Tensor,
+        Xu: torch.Tensor,
+        Xv: torch.Tensor,
         tau: float,
-        *,
         seeds_raw: torch.Tensor,
         w_raw: torch.Tensor,
         h_raw: torch.Tensor,
         theta: torch.Tensor | None = None,
         a_raw: torch.Tensor | None = None,
         points_face_id: torch.Tensor | None = None,
-        # new optional raw gate controls (if not provided, defaults are used)
         gap_thr_raw: torch.Tensor | None = None,
         big_thr_raw: torch.Tensor | None = None,
         alpha_raw: torch.Tensor | None = None,
@@ -508,6 +512,7 @@ class VoronoiDecoder(nn.Module):
 
         # fiber
         t_uv_raw = self._blended_uv_fiber(w_soft, seeds)  # (N,2)
+        fiber3d = self.map_to_3d(t_uv_raw, Xu=Xu, Xv=Xv)  # (N,3)
         rho0, gamma = 0.5, 0.05
         m = torch.sigmoid((rho - rho0) / gamma).unsqueeze(1)  # (N,1)
         t_uv = t_uv_raw * m
@@ -515,4 +520,4 @@ class VoronoiDecoder(nn.Module):
         # height
         h = self.height(h_raw)  # scalar tensor
 
-        return w_soft, d, M, seeds, rho, t_uv_raw, t_uv, h,Q_used
+        return w_soft, d, M, seeds, rho, t_uv_raw, t_uv, h,Q_used,fiber3d

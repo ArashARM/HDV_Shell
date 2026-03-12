@@ -345,3 +345,23 @@ class CADVisualizer:
 
         pl.show()
         return solid, float(thr), pl
+    
+    def visualize_show_Model(
+        cls,
+        points,
+        pv_faces,
+    ):
+        P = cls.to_numpy(points).astype(np.float32)
+
+        F_in = cls.to_numpy(pv_faces)
+        if F_in.ndim == 2 and F_in.shape[1] == 3:
+            F = F_in.astype(np.int64)
+            faces_pv = np.hstack([np.full((F.shape[0], 1), 3, dtype=np.int64), F]).ravel()
+        else:
+            faces_pv = F_in.astype(np.int64).ravel()
+
+        mesh = pv.PolyData(P, faces_pv)
+        pl = pv.Plotter()
+        pl.add_mesh(mesh, opacity=1.0, show_edges=True)
+        pl.show_axes()
+        pl.show()

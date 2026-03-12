@@ -19,11 +19,13 @@ class FE:
     # -----------------------#
     def __init__(self, problem, device='cuda'):
         if problem.mesh['type'] == 'grid':
-            #returns: 1) edofMat: (numElems, numDOFPerElem) 2) iK, jK: (numElems*numDOFPerElem**2,) 3) KE: (numDOFPerElem, numDOFPerElem) 4) f: (ndof, 1)
+
+
             self.mesh = GridMesh(problem)
         # elif(mesh['type'] == 'quad'):
         #    self.mesh = QuadMesh(mesh, matProp, bc)
         self.init_Matrix_idx(device)
+
 
         if type(problem.materialProperty) is dict:
             self.H8 = H8_anisotropic_K(device, **problem.materialProperty)

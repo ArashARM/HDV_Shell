@@ -18,6 +18,8 @@ from OCC.Core.Poly import Poly_Triangle
 from OCC.Core.gp import gp_Pnt, gp_Pnt2d
 from OCC.Core.GeomLProp import GeomLProp_SLProps
 from OCC.Core.BRepClass import BRepClass_FaceClassifier
+from OCC.Core.BRepBndLib import brepbndlib
+from OCC.Core.Bnd import Bnd_Box
 
 
 class CADTensorGenerator:
@@ -437,6 +439,8 @@ class CADTensorGenerator:
                     and Gn > 0.0
                 )
 
+                bbox =self.face_bounding_box(face)
+
                 mesh_rows.append({
                     "face_id": int(face_id),
                     "lvid": int(lvid),
@@ -459,6 +463,13 @@ class CADTensorGenerator:
                     "G": float(Gn),
                     "det": float(det),
                     "metric_valid": metric_valid,
+                    "bbox_xmin": bbox["xmin"],
+                    "bbox_ymin": bbox["ymin"],
+                    "bbox_zmin": bbox["zmin"],
+                    "bbox_xmax": bbox["xmax"],
+                    "bbox_ymax": bbox["ymax"],
+                    "bbox_zmax": bbox["zmax"],
+
                 })
 
             for f in F_idx:
@@ -681,6 +692,29 @@ class CADTensorGenerator:
             device=self.device,
         )
 
+        # -------------------------------------------------------------------------
+        # Build per-face bounding-box dictionary: BBX[face_id] = {...}
+        # Expected columns in mesh_df:
+        # x, y, z, face_id
+        # -------------------------------------------------------------------------
+        BBX = {}
+        for fid, grp in mesh_df_ord.groupby("face_id", sort=True):
+            xmin = float(grp["x"].min())
+            xmax = float(grp["x"].max())
+            ymin = float(grp["y"].min())
+            ymax = float(grp["y"].max())
+            zmin = float(grp["z"].min())
+            zmax = float(grp["z"].max())
+
+            BBX[int(fid)] = {
+                "xmin": xmin,
+                "xmax": xmax,
+                "ymin": ymin,
+                "ymax": ymax,
+                "zmin": zmin,
+                "zmax": zmax,
+            }
+
         print("MinVolFrac:", min_vol_frac)
         print("uv device:", uv.device)
 
@@ -696,6 +730,7 @@ class CADTensorGenerator:
             "boundary_idx_ring1": boundary_idx_ring1,
             "boundary_idx_ring2": boundary_idx_ring2,
             "min_vol_frac": min_vol_frac,
+            "BBX": BBX,
         }
 
     def generate_from_file(self, shape_path: str, input_ring: int, visualize: bool = False, visualize_face_id: int | None = None):
@@ -880,3 +915,33 @@ class CADTensorGenerator:
         A_v.index_add_(0, tri[:, 1], a)
         A_v.index_add_(0, tri[:, 2], a)
         return A_v
+    @staticmethod
+    def face_bounding_box(face, use_triangulation: bool = True):
+        """
+        Compute axis-aligned 3D bounding box of a face.
+
+        Returns:
+            {
+                "xmin": ...,
+                "xmax": ...,
+                "ymin": ...,
+                "ymax": ...,
+                "zmin": ...,
+                "zmax": ...,
+            }
+        """
+        box = Bnd_Box()
+        brepbndlib.Add(face, box, use_triangulation)
+
+        if box.IsVoid():
+            raise RuntimeError("Bounding box is void.")
+
+        xmin, ymin, zmin, xmax, ymax, zmax = box.Get()
+        return {
+            "xmin": float(xmin),
+            "xmax": float(xmax),
+            "ymin": float(ymin),
+            "ymax": float(ymax),
+            "zmin": float(zmin),
+            "zmax": float(zmax),
+        }
