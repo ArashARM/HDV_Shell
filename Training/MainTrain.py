@@ -12,16 +12,22 @@ class TrainingConfig:
     seed_repulsion_sigma: float = 0.08
     boundary_margin: float = 0.05
 
+    w_min:float = 0.005,
+    w_max: float = 0.5,
 
-    # only 4 outer weights
+    # outer weights
     lam_fem: float = 1.0
     lam_vol: float = 2.0
     lam_rep: float = 0.5
     lam_bnd: float = 0.5
 
-    # best model selection
-    lam_best_vol: float = 5.0
-    lam_best_fem: float = 0.0
+    # optional strutness loss
+    lam_strut: float = 0.0
+    lam_strut_edge: float = 1.0
+    lam_strut_void: float = 0.25
+    strut_edge_power: float = 1.0
+    strut_void_power: float = 1.0
+    strut_void_from_one_minus_edge: bool = True
 
     # FEM scaling
     comp_normalize_by: float | None = 1e10
@@ -39,7 +45,7 @@ class TrainingConfig:
     tau: float = 0.02
     beta: float = 0.05
 
-    lr_seed_refine: float = 2e-4
+    lr_seed_refine: float = 1e-1
     lr_delta_head: float = 2e-4
     lr_mlp: float = 2e-4
     lr_w_head: float = 2e-4
@@ -137,21 +143,10 @@ class NN_Trainer:
         margin: float = 0.05,
         eps: float = 1e-12,
     ) -> torch.Tensor:
-        """
-        Penalize seeds that get too close to the *actual trimmed face boundary*.
-
-        boundary_uv:
-            [Nb, 2] UV samples from the triangulated face boundary.
-            If the face has no open boundary (e.g. effectively closed in the
-            optimization domain), return zero penalty.
-        """
         if boundary_uv is None or boundary_uv.numel() == 0:
             return torch.zeros((), dtype=seeds.dtype, device=seeds.device)
 
-        # Distance from each seed to the nearest boundary sample
         dmin = torch.cdist(seeds, boundary_uv).amin(dim=1)
-
-        # Smooth penalty: large near boundary, decays away from it
         penalty = torch.exp(-dmin / (margin + eps))
 
         if gates is None:
@@ -159,6 +154,7 @@ class NN_Trainer:
 
         g = gates.view(-1)
         return (g * penalty).sum() / (g.sum() + eps)
+
     @staticmethod
     def compliance_loss(
         comp: torch.Tensor,
@@ -169,6 +165,41 @@ class NN_Trainer:
         if normalize_by is not None:
             return comp / (float(normalize_by) + eps)
         return comp
+
+    @staticmethod
+    def strutness_loss(
+        rho: torch.Tensor,
+        pair_strength: torch.Tensor,
+        pair_relevance: torch.Tensor | None = None,
+        lam_edge: float = 1.0,
+        lam_void: float = 0.25,
+        edge_power: float = 1.0,
+        void_power: float = 1.0,
+        void_from_one_minus_edge: bool = True,
+        eps: float = 1e-12,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        edge_mask = pair_strength.sum(dim=(1, 2)).clamp(0.0, 1.0)
+
+        if edge_power != 1.0:
+            edge_mask = edge_mask.pow(edge_power)
+
+        if void_from_one_minus_edge:
+            void_mask = (1.0 - edge_mask).clamp(0.0, 1.0)
+        else:
+            if pair_relevance is None:
+                void_mask = (1.0 - edge_mask).clamp(0.0, 1.0)
+            else:
+                rel = pair_relevance.sum(dim=(1, 2)).clamp(0.0, 1.0)
+                void_mask = (1.0 - rel).clamp(0.0, 1.0)
+
+        if void_power != 1.0:
+            void_mask = void_mask.pow(void_power)
+
+        loss_edge = ((1.0 - rho).pow(2) * edge_mask).sum() / (edge_mask.sum() + eps)
+        loss_void = (rho.pow(2) * void_mask).sum() / (void_mask.sum() + eps)
+
+        total_strut = lam_edge * loss_edge + lam_void * loss_void
+        return total_strut, loss_edge, loss_void, edge_mask
 
     @staticmethod
     def _scalar_tensor_is_finite(x: torch.Tensor) -> bool:
@@ -217,7 +248,6 @@ class NN_Trainer:
             "density_shape": tuple(density.shape),
             "phi_shape": tuple(phi.shape),
             "theta_shape": tuple(theta.shape),
-
             "density_floor": float(density_floor),
             "density_raw_min": float(density_raw.min().detach().item()),
             "density_raw_mean": float(density_raw.mean().detach().item()),
@@ -225,18 +255,15 @@ class NN_Trainer:
             "density_min": float(density.min().detach().item()),
             "density_mean": float(density.mean().detach().item()),
             "density_max": float(density.max().detach().item()),
-
             "phi_has_nan": bool(torch.isnan(phi).any().detach().item()),
             "phi_has_inf": bool(torch.isinf(phi).any().detach().item()),
             "theta_has_nan": bool(torch.isnan(theta).any().detach().item()),
             "theta_has_inf": bool(torch.isinf(theta).any().detach().item()),
-
             "fiber_has_nan": bool(torch.isnan(fiber_surface).any().detach().item()),
             "fiber_has_inf": bool(torch.isinf(fiber_surface).any().detach().item()),
             "fiber_norm_min": float(fiber_norm.min().detach().item()),
             "fiber_norm_mean": float(fiber_norm.mean().detach().item()),
             "fiber_norm_max": float(fiber_norm.max().detach().item()),
-
             "void_fraction_lt_1e_2_raw": float((density_raw < 1e-2).float().mean().detach().item()),
             "void_fraction_lt_5e_2_raw": float((density_raw < 5e-2).float().mean().detach().item()),
             "void_fraction_lt_floor_raw": float((density_raw < density_floor).float().mean().detach().item()),
@@ -249,7 +276,6 @@ class NN_Trainer:
         ):
             reason = "Invalid phi/theta/fiber fields before FEM solve"
             self._record_invalid_fem_debug(debug, reason, save_debug_history)
-
             nan_scalar = torch.full((), float("nan"), dtype=dtype, device=device)
             return {
                 "fem_total": nan_scalar,
@@ -264,7 +290,6 @@ class NN_Trainer:
         except Exception as e:
             reason = f"FEM solve raised exception: {repr(e)}"
             self._record_invalid_fem_debug(debug, reason, save_debug_history)
-
             nan_scalar = torch.full((), float("nan"), dtype=dtype, device=device)
             return {
                 "fem_total": nan_scalar,
@@ -282,7 +307,6 @@ class NN_Trainer:
         if not debug["comp_is_finite"]:
             reason = "Non-finite compliance returned by FEM solve"
             self._record_invalid_fem_debug(debug, reason, save_debug_history)
-
             nan_scalar = torch.full((), float("nan"), dtype=dtype, device=device)
             return {
                 "fem_total": nan_scalar,
@@ -330,18 +354,21 @@ class NN_Trainer:
         boundary_uv: torch.Tensor | None = None,
         fiber_surface: torch.Tensor | None = None,
         gates: torch.Tensor | None = None,
+        pair_strength: torch.Tensor | None = None,
+        pair_relevance: torch.Tensor | None = None,
         w_vol: float = 1.0,
         w_seed: float = 1.0,
         w_boundary: float = 1.0,
+        w_strut: float = 0.0,
         w_fem: float = 0.0,
         comp_normalize_by: float | None = None,
         density_floor: float = 0.02,
         eps: float = 1e-12,
         save_debug_history: bool = True,
     ) -> dict:
-        
-        sigma= self.cfg.seed_repulsion_sigma
-        margin= self.cfg.boundary_margin
+        sigma = self.cfg.seed_repulsion_sigma
+        margin = self.cfg.boundary_margin
+
         loss_vol = self.volume_loss_constant_height(
             rho=rho,
             A_v=A_v,
@@ -364,10 +391,28 @@ class NN_Trainer:
             eps=eps,
         )
 
+        loss_strut = torch.zeros((), dtype=rho.dtype, device=rho.device)
+        loss_strut_edge = torch.zeros((), dtype=rho.dtype, device=rho.device)
+        loss_strut_void = torch.zeros((), dtype=rho.dtype, device=rho.device)
+
+        if (w_strut != 0.0) and (pair_strength is not None):
+            loss_strut, loss_strut_edge, loss_strut_void, _ = self.strutness_loss(
+                rho=rho,
+                pair_strength=pair_strength,
+                pair_relevance=pair_relevance,
+                lam_edge=self.cfg.lam_strut_edge,
+                lam_void=self.cfg.lam_strut_void,
+                edge_power=self.cfg.strut_edge_power,
+                void_power=self.cfg.strut_void_power,
+                void_from_one_minus_edge=self.cfg.strut_void_from_one_minus_edge,
+                eps=eps,
+            )
+
         total = (
-            w_vol * loss_vol
-            + w_seed * loss_seed
-            + w_boundary * loss_boundary
+            w_vol * loss_vol +
+            w_seed * loss_seed +
+            w_boundary * loss_boundary +
+            w_strut * loss_strut
         )
 
         fem_out = {
@@ -399,6 +444,9 @@ class NN_Trainer:
             "volume": loss_vol,
             "seed_repulsion": loss_seed,
             "boundary_repulsion": loss_boundary,
+            "strut": loss_strut,
+            "strut_edge": loss_strut_edge,
+            "strut_void": loss_strut_void,
             "fem_total": fem_out["fem_total"],
             "comp": fem_out["comp"],
             "compliance_loss": fem_out["compliance_loss"],
@@ -431,13 +479,17 @@ class NN_Trainer:
             face_u_periodic=face_u_periodic,
             face_v_periodic=face_v_periodic,
             use_anisotropy=use_anisotropy,
-            fixed_height=getattr(self.cfg.fixed_height, "thickness", None),
+            w_min= self.cfg.w_min,
+            w_max= self.cfg.w_max,
+            fixed_height=self.cfg.fixed_height,
         ).to(device)
 
         ppnet = self.ppnet_cls(
             context_dim=context_vector_size,
             n_seeds=seed_number,
             use_anisotropy=use_anisotropy,
+            predict_height=(self.cfg.fixed_height is None),
+            use_gating=False,
         ).to(device)
 
         return decoder, ppnet
@@ -469,12 +521,12 @@ class NN_Trainer:
         for ppnet in ppnets:
             param_groups.extend([
                 {"params": ppnet.seed_refine.parameters(), "lr": cfg.lr_seed_refine},
-                {"params": ppnet.delta_head.parameters(),  "lr": cfg.lr_delta_head},
-                {"params": ppnet.mlp.parameters(),         "lr": cfg.lr_mlp},
-                {"params": ppnet.w_head.parameters(),      "lr": cfg.lr_w_head},
+                {"params": ppnet.delta_head.parameters(), "lr": cfg.lr_delta_head},
+                {"params": ppnet.mlp.parameters(), "lr": cfg.lr_mlp},
+                {"params": ppnet.w_head.parameters(), "lr": cfg.lr_w_head},
             ])
 
-            fixed_height = getattr(self.cfg.fixed_height, "thickness", None)
+            fixed_height = self.cfg.fixed_height
             if (fixed_height is None) and hasattr(ppnet, "h_head"):
                 param_groups.append({"params": ppnet.h_head.parameters(), "lr": cfg.lr_h_head})
 
@@ -516,7 +568,7 @@ class NN_Trainer:
 
         import numpy as np
         return np.concatenate(xyz_parts, axis=0)
-  
+
     def _finite_or_default(self, x: torch.Tensor, default: float = float("nan")) -> float:
         if self._scalar_tensor_is_finite(x):
             return float(x.detach().item())
@@ -560,6 +612,7 @@ class NN_Trainer:
                 "faces_ijk": faces_ijk,
                 "face_areas": face_areas,
                 "boundary_idx_ring1": boundary_idx_ring1,
+                "boundary_idx": boundary_idx_ring1,
                 "u_periodic": False,
                 "v_periodic": False,
                 "global_vertex_idx": torch.arange(vertices_number, device=device, dtype=torch.long),
@@ -579,9 +632,13 @@ class NN_Trainer:
         norm_vol = RunningNorm()
         norm_rep = RunningNorm()
         norm_bnd = RunningNorm()
+        norm_strut = RunningNorm()
         norm_fem = RunningNorm()
 
         best_score = float("inf")
+        best_vol_frac = float("inf")
+        best_comp = float("inf")
+        best_w_geo = float("inf")
         best_step = -1
         best_rho = None
         best_seeds = None
@@ -610,12 +667,17 @@ class NN_Trainer:
             rep_terms = []
             bnd_terms = []
 
+            strut_terms = []
+            strut_edge_terms = []
+            strut_void_terms = []
+            w_geo_terms = []
+
             for ft, decoder, ppnet, uv_init_i, context_i in zip(face_tensors, decoders, ppnets, uv_init_list, contexts):
-                pred_i = ppnet(context_i, uv_init_i, offset_scale=1, clamp01=True)
+                pred_i = ppnet(context_i, uv_init_i, offset_scale=1)
 
                 seeds_raw_i = pred_i["seeds_raw"][0]
                 w_raw_i = pred_i["w_raw"][0]
-                fixed_height = getattr(self.cfg.fixed_height, "thickness", None)
+                fixed_height = self.cfg.fixed_height
                 h_raw_i = None if fixed_height is not None else pred_i["h_raw"][0]
                 gates_i = pred_i.get("gate_probs", None)
                 gates_i = gates_i[0] if gates_i is not None else None
@@ -629,7 +691,7 @@ class NN_Trainer:
                     device=device,
                 )
 
-                _, _, _, seeds_i, rho_i, _, _, _, _, fiber3d_i = decoder(
+                decoder_out = decoder(
                     points_uv=ft["uv"],
                     Xu=ft["Xu"],
                     Xv=ft["Xv"],
@@ -642,6 +704,28 @@ class NN_Trainer:
                     points_face_id=local_face_id,
                 )
 
+                if len(decoder_out) == 13:
+                    (
+                        _w_soft_i,
+                        _d_i,
+                        _M_i,
+                        seeds_i,
+                        rho_i,
+                        _t_uv_raw_i,
+                        _t_uv_i,
+                        _h_i,
+                        w_geo_i,
+                        fiber3d_i,
+                        pair_strength_i,
+                        _band_ij_i,
+                        pair_relevance_i,
+                    ) = decoder_out
+                else:
+                    raise ValueError(
+                        "Decoder output does not match expected new signature with "
+                        "(..., w_geo, fiber3d, pair_strength, band_ij, pair_relevance)."
+                    )
+
                 gidx = ft["global_vertex_idx"]
                 rho[gidx] = rho_i
                 fiber_surface[gidx] = fiber3d_i
@@ -653,29 +737,49 @@ class NN_Trainer:
                     "w_raw": w_raw_i,
                     "h_raw": None if h_raw_i is None else h_raw_i,
                     "gates": None if gates_i is None else gates_i,
+                    "w_geo": w_geo_i.detach().clone(),
                 })
 
                 rep_terms.append(
                     self.seed_repulsion_term(
                         seeds=seeds_i,
                         gates=gates_i,
-                        sigma=0.08,
+                        sigma=cfg.seed_repulsion_sigma,
                         eps=cfg.eps,
                     )
                 )
+
                 boundary_uv_i = None
-                if ("boundary_idx" in ft) and (ft["boundary_idx"] is not None) and (ft["boundary_idx"].numel() > 0):
-                    boundary_uv_i = ft["uv"][ft["boundary_idx"]]
+                if ("boundary_idx_ring1" in ft) and ft["boundary_idx_ring1"] is not None and ft["boundary_idx_ring1"].numel() > 0:
+                    boundary_uv_i = ft["uv"][ft["boundary_idx_ring1"]]
 
                 bnd_terms.append(
                     self.boundary_repulsion_term(
                         seeds=seeds_i,
                         boundary_uv=boundary_uv_i,
                         gates=gates_i,
-                        margin=0.05,
+                        margin=cfg.boundary_margin,
                         eps=cfg.eps,
                     )
                 )
+
+                w_geo_terms.append(w_geo_i.reshape(()))
+
+                if cfg.lam_strut != 0.0:
+                    loss_strut_i, loss_strut_edge_i, loss_strut_void_i, _edge_mask_i = self.strutness_loss(
+                        rho=rho_i,
+                        pair_strength=pair_strength_i,
+                        pair_relevance=pair_relevance_i,
+                        lam_edge=cfg.lam_strut_edge,
+                        lam_void=cfg.lam_strut_void,
+                        edge_power=cfg.strut_edge_power,
+                        void_power=cfg.strut_void_power,
+                        void_from_one_minus_edge=cfg.strut_void_from_one_minus_edge,
+                        eps=cfg.eps,
+                    )
+                    strut_terms.append(loss_strut_i)
+                    strut_edge_terms.append(loss_strut_edge_i)
+                    strut_void_terms.append(loss_strut_void_i)
 
             loss_vol = self.volume_loss_constant_height(
                 rho=rho,
@@ -686,6 +790,10 @@ class NN_Trainer:
 
             loss_rep = torch.stack(rep_terms).mean() if len(rep_terms) else torch.zeros((), dtype=dtype, device=device)
             loss_bnd = torch.stack(bnd_terms).mean() if len(bnd_terms) else torch.zeros((), dtype=dtype, device=device)
+            loss_strut = torch.stack(strut_terms).mean() if len(strut_terms) else torch.zeros((), dtype=dtype, device=device)
+            loss_strut_edge = torch.stack(strut_edge_terms).mean() if len(strut_edge_terms) else torch.zeros((), dtype=dtype, device=device)
+            loss_strut_void = torch.stack(strut_void_terms).mean() if len(strut_void_terms) else torch.zeros((), dtype=dtype, device=device)
+            w_geo_mean = torch.stack(w_geo_terms).mean() if len(w_geo_terms) else torch.zeros((), dtype=dtype, device=device)
 
             fem_out = {
                 "fem_total": torch.zeros((), dtype=dtype, device=device),
@@ -711,26 +819,23 @@ class NN_Trainer:
             fem_is_valid = bool(fem_out["fem_valid"])
             fem_failure_reason = fem_out["failure_reason"]
 
-
-
-
             if cfg.normalize_losses:
                 n_vol = norm_vol.update(loss_vol.detach().item())
                 n_rep = norm_rep.update(loss_rep.detach().item())
                 n_bnd = norm_bnd.update(loss_bnd.detach().item())
-                n_fem = (
-                    norm_fem.update(loss_fem.detach().item())
-                    if (cfg.lam_fem != 0.0 and fem_is_valid)
-                    else 1.0
-                )
+                n_strut = norm_strut.update(loss_strut.detach().item()) if cfg.lam_strut != 0.0 else 1.0
+                n_fem = norm_fem.update(loss_fem.detach().item()) if (cfg.lam_fem != 0.0 and fem_is_valid) else 1.0
             else:
-                n_vol = n_rep = n_bnd = n_fem = 1.0
+                n_vol = n_rep = n_bnd = n_strut = n_fem = 1.0
 
             L_total = (
                 cfg.lam_vol * (loss_vol / n_vol) +
                 cfg.lam_rep * (loss_rep / n_rep) +
                 cfg.lam_bnd * (loss_bnd / n_bnd)
             )
+
+            if cfg.lam_strut != 0.0:
+                L_total = L_total + cfg.lam_strut * (loss_strut / n_strut)
 
             if cfg.lam_fem != 0.0:
                 if fem_is_valid:
@@ -741,6 +846,7 @@ class NN_Trainer:
             total_is_finite = self._scalar_tensor_is_finite(L_total)
 
             if total_is_finite:
+                opt.zero_grad(set_to_none=True)
                 L_total.backward()
                 opt.step()
             else:
@@ -749,23 +855,14 @@ class NN_Trainer:
             with torch.no_grad():
                 vol_frac = (rho * A_v).sum() / (A_v.sum() + cfg.eps)
                 vol_dev = torch.abs(vol_frac - cfg.target_volfrac)
-
-                score_fem_term = (
-                    cfg.lam_best_fem * float(loss_fem.detach().item())
-                    if fem_is_valid and self._scalar_tensor_is_finite(loss_fem)
-                    else 0.0
-                )
-
-                # score = float(
-                #     (float(L_total.detach().item()) if total_is_finite else float("inf"))
-                #     + cfg.lam_best_vol * vol_dev.detach().item()
-                #     + score_fem_term
-                # )
                 score = float(L_total.detach().item()) if total_is_finite else float("inf")
 
                 if score < (best_score - cfg.min_delta):
                     best_score = score
                     best_step = step
+                    best_vol_frac = float(vol_frac.detach().item())
+                    best_comp = float(comp_val.detach().item()) 
+                    best_w_geo = float(w_geo_mean.detach().item())
                     best_rho = rho.detach().clone()
                     best_seeds = [s.detach().clone() for s in seeds_list]
                     best_pred = [
@@ -775,6 +872,7 @@ class NN_Trainer:
                             "w_raw": p["w_raw"].detach().clone(),
                             "h_raw": None if p["h_raw"] is None else p["h_raw"].detach().clone(),
                             "gates": None if p["gates"] is None else p["gates"].detach().clone(),
+                            "w_geo": p["w_geo"].detach().clone(),
                         }
                         for p in pred_list
                     ]
@@ -796,10 +894,7 @@ class NN_Trainer:
                     seeds0 = [s.detach().clone() for s in seeds_list]
 
                 drho = float((rho - rho0).abs().mean().item())
-                dseed_terms = [
-                    float((s - s0).abs().mean().item())
-                    for s, s0 in zip(seeds_list, seeds0)
-                ]
+                dseed_terms = [float((s - s0).abs().mean().item()) for s, s0 in zip(seeds_list, seeds0)]
                 dseed = sum(dseed_terms) / max(len(dseed_terms), 1)
 
                 rho_min = float(rho.min().item())
@@ -821,6 +916,9 @@ class NN_Trainer:
                     "loss_vol": self._finite_or_default(loss_vol),
                     "loss_rep": self._finite_or_default(loss_rep),
                     "loss_bnd": self._finite_or_default(loss_bnd),
+                    "loss_strut": self._finite_or_default(loss_strut),
+                    "loss_strut_edge": self._finite_or_default(loss_strut_edge),
+                    "loss_strut_void": self._finite_or_default(loss_strut_void),
                     "loss_fem": self._finite_or_default(loss_fem),
                     "loss_comp": self._finite_or_default(loss_comp),
                     "comp": self._finite_or_default(comp_val),
@@ -837,6 +935,7 @@ class NN_Trainer:
                     "fem_valid": fem_is_valid,
                     "fem_failure_reason": fem_failure_reason,
                     "optimizer_step_skipped": not total_is_finite,
+                    "w_geo_mean": self._finite_or_default(w_geo_mean),
                 }
                 history.append(row)
 
@@ -849,21 +948,25 @@ class NN_Trainer:
                         f"[{step:05d}] "
                         f"L_total={row['L_total']:.4e} | "
                         f"L_vol={row['loss_vol']:.3e} "
+                        f"L_fem={row['loss_fem']:.3e} "
+                        f"L_strut={row['loss_strut']:.3e}  "
                         f"L_rep={row['loss_rep']:.3e} "
-                        f"L_bnd={row['loss_bnd']:.3e} "
-                        f"L_fem={row['loss_fem']:.3e} |"
+                        f"L_bnd={row['loss_bnd']:.3e} |"
+                        f"vol={row['vol_frac']:.3f} (/{cfg.target_volfrac:.3f}) "
                         f"comp={row['comp']:.3e} "
-                        f"vol={row['vol_frac']:.3f} (/{cfg.target_volfrac:.3f})"
+                        f"w={row['w_geo_mean']:.3e} | "
+                        f"Lse={row['loss_strut_edge']:.3e} "
+                        f"Lsv={row['loss_strut_void']:.3e} "
                         f"rho(min/mean/max)={rho_min:.3f}/{rho_mean:.3f}/{rho_max:.3f} | "
                         f"Δrho={drho:.2e} Δseed={dseed:.2e} grad_mean={g_mean:.2e} | "
                         f"fem={fem_status} | "
-                        f"best={best_score:.4e}@{best_step}"
+                        f"best={best_score:.4e}@{best_step} " 
                     )
 
                 if step >= cfg.early_stop_start and steps_since_improve >= cfg.patience:
                     print(
                         f"Early stopping at step {step} | "
-                        f"best_step={best_step} | best_score={best_score:.6f}"
+                        f"best_step={best_step} | best_score={best_score:.6f} "
                     )
                     break
 
@@ -882,7 +985,7 @@ class NN_Trainer:
                 mid_shape_density = final_shape_density.clone()
                 seed_points_mid = seed_points_final
 
-        print(f"FINAL RETURNED: best_step={best_step}, best_score={best_score:.6f}")
+        print(f"FINAL RETURNED: best_step={best_step}, best_score={best_score:.6f} | vol={best_vol_frac:.3e}, comp={best_comp:.3e}, w_geo={best_w_geo:.3e}")
 
         return {
             "decoders": decoders,
@@ -914,17 +1017,19 @@ class NN_Trainer:
     def visualize_result_stepwise(self, result, points_xyz, faces_ijk):
         pv_faces_fixed = self.generator.faces_ijk_to_pv_faces(faces_ijk)
 
+        density_init = result["Initial_shape_density"].detach().cpu().numpy()
+        density_mid = result["Mid_shape_density"].detach().cpu().numpy()
+        density_final = result["Final_shape_density"].detach().cpu().numpy()
+
         self.viz.plot_density_and_seedpoints_3stage_2(
             mesh_points=points_xyz.detach().cpu().numpy(),
             pv_faces=pv_faces_fixed,
-            density_init=result["Initial_shape_density"].detach().cpu().numpy(),
-            density_mid=result["Mid_shape_density"].detach().cpu().numpy(),
-            density_final=result["Final_shape_density"].detach().cpu().numpy(),
+            density_init=density_init,
+            density_mid=density_mid,
+            density_final=density_final,
             seed_points_init=result["seed_points_init"],
             seed_points_mid=result["seed_points_mid"],
             seed_points_final=result["seed_points_final"],
-            thr=0.5,
-            show_shell_background=True,
         )
 
     def visualize_result_final(self, result, points_xyz, faces_ijk, thr=0.5, show_solid=True):

@@ -93,7 +93,7 @@ class ThickenShell(problemBase):
         # Select nodes on the bottom and top of the voxelized shell to apply boundary conditions.
         # We define thin slabs near the minimum and maximum z of the padded bounding box.
         # Nodes within these slabs will be used for supports and loads.
-        tol = 1.5 * self.voxel_size
+        tol = 2 * self.voxel_size
 
         # Nodes belonging to voxels that are part of the shell (avoid selecting nodes in empty space)
         shell_nodes = self.occupied_node_ids()
