@@ -149,9 +149,15 @@ class VoronoiDecoder(nn.Module):
         T = self.raw_temp
         return self.w_min + (self.w_max - self.w_min) * torch.sigmoid(w_raw / T)
 
-    def height(self, h_raw: torch.Tensor) -> torch.Tensor:
+    def height(self, h_raw: torch.Tensor | None, ref_tensor: torch.Tensor | None = None) -> torch.Tensor:
         if self.fixed_height is not None:
-            return torch.tensor(float(self.fixed_height), device=h_raw.device, dtype=h_raw.dtype)
+            if ref_tensor is not None:
+                return torch.tensor(float(self.fixed_height), device=ref_tensor.device, dtype=ref_tensor.dtype)
+            if h_raw is not None:
+                return torch.tensor(float(self.fixed_height), device=h_raw.device, dtype=h_raw.dtype)
+            return torch.tensor(float(self.fixed_height))
+        if h_raw is None:
+            raise ValueError("h_raw must be provided when fixed_height is None")
         return self.h_min + (self.h_max - self.h_min) * torch.sigmoid(h_raw)
 
     def _soft_extrema_levels(self, Q: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -414,7 +420,7 @@ class VoronoiDecoder(nn.Module):
         tau: float,
         seeds_raw: torch.Tensor,
         w_raw: torch.Tensor,
-        h_raw: torch.Tensor,
+        h_raw: torch.Tensor | None,
         theta: torch.Tensor | None = None,
         a_raw: torch.Tensor | None = None,
         points_face_id: torch.Tensor | None = None,
@@ -518,6 +524,6 @@ class VoronoiDecoder(nn.Module):
         t_uv = t_uv_raw * m
 
         # height
-        h = self.height(h_raw)  # scalar tensor
+        h = self.height(h_raw, ref_tensor=points_uv)  # scalar tensor
 
         return w_soft, d, M, seeds, rho, t_uv_raw, t_uv, h,Q_used,fiber3d

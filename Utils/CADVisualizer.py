@@ -252,6 +252,100 @@ class CADVisualizer:
 
         pl.show()
         return pl
+    
+    @classmethod
+    def plot_density_and_seedpoints_3stage_2(
+        cls,
+        mesh_points,
+        pv_faces,
+        density_init,
+        density_mid,
+        density_final,
+        seed_points_init,
+        seed_points_mid,
+        seed_points_final,
+        window_size=(1600, 900),
+        point_size=5,
+        link_views=True,
+        thr=0.5,
+        show_shell_background=True,
+    ):
+        mesh_points = cls.to_numpy(mesh_points)
+        pv_faces = cls.to_numpy(pv_faces)
+
+        m0 = pv.PolyData(mesh_points, pv_faces)
+        m1 = pv.PolyData(mesh_points, pv_faces)
+        m2 = pv.PolyData(mesh_points, pv_faces)
+
+        d0 = np.asarray(density_init).reshape(-1)
+        d1 = np.asarray(density_mid).reshape(-1)
+        d2 = np.asarray(density_final).reshape(-1)
+
+        m0["density"] = d0
+        m1["density"] = d1
+        m2["density"] = d2
+
+        # Hard binary mask on points
+        m0["solid_mask"] = (d0 >= thr).astype(np.uint8)
+        m1["solid_mask"] = (d1 >= thr).astype(np.uint8)
+        m2["solid_mask"] = (d2 >= thr).astype(np.uint8)
+
+        # Keep only points/cells connected to solid_mask
+        s0 = m0.threshold(value=0.5, scalars="solid_mask")
+        s1 = m1.threshold(value=0.5, scalars="solid_mask")
+        s2 = m2.threshold(value=0.5, scalars="solid_mask")
+
+        pl = pv.Plotter(shape=(2, 3), window_size=window_size)
+
+        # --- top row: binary solids ---
+        pl.subplot(0, 0)
+        pl.add_text("Initial Density", font_size=12)
+        if show_shell_background:
+            pl.add_mesh(m0, color="lightgray", opacity=0.15)
+        if s0.n_points > 0:
+            pl.add_mesh(s0, color="gold", opacity=1.0)
+        pl.show_axes()
+
+        pl.subplot(0, 1)
+        pl.add_text("Middle Density", font_size=12)
+        if show_shell_background:
+            pl.add_mesh(m1, color="lightgray", opacity=0.15)
+        if s1.n_points > 0:
+            pl.add_mesh(s1, color="gold", opacity=1.0)
+        pl.show_axes()
+
+        pl.subplot(0, 2)
+        pl.add_text("Final Density", font_size=12)
+        if show_shell_background:
+            pl.add_mesh(m2, color="lightgray", opacity=0.15)
+        if s2.n_points > 0:
+            pl.add_mesh(s2, color="gold", opacity=1.0)
+        pl.show_axes()
+
+        # --- bottom row: seeds on shell ---
+        pl.subplot(1, 0)
+        pl.add_text("Initial Seeds", font_size=12)
+        pl.add_mesh(m0, color="lightgray", opacity=1.0)
+        pl.add_mesh(seed_points_init, render_points_as_spheres=True, point_size=point_size, color="red")
+        pl.show_axes()
+
+        pl.subplot(1, 1)
+        pl.add_text("Middle Seeds", font_size=12)
+        pl.add_mesh(m1, color="lightgray", opacity=1.0)
+        pl.add_mesh(seed_points_mid, render_points_as_spheres=True, point_size=point_size, color="red")
+        pl.show_axes()
+
+        pl.subplot(1, 2)
+        pl.add_text("Final Seeds", font_size=12)
+        pl.add_mesh(m2, color="lightgray", opacity=1.0)
+        pl.add_mesh(seed_points_final, render_points_as_spheres=True, point_size=point_size, color="red")
+        pl.show_axes()
+
+        if link_views:
+            pl.link_views()
+
+        pl.show()
+        return pl
 
     # =========================================================================
     # 5) Thresholded density visualization

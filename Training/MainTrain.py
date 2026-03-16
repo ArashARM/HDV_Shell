@@ -7,7 +7,11 @@ import torch
 class TrainingConfig:
     seed_number: int = 15
     use_anisotropy: bool = True
+    fixed_height: float | None = None
     target_volfrac: float = 0.5
+    seed_repulsion_sigma: float = 0.08
+    boundary_margin: float = 0.05
+
 
     # only 4 outer weights
     lam_fem: float = 1.0
@@ -128,20 +132,33 @@ class NN_Trainer:
     @staticmethod
     def boundary_repulsion_term(
         seeds: torch.Tensor,
+        boundary_uv: torch.Tensor | None,
         gates: torch.Tensor | None = None,
         margin: float = 0.05,
         eps: float = 1e-12,
     ) -> torch.Tensor:
-        u, v = seeds[:, 0], seeds[:, 1]
-        d = torch.stack([u, 1 - u, v, 1 - v], dim=1)
-        penalty = torch.exp(-d / (margin + eps)).mean(dim=1)
+        """
+        Penalize seeds that get too close to the *actual trimmed face boundary*.
+
+        boundary_uv:
+            [Nb, 2] UV samples from the triangulated face boundary.
+            If the face has no open boundary (e.g. effectively closed in the
+            optimization domain), return zero penalty.
+        """
+        if boundary_uv is None or boundary_uv.numel() == 0:
+            return torch.zeros((), dtype=seeds.dtype, device=seeds.device)
+
+        # Distance from each seed to the nearest boundary sample
+        dmin = torch.cdist(seeds, boundary_uv).amin(dim=1)
+
+        # Smooth penalty: large near boundary, decays away from it
+        penalty = torch.exp(-dmin / (margin + eps))
 
         if gates is None:
             return penalty.mean()
 
         g = gates.view(-1)
         return (g * penalty).sum() / (g.sum() + eps)
-
     @staticmethod
     def compliance_loss(
         comp: torch.Tensor,
@@ -310,19 +327,21 @@ class NN_Trainer:
         A_v: torch.Tensor,
         target_volfrac: float,
         seeds: torch.Tensor,
+        boundary_uv: torch.Tensor | None = None,
         fiber_surface: torch.Tensor | None = None,
         gates: torch.Tensor | None = None,
         w_vol: float = 1.0,
         w_seed: float = 1.0,
         w_boundary: float = 1.0,
         w_fem: float = 0.0,
-        sigma: float = 0.08,
-        margin: float = 0.05,
         comp_normalize_by: float | None = None,
         density_floor: float = 0.02,
         eps: float = 1e-12,
         save_debug_history: bool = True,
     ) -> dict:
+        
+        sigma= self.cfg.seed_repulsion_sigma
+        margin= self.cfg.boundary_margin
         loss_vol = self.volume_loss_constant_height(
             rho=rho,
             A_v=A_v,
@@ -339,6 +358,7 @@ class NN_Trainer:
 
         loss_boundary = self.boundary_repulsion_term(
             seeds=seeds,
+            boundary_uv=boundary_uv,
             gates=gates,
             margin=margin,
             eps=eps,
@@ -390,17 +410,18 @@ class NN_Trainer:
     # Model / optimizer builders
     # ------------------------------------------------------------------
 
-    def _build_models(
+    def _build_single_face_models(
         self,
         device,
         seed_number,
         boundary_idx_ring1,
-        face_id,
+        u_periodic,
+        v_periodic,
         use_anisotropy,
         context_vector_size,
     ):
-        face_u_periodic = torch.tensor([False], device=device)
-        face_v_periodic = torch.tensor([False], device=device)
+        face_u_periodic = torch.tensor([bool(u_periodic)], dtype=torch.bool, device=device)
+        face_v_periodic = torch.tensor([bool(v_periodic)], dtype=torch.bool, device=device)
         seed_face_id = torch.zeros(seed_number, dtype=torch.long, device=device)
 
         decoder = self.decoder_cls(
@@ -410,6 +431,7 @@ class NN_Trainer:
             face_u_periodic=face_u_periodic,
             face_v_periodic=face_v_periodic,
             use_anisotropy=use_anisotropy,
+            fixed_height=getattr(self.cfg.fixed_height, "thickness", None),
         ).to(device)
 
         ppnet = self.ppnet_cls(
@@ -420,16 +442,81 @@ class NN_Trainer:
 
         return decoder, ppnet
 
-    def _build_optimizer(self, ppnet):
+    def _build_face_models(self, face_tensors, device):
         cfg = self.cfg
-        return torch.optim.Adam([
-            {"params": ppnet.seed_refine.parameters(), "lr": cfg.lr_seed_refine},
-            {"params": ppnet.delta_head.parameters(),  "lr": cfg.lr_delta_head},
-            {"params": ppnet.mlp.parameters(),         "lr": cfg.lr_mlp},
-            {"params": ppnet.w_head.parameters(),      "lr": cfg.lr_w_head},
-            {"params": ppnet.h_head.parameters(),      "lr": cfg.lr_h_head},
-        ])
+        decoders = []
+        ppnets = []
 
+        for ft in face_tensors:
+            decoder, ppnet = self._build_single_face_models(
+                device=device,
+                seed_number=cfg.seed_number,
+                boundary_idx_ring1=ft["boundary_idx_ring1"],
+                u_periodic=ft.get("u_periodic", False),
+                v_periodic=ft.get("v_periodic", False),
+                use_anisotropy=cfg.use_anisotropy,
+                context_vector_size=cfg.context_vector_size,
+            )
+            decoders.append(decoder)
+            ppnets.append(ppnet)
+
+        return decoders, ppnets
+
+    def _build_optimizer(self, ppnets):
+        cfg = self.cfg
+        param_groups = []
+
+        for ppnet in ppnets:
+            param_groups.extend([
+                {"params": ppnet.seed_refine.parameters(), "lr": cfg.lr_seed_refine},
+                {"params": ppnet.delta_head.parameters(),  "lr": cfg.lr_delta_head},
+                {"params": ppnet.mlp.parameters(),         "lr": cfg.lr_mlp},
+                {"params": ppnet.w_head.parameters(),      "lr": cfg.lr_w_head},
+            ])
+
+            fixed_height = getattr(self.cfg.fixed_height, "thickness", None)
+            if (fixed_height is None) and hasattr(ppnet, "h_head"):
+                param_groups.append({"params": ppnet.h_head.parameters(), "lr": cfg.lr_h_head})
+
+            if cfg.use_anisotropy:
+                if hasattr(ppnet, "theta_head"):
+                    param_groups.append({"params": ppnet.theta_head.parameters(), "lr": cfg.lr_mlp})
+                if hasattr(ppnet, "a_head"):
+                    param_groups.append({"params": ppnet.a_head.parameters(), "lr": cfg.lr_mlp})
+
+        return torch.optim.Adam(param_groups)
+
+    def _init_face_seeds(self, face_tensors):
+        cfg = self.cfg
+        uv_init_list = []
+
+        for ft in face_tensors:
+            boundary = torch.unique(ft["boundary_idx_ring1"])
+            seed_idx = self.generator.fps_3d(
+                ft["points_xyz"],
+                cfg.seed_number,
+                exclude_idx=boundary,
+            )
+            uv_init_list.append(ft["uv"][seed_idx].clone())
+
+        return uv_init_list
+
+    def _seed_points_xyz_all_faces(self, seeds_list, face_tensors):
+        xyz_parts = []
+        for seeds, ft in zip(seeds_list, face_tensors):
+            xyz_i = self.generator.seeds_uv_to_xyz_nearest(
+                seeds,
+                ft["uv"],
+                ft["points_xyz"],
+            )
+            xyz_parts.append(xyz_i)
+
+        if len(xyz_parts) == 0:
+            return None
+
+        import numpy as np
+        return np.concatenate(xyz_parts, axis=0)
+  
     def _finite_or_default(self, x: torch.Tensor, default: float = float("nan")) -> float:
         if self._scalar_tensor_is_finite(x):
             return float(x.detach().item())
@@ -455,6 +542,7 @@ class NN_Trainer:
         faces_ijk,
         face_id,
         boundary_idx_ring1,
+        face_tensors=None,
     ):
         cfg = self.cfg
         device = uv.device
@@ -462,27 +550,31 @@ class NN_Trainer:
         mid_step = cfg.num_steps // 2
         vertices_number = uv.shape[0]
 
-        boundary = torch.unique(boundary_idx_ring1)
-        seed_idx = self.generator.fps_3d(
-            points_xyz,
-            cfg.seed_number,
-            exclude_idx=boundary,
-        )
-        uv_init = uv[seed_idx].clone()
+        if face_tensors is None:
+            face_tensors = [{
+                "face_id": 0,
+                "uv": uv,
+                "Xu": Xu,
+                "Xv": Xv,
+                "points_xyz": points_xyz,
+                "faces_ijk": faces_ijk,
+                "face_areas": face_areas,
+                "boundary_idx_ring1": boundary_idx_ring1,
+                "u_periodic": False,
+                "v_periodic": False,
+                "global_vertex_idx": torch.arange(vertices_number, device=device, dtype=torch.long),
+            }]
 
         A_v = self.generator.vertex_area_lumped(vertices_number, faces_ijk, face_areas)
 
-        decoder, ppnet = self._build_models(
-            device=device,
-            seed_number=cfg.seed_number,
-            boundary_idx_ring1=boundary_idx_ring1,
-            face_id=face_id,
-            use_anisotropy=cfg.use_anisotropy,
-            context_vector_size=cfg.context_vector_size,
-        )
+        decoders, ppnets = self._build_face_models(face_tensors=face_tensors, device=device)
+        uv_init_list = self._init_face_seeds(face_tensors)
+        contexts = [
+            torch.zeros(1, cfg.context_vector_size, device=device, dtype=dtype)
+            for _ in face_tensors
+        ]
 
-        opt = self._build_optimizer(ppnet)
-        context = torch.zeros(1, cfg.context_vector_size, device=device, dtype=dtype)
+        opt = self._build_optimizer(ppnets)
 
         norm_vol = RunningNorm()
         norm_rep = RunningNorm()
@@ -509,57 +601,118 @@ class NN_Trainer:
         history = []
 
         for step in range(cfg.num_steps):
-            decoder.beta = cfg.beta
-            opt.zero_grad(set_to_none=True)
+            rho = torch.zeros((vertices_number,), dtype=dtype, device=device)
+            fiber_surface = torch.zeros((vertices_number, 3), dtype=dtype, device=device)
+            fiber_surface[:, 0] = 1.0
 
-            pred = ppnet(context, uv_init, offset_scale=1, clamp01=True)
-            seeds_raw = pred["seeds_raw"][0]
-            w_raw = pred["w_raw"][0]
-            h_raw = pred["h_raw"][0]
-            gates = pred.get("gate_probs", None)
-            gates = gates[0] if gates is not None else None
+            seeds_list = []
+            pred_list = []
+            rep_terms = []
+            bnd_terms = []
 
-            w_soft, d, M, seeds, rho, t_raw, t_uv, h, Q_used, fiber3d = decoder(
-                points_uv=uv,
-                Xu=Xu,
-                Xv=Xv,
-                tau=cfg.tau,
-                seeds_raw=seeds_raw,
-                w_raw=w_raw,
-                h_raw=h_raw,
-                points_face_id=face_id,
-            )
+            for ft, decoder, ppnet, uv_init_i, context_i in zip(face_tensors, decoders, ppnets, uv_init_list, contexts):
+                pred_i = ppnet(context_i, uv_init_i, offset_scale=1, clamp01=True)
 
-            fiber_surface = fiber3d
+                seeds_raw_i = pred_i["seeds_raw"][0]
+                w_raw_i = pred_i["w_raw"][0]
+                fixed_height = getattr(self.cfg.fixed_height, "thickness", None)
+                h_raw_i = None if fixed_height is not None else pred_i["h_raw"][0]
+                gates_i = pred_i.get("gate_probs", None)
+                gates_i = gates_i[0] if gates_i is not None else None
 
-            loss_out = self.total_loss(
+                theta_i = pred_i["theta"][0] if (cfg.use_anisotropy and "theta" in pred_i) else None
+                a_raw_i = pred_i["a_raw"][0] if (cfg.use_anisotropy and "a_raw" in pred_i) else None
+
+                local_face_id = torch.zeros(
+                    ft["uv"].shape[0],
+                    dtype=torch.long,
+                    device=device,
+                )
+
+                _, _, _, seeds_i, rho_i, _, _, _, _, fiber3d_i = decoder(
+                    points_uv=ft["uv"],
+                    Xu=ft["Xu"],
+                    Xv=ft["Xv"],
+                    tau=cfg.tau,
+                    seeds_raw=seeds_raw_i,
+                    w_raw=w_raw_i,
+                    h_raw=h_raw_i,
+                    theta=theta_i,
+                    a_raw=a_raw_i,
+                    points_face_id=local_face_id,
+                )
+
+                gidx = ft["global_vertex_idx"]
+                rho[gidx] = rho_i
+                fiber_surface[gidx] = fiber3d_i
+
+                seeds_list.append(seeds_i)
+                pred_list.append({
+                    "face_id": ft["face_id"],
+                    "seeds_raw": seeds_raw_i,
+                    "w_raw": w_raw_i,
+                    "h_raw": None if h_raw_i is None else h_raw_i,
+                    "gates": None if gates_i is None else gates_i,
+                })
+
+                rep_terms.append(
+                    self.seed_repulsion_term(
+                        seeds=seeds_i,
+                        gates=gates_i,
+                        sigma=0.08,
+                        eps=cfg.eps,
+                    )
+                )
+                boundary_uv_i = None
+                if ("boundary_idx" in ft) and (ft["boundary_idx"] is not None) and (ft["boundary_idx"].numel() > 0):
+                    boundary_uv_i = ft["uv"][ft["boundary_idx"]]
+
+                bnd_terms.append(
+                    self.boundary_repulsion_term(
+                        seeds=seeds_i,
+                        boundary_uv=boundary_uv_i,
+                        gates=gates_i,
+                        margin=0.05,
+                        eps=cfg.eps,
+                    )
+                )
+
+            loss_vol = self.volume_loss_constant_height(
                 rho=rho,
                 A_v=A_v,
                 target_volfrac=cfg.target_volfrac,
-                seeds=seeds,
-                fiber_surface=fiber_surface,
-                gates=gates,
-                w_vol=1.0,
-                w_seed=1.0,
-                w_boundary=1.0,
-                w_fem=1.0 if cfg.lam_fem != 0.0 else 0.0,
-                sigma=0.08,
-                margin=0.05,
-                comp_normalize_by=cfg.comp_normalize_by,
-                density_floor=cfg.fem_density_floor,
                 eps=cfg.eps,
-                save_debug_history=True,
             )
 
-            loss_vol = loss_out["volume"]
-            loss_rep = loss_out["seed_repulsion"]
-            loss_bnd = loss_out["boundary_repulsion"]
-            loss_fem = loss_out["fem_total"]
-            loss_comp = loss_out["compliance_loss"]
-            comp_val = loss_out["comp"]
+            loss_rep = torch.stack(rep_terms).mean() if len(rep_terms) else torch.zeros((), dtype=dtype, device=device)
+            loss_bnd = torch.stack(bnd_terms).mean() if len(bnd_terms) else torch.zeros((), dtype=dtype, device=device)
 
-            fem_is_valid = bool(loss_out["fem_valid"])
-            fem_failure_reason = loss_out["fem_failure_reason"]
+            fem_out = {
+                "fem_total": torch.zeros((), dtype=dtype, device=device),
+                "comp": torch.zeros((), dtype=dtype, device=device),
+                "compliance_loss": torch.zeros((), dtype=dtype, device=device),
+                "fem_valid": True,
+                "failure_reason": None,
+            }
+
+            if cfg.lam_fem != 0.0:
+                fem_out = self.fem_loss(
+                    rho_surface=rho,
+                    fiber_surface=fiber_surface,
+                    comp_normalize_by=cfg.comp_normalize_by,
+                    density_floor=cfg.fem_density_floor,
+                    eps=cfg.eps,
+                    save_debug_history=True,
+                )
+
+            loss_fem = fem_out["fem_total"]
+            loss_comp = fem_out["compliance_loss"]
+            comp_val = fem_out["comp"]
+            fem_is_valid = bool(fem_out["fem_valid"])
+            fem_failure_reason = fem_out["failure_reason"]
+
+
+
 
             if cfg.normalize_losses:
                 n_vol = norm_vol.update(loss_vol.detach().item())
@@ -614,32 +767,40 @@ class NN_Trainer:
                     best_score = score
                     best_step = step
                     best_rho = rho.detach().clone()
-                    best_seeds = seeds.detach().clone()
-                    best_pred = {
-                        "seeds_raw": seeds_raw.detach().clone(),
-                        "w_raw": w_raw.detach().clone(),
-                        "h_raw": h_raw.detach().clone(),
-                        "gates": None if gates is None else gates.detach().clone(),
-                    }
+                    best_seeds = [s.detach().clone() for s in seeds_list]
+                    best_pred = [
+                        {
+                            "face_id": p["face_id"],
+                            "seeds_raw": p["seeds_raw"].detach().clone(),
+                            "w_raw": p["w_raw"].detach().clone(),
+                            "h_raw": None if p["h_raw"] is None else p["h_raw"].detach().clone(),
+                            "gates": None if p["gates"] is None else p["gates"].detach().clone(),
+                        }
+                        for p in pred_list
+                    ]
                     steps_since_improve = 0
                 else:
                     steps_since_improve += 1
 
                 if step == 0:
                     initial_shape_density = rho.detach().clone()
-                    seed_points_init = self.generator.seeds_uv_to_xyz_nearest(seeds, uv, points_xyz)
+                    seed_points_init = self._seed_points_xyz_all_faces(seeds_list, face_tensors)
 
                 if step == mid_step:
                     mid_shape_density = rho.detach().clone()
-                    seed_points_mid = self.generator.seeds_uv_to_xyz_nearest(seeds, uv, points_xyz)
+                    seed_points_mid = self._seed_points_xyz_all_faces(seeds_list, face_tensors)
 
                 if rho0 is None:
                     rho0 = rho.detach().clone()
                 if seeds0 is None:
-                    seeds0 = seeds.detach().clone()
+                    seeds0 = [s.detach().clone() for s in seeds_list]
 
                 drho = float((rho - rho0).abs().mean().item())
-                dseed = float((seeds - seeds0).abs().mean().item())
+                dseed_terms = [
+                    float((s - s0).abs().mean().item())
+                    for s, s0 in zip(seeds_list, seeds0)
+                ]
+                dseed = sum(dseed_terms) / max(len(dseed_terms), 1)
 
                 rho_min = float(rho.min().item())
                 rho_mean = float(rho.mean().item())
@@ -647,10 +808,11 @@ class NN_Trainer:
 
                 g_mean = 0.0
                 g_count = 0
-                for p in ppnet.parameters():
-                    if p.grad is not None:
-                        g_mean += float(p.grad.detach().abs().mean().item())
-                        g_count += 1
+                for ppnet in ppnets:
+                    for p in ppnet.parameters():
+                        if p.grad is not None:
+                            g_mean += float(p.grad.detach().abs().mean().item())
+                            g_count += 1
                 g_mean = g_mean / max(g_count, 1)
 
                 row = {
@@ -708,13 +870,13 @@ class NN_Trainer:
         if best_rho is None:
             with torch.no_grad():
                 best_rho = rho.detach().clone()
-                best_seeds = seeds.detach().clone()
+                best_seeds = [s.detach().clone() for s in seeds_list]
                 best_step = step
                 best_score = float("inf") if not self._scalar_tensor_is_finite(L_total) else float(L_total.detach().item())
 
         with torch.no_grad():
             final_shape_density = best_rho.clone()
-            seed_points_final = self.generator.seeds_uv_to_xyz_nearest(best_seeds, uv, points_xyz)
+            seed_points_final = self._seed_points_xyz_all_faces(best_seeds, face_tensors)
 
             if mid_shape_density is None:
                 mid_shape_density = final_shape_density.clone()
@@ -723,8 +885,8 @@ class NN_Trainer:
         print(f"FINAL RETURNED: best_step={best_step}, best_score={best_score:.6f}")
 
         return {
-            "decoder": decoder,
-            "ppnet": ppnet,
+            "decoders": decoders,
+            "ppnets": ppnets,
             "optimizer": opt,
             "history": history,
             "best_score": best_score,
@@ -739,7 +901,8 @@ class NN_Trainer:
             "seed_points_mid": seed_points_mid,
             "seed_points_final": seed_points_final,
             "A_v": A_v,
-            "uv_init": uv_init,
+            "uv_init_list": uv_init_list,
+            "face_tensors": face_tensors,
             "fem_debug_history": self.fem_debug_history,
             "last_fem_debug": self.last_fem_debug,
         }
@@ -749,22 +912,19 @@ class NN_Trainer:
     # ------------------------------------------------------------------
 
     def visualize_result_stepwise(self, result, points_xyz, faces_ijk):
-        density_init_viz = self.viz.viz_normalize(result["Initial_shape_density"])
-        density_mid_viz = self.viz.viz_normalize(result["Mid_shape_density"])
-        density_fin_viz = self.viz.viz_normalize(result["Final_shape_density"])
-
         pv_faces_fixed = self.generator.faces_ijk_to_pv_faces(faces_ijk)
 
-        self.viz.plot_density_and_seedpoints_3stage(
+        self.viz.plot_density_and_seedpoints_3stage_2(
             mesh_points=points_xyz.detach().cpu().numpy(),
             pv_faces=pv_faces_fixed,
-            density_init=density_init_viz.detach().cpu().numpy(),
-            density_mid=density_mid_viz.detach().cpu().numpy(),
-            density_final=density_fin_viz.detach().cpu().numpy(),
+            density_init=result["Initial_shape_density"].detach().cpu().numpy(),
+            density_mid=result["Mid_shape_density"].detach().cpu().numpy(),
+            density_final=result["Final_shape_density"].detach().cpu().numpy(),
             seed_points_init=result["seed_points_init"],
             seed_points_mid=result["seed_points_mid"],
             seed_points_final=result["seed_points_final"],
-            shared_clim=False,
+            thr=0.5,
+            show_shell_background=True,
         )
 
     def visualize_result_final(self, result, points_xyz, faces_ijk, thr=0.5, show_solid=True):

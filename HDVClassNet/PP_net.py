@@ -50,15 +50,20 @@ class PPNet(nn.Module):
             self.theta_head = nn.Linear(hidden, 1)
             self.a_head = nn.Linear(hidden, 1)
 
-
-    def forward(self, context, uv_init, offset_scale=0.05, clamp01=True):
+    def forward(self, context, uv_init, offset_scale=1, clamp01=True):
         """
         context : (B,C)
         uv_init : (S,2) or (B,S,2)
-        offset_scale: max move magnitude (in UV units) via offset_scale*tanh(...)
+
+        New behavior:
+        - refinement is done in a smooth bounded way
+        - instead of hard clamping in UV space, we move in logit space:
+              seeds = sigmoid(logit(uv_init) + offset_scale * tanh(delta_raw))
+        - this preserves bounded seeds in [0,1] while keeping gradients smooth
         """
         B = context.shape[0]
         S = self.n_seeds
+        eps = 1e-6
 
         # ensure uv_init is (B,S,2)
         if uv_init.dim() == 2:
@@ -71,24 +76,31 @@ class PPNet(nn.Module):
         if uv_init_b.shape[1:] != (S, 2):
             raise ValueError(f"Expected uv_init (B,{S},2) or ({S},2), got {tuple(uv_init_b.shape)}")
 
-        z = self.mlp(context)                       # (B,H)
-        z_rep = z.unsqueeze(1).expand(-1, S, -1)    # (B,S,H)
+        z = self.mlp(context)                          # (B,H)
+        z_rep = z.unsqueeze(1).expand(-1, S, -1)      # (B,S,H)
 
-        seed_in = torch.cat([z_rep, uv_init_b], dim=-1)  # (B,S,H+2)
-        h = self.seed_refine(seed_in)                    # (B,S,H)
+        seed_in = torch.cat([z_rep, uv_init_b], dim=-1)   # (B,S,H+2)
+        h = self.seed_refine(seed_in)                     # (B,S,H)
 
-        delta_raw = self.delta_head(h)                   # (B,S,2)
-        delta = offset_scale * torch.tanh(delta_raw)     # bounded
-        seeds_raw = uv_init_b + delta                    # (B,S,2)
+        delta_raw = self.delta_head(h)                    # (B,S,2)
+        delta = offset_scale * torch.tanh(delta_raw)      # bounded smooth latent offset
 
+        # Smooth bounded parameterization:
+        # map uv_init to logit space, add offset, map back with sigmoid
+        uv_safe = uv_init_b.clamp(eps, 1.0 - eps)
+        uv_logits = torch.log(uv_safe) - torch.log(1.0 - uv_safe)
+        seeds_raw = torch.sigmoid(uv_logits + delta)
+
+        # keep backward compatibility with older call sites;
+        # no hard clamp is needed anymore
         if clamp01:
-            seeds_raw = seeds_raw.clamp(0.0, 1.0)
+            seeds_raw = seeds_raw
 
-        gate_logits = self.gate_head(h).squeeze(-1)      # (B,S)
-        gate_probs = torch.sigmoid(gate_logits)          # (B,S)
+        gate_logits = self.gate_head(h).squeeze(-1)       # (B,S)
+        gate_probs = torch.sigmoid(gate_logits)           # (B,S)
 
-        w_raw = self.w_head(z).view(-1)                  # (B,)
-        h_raw = self.h_head(z).view(-1)                  # (B,)
+        w_raw = self.w_head(z).view(-1)                   # (B,)
+        h_raw = self.h_head(z).view(-1) if hasattr(self, "h_head") else None
 
         out = {
             "uv_init": uv_init_b,
@@ -101,7 +113,7 @@ class PPNet(nn.Module):
         }
 
         if self.use_anisotropy:
-            out["theta"] = self.theta_head(h).squeeze(-1)  # (B,S)
-            out["a_raw"] = self.a_head(h).squeeze(-1)      # (B,S)
+            out["theta"] = self.theta_head(h).squeeze(-1)   # (B,S)
+            out["a_raw"] = self.a_head(h).squeeze(-1)       # (B,S)
 
         return out

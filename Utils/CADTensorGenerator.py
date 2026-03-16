@@ -276,7 +276,7 @@ class CADTensorGenerator:
         umax,
         vmin,
         vmax,
-        classifier,
+        classifier=None,
         tol_uv=1e-7,
         n_test=9,
         xyz_tol=1e-6,
@@ -295,17 +295,16 @@ class CADTensorGenerator:
 
         vs = np.linspace(vmin, vmax, int(max(3, n_test)))
         ok = 0
+        tested = 0
 
         for vv in vs:
-            if not (
-                cls._classify_inside(face, umin, vv, classifier, tol_uv)
-                and cls._classify_inside(face, umax, vv, classifier, tol_uv)
-            ):
+            try:
+                p1 = surf.Value(float(umin), float(vv))
+                p2 = surf.Value(float(umax), float(vv))
+            except Exception:
                 continue
 
-            p1 = surf.Value(float(umin), float(vv))
-            p2 = surf.Value(float(umax), float(vv))
-
+            tested += 1
             dx = p1.X() - p2.X()
             dy = p1.Y() - p2.Y()
             dz = p1.Z() - p2.Z()
@@ -313,8 +312,10 @@ class CADTensorGenerator:
             if (dx * dx + dy * dy + dz * dz) <= float(xyz_tol) ** 2:
                 ok += 1
 
-        return ok >= max(2, int(0.7 * len(vs)))
+        if tested == 0:
+            return False
 
+        return ok >= max(2, int(0.7 * tested))
     @classmethod
     def triangulate_face_uv_grid(cls, face, n_u=80, n_v=40, tol=1e-7):
         """
@@ -385,12 +386,19 @@ class CADTensorGenerator:
     # =========================================================================
     # 6) Export mesh tables
     # =========================================================================
-
     def export_face_mesh_metric(self, shape_path: str, visualize: bool = False, visualize_face_id: int | None = None):
         """
         Returns:
             mesh_df: per-vertex table
             faces_df: global triangle table
+
+        Notes:
+            - `surface_*_periodic` describes the underlying OCC surface.
+            - `face_*_periodic` describes whether the *trimmed face domain* should
+            actually wrap for optimization/decoder use.
+            - This distinction matters for trimmed periodic surfaces such as a
+            half-cylinder patch: the underlying surface is periodic, but the face
+            is not necessarily wrap-closed.
         """
         shape = self.load_shape(shape_path)
         self.mesh_shape_force(shape, deflection=self.deflection, angle=self.angle)
@@ -401,6 +409,7 @@ class CADTensorGenerator:
 
         for face_id, face in enumerate(self.iter_faces(shape)):
             (umin, umax, vmin, vmax), surf = self.face_uv_bounds_and_surface(face)
+            surface_u_periodic, surface_v_periodic, u_period, v_period = self.face_uv_periodicity(face)
 
             tri = self.triangulate_face(face, n_u=self.n_u, n_v=self.n_v, tol=1e-7)
             if tri is None:
@@ -409,13 +418,64 @@ class CADTensorGenerator:
 
             V_xyz, UV_raw, F_idx = tri
 
+            valid_local_vertices = []
+            u_raw_list = []
+            v_raw_list = []
+
             for lvid, (xyz, uv) in enumerate(zip(V_xyz, UV_raw)):
                 if uv is None or uv[0] is None or uv[1] is None:
                     continue
 
-                u_raw, v_raw = float(uv[0]), float(uv[1])
-                u_n, v_n = self.uv_raw_to_norm(u_raw, v_raw, umin, umax, vmin, vmax)
+                u_raw = float(uv[0])
+                v_raw = float(uv[1])
                 x, y, z = float(xyz[0]), float(xyz[1]), float(xyz[2])
+
+                valid_local_vertices.append((lvid, x, y, z, u_raw, v_raw))
+                u_raw_list.append(u_raw)
+                v_raw_list.append(v_raw)
+
+            if len(valid_local_vertices) == 0:
+                print(f"[warn] face {face_id}: triangulation had no valid UV vertices, skipped")
+                continue
+
+            # Effective wrapping for the trimmed face domain.
+            wrap_u = False
+            wrap_v = False
+
+            if surface_u_periodic and (u_period is not None):
+                try:
+                    wrap_u = bool(
+                        self._should_wrap_u_true_seam(
+                            face,
+                            surf,
+                            float(umin),
+                            float(umax),
+                            float(vmin),
+                            float(vmax),
+                            None,
+                        )
+                    )
+                except Exception:
+                    if len(u_raw_list) > 0:
+                        uvals = np.asarray(u_raw_list, dtype=float)
+                        umin_raw = float(np.min(uvals))
+                        umax_raw = float(np.max(uvals))
+                        span_u = umax_raw - umin_raw
+                        wrap_u = abs(span_u - float(u_period)) <= max(1e-6, 0.05 * float(u_period))
+                    else:
+                        wrap_u = False
+
+            if surface_v_periodic and (v_period is not None) and len(v_raw_list) > 0:
+                vvals = np.asarray(v_raw_list, dtype=float)
+                vmin_raw = float(np.min(vvals))
+                vmax_raw = float(np.max(vvals))
+                span_v = vmax_raw - vmin_raw
+                wrap_v = abs(span_v - float(v_period)) <= max(1e-6, 0.05 * float(v_period))
+
+            bbox = self.face_bounding_box(face)
+
+            for lvid, x, y, z, u_raw, v_raw in valid_local_vertices:
+                u_n, v_n = self.uv_raw_to_norm(u_raw, v_raw, umin, umax, vmin, vmax)
 
                 gvid = len(mesh_rows)
                 face_lvid_to_gvid[(face_id, lvid)] = gvid
@@ -439,37 +499,53 @@ class CADTensorGenerator:
                     and Gn > 0.0
                 )
 
-                bbox =self.face_bounding_box(face)
-
                 mesh_rows.append({
                     "face_id": int(face_id),
                     "lvid": int(lvid),
                     "gvid": int(gvid),
+
                     "u": float(u_n),
                     "v": float(v_n),
                     "u_raw": float(u_raw),
                     "v_raw": float(v_raw),
+
                     "x": x,
                     "y": y,
                     "z": z,
+
                     "Su_x": float(Su_xyz[0]),
                     "Su_y": float(Su_xyz[1]),
                     "Su_z": float(Su_xyz[2]),
                     "Sv_x": float(Sv_xyz[0]),
                     "Sv_y": float(Sv_xyz[1]),
                     "Sv_z": float(Sv_xyz[2]),
+
                     "E": float(En),
                     "F": float(Fn),
                     "G": float(Gn),
                     "det": float(det),
                     "metric_valid": metric_valid,
-                    "bbox_xmin": bbox["xmin"],
-                    "bbox_ymin": bbox["ymin"],
-                    "bbox_zmin": bbox["zmin"],
-                    "bbox_xmax": bbox["xmax"],
-                    "bbox_ymax": bbox["ymax"],
-                    "bbox_zmax": bbox["zmax"],
 
+                    "bbox_xmin": float(bbox["xmin"]),
+                    "bbox_ymin": float(bbox["ymin"]),
+                    "bbox_zmin": float(bbox["zmin"]),
+                    "bbox_xmax": float(bbox["xmax"]),
+                    "bbox_ymax": float(bbox["ymax"]),
+                    "bbox_zmax": float(bbox["zmax"]),
+
+                    "face_u_periodic": bool(wrap_u),
+                    "face_v_periodic": bool(wrap_v),
+
+                    "surface_u_periodic": bool(surface_u_periodic),
+                    "surface_v_periodic": bool(surface_v_periodic),
+
+                    "face_u_period": None if u_period is None else float(u_period),
+                    "face_v_period": None if v_period is None else float(v_period),
+
+                    "face_u_raw_min": float(umin),
+                    "face_u_raw_max": float(umax),
+                    "face_v_raw_min": float(vmin),
+                    "face_v_raw_max": float(vmax),
                 })
 
             for f in F_idx:
@@ -477,6 +553,7 @@ class CADTensorGenerator:
                 ka, kb, kc = (face_id, a), (face_id, b), (face_id, c)
                 if ka not in face_lvid_to_gvid or kb not in face_lvid_to_gvid or kc not in face_lvid_to_gvid:
                     continue
+
                 face_rows.append({
                     "face_id": int(face_id),
                     "i": int(face_lvid_to_gvid[ka]),
@@ -486,12 +563,10 @@ class CADTensorGenerator:
 
         mesh_df = pd.DataFrame(mesh_rows)
         faces_df = pd.DataFrame(face_rows)
-        return mesh_df, faces_df
-
-    # =========================================================================
-    # 7) Tensor helpers
-    # =========================================================================
-
+        return mesh_df, faces_df    # =========================================================================
+    @staticmethod
+    def _empty_long(device):
+        return torch.empty((0,), dtype=torch.long, device=device)
     @staticmethod
     def boundary_vertex_indices_from_faces_numpy(faces_ijk: torch.Tensor):
         f = faces_ijk.detach().cpu().numpy().astype(np.int64)
@@ -633,9 +708,99 @@ class CADTensorGenerator:
 
         return faces
 
-    # =========================================================================
-    # 8) Main tensor generation API
-    # =========================================================================
+    def _build_single_face_tensor_dict(self, mesh_face_df, faces_face_df, input_ring: int):
+        mesh_face_df = mesh_face_df.sort_values("gvid").reset_index(drop=True)
+        device = self.device
+
+        global_vertex_idx = torch.tensor(
+            mesh_face_df["gvid"].to_numpy(),
+            dtype=torch.long,
+            device=device,
+        )
+
+        uv = torch.tensor(
+            mesh_face_df[["u", "v"]].to_numpy(),
+            dtype=torch.float32,
+            device=device,
+        )
+        points_xyz = torch.tensor(
+            mesh_face_df[["x", "y", "z"]].to_numpy(),
+            dtype=torch.float32,
+            device=device,
+        )
+        Xu = torch.tensor(
+            mesh_face_df[["Su_x", "Su_y", "Su_z"]].to_numpy(),
+            dtype=torch.float32,
+            device=device,
+        )
+        Xv = torch.tensor(
+            mesh_face_df[["Sv_x", "Sv_y", "Sv_z"]].to_numpy(),
+            dtype=torch.float32,
+            device=device,
+        )
+
+        gvid_to_local = {int(g): i for i, g in enumerate(mesh_face_df["gvid"].tolist())}
+        if len(faces_face_df) > 0:
+            faces_local_np = faces_face_df[["i", "j", "k"]].replace(gvid_to_local).to_numpy(dtype=np.int64)
+            faces_ijk = torch.tensor(faces_local_np, dtype=torch.long, device=device)
+            global_face_idx = torch.tensor(faces_face_df.index.to_numpy(), dtype=torch.long, device=device)
+        else:
+            faces_ijk = torch.empty((0, 3), dtype=torch.long, device=device)
+            global_face_idx = self._empty_long(device)
+
+        pv_faces = self.faces_ijk_to_pv_faces(faces_ijk) if faces_ijk.numel() else np.empty((0,), dtype=np.int64)
+        num_verts = int(uv.shape[0])
+
+        if faces_ijk.numel():
+            boundary_idx = self.boundary_vertex_indices_from_faces_numpy(faces_ijk).to(device=device)
+            adj = self.vertex_adjacency_from_faces(faces_ijk, num_verts)
+            boundary_idx_ring1 = self.k_ring(boundary_idx, adj, k=input_ring)
+            boundary_idx_ring2 = self.k_ring(boundary_idx, adj, k=8)
+            face_areas = self.precompute_face_areas(points_xyz, faces_ijk)
+            min_vol_frac = self.compute_min_fraction(points_xyz, faces_ijk, boundary_idx_ring1)
+        else:
+            boundary_idx = self._empty_long(device)
+            boundary_idx_ring1 = self._empty_long(device)
+            boundary_idx_ring2 = self._empty_long(device)
+            face_areas = torch.empty((0,), dtype=torch.float32, device=device)
+            min_vol_frac = 0.0
+
+        row0 = mesh_face_df.iloc[0]
+        bbox = {
+            "xmin": float(row0["bbox_xmin"]),
+            "xmax": float(row0["bbox_xmax"]),
+            "ymin": float(row0["bbox_ymin"]),
+            "ymax": float(row0["bbox_ymax"]),
+            "zmin": float(row0["bbox_zmin"]),
+            "zmax": float(row0["bbox_zmax"]),
+        }
+
+        fid = int(row0["face_id"])
+        return {
+            "face_id": fid,
+            "uv": uv,
+            "points_xyz": points_xyz,
+            "Xu": Xu,
+            "Xv": Xv,
+            "faces_ijk": faces_ijk,
+            "pv_faces": pv_faces,
+            "face_areas": face_areas,
+            "boundary_idx": boundary_idx,
+            "boundary_idx_ring1": boundary_idx_ring1,
+            "boundary_idx_ring2": boundary_idx_ring2,
+            "min_vol_frac": float(min_vol_frac),
+            "BBX": bbox,
+            "u_periodic": bool(row0["face_u_periodic"]),
+            "v_periodic": bool(row0["face_v_periodic"]),
+            "u_period": None if pd.isna(row0["face_u_period"]) else float(row0["face_u_period"]),
+            "v_period": None if pd.isna(row0["face_v_period"]) else float(row0["face_v_period"]),
+            "u_raw_bounds": (float(row0["face_u_raw_min"]), float(row0["face_u_raw_max"])),
+            "v_raw_bounds": (float(row0["face_v_raw_min"]), float(row0["face_v_raw_max"])),
+            "global_vertex_idx": global_vertex_idx,
+            "global_face_idx": global_face_idx,
+            "num_vertices": num_verts,
+            "num_faces": int(faces_ijk.shape[0]),
+        }
 
     def generate_input_tensors_from_dataframes(self, mesh_df, faces_df, input_ring: int):
         mesh_df_ord = mesh_df.sort_values("gvid").reset_index(drop=True)
@@ -645,29 +810,21 @@ class CADTensorGenerator:
             dtype=torch.float32,
             device=self.device,
         )
-
         points_xyz = torch.tensor(
             mesh_df_ord[["x", "y", "z"]].to_numpy(),
             dtype=torch.float32,
             device=self.device,
         )
-
         Xu = torch.tensor(
             mesh_df_ord[["Su_x", "Su_y", "Su_z"]].to_numpy(),
             dtype=torch.float32,
             device=self.device,
         )
-
         Xv = torch.tensor(
             mesh_df_ord[["Sv_x", "Sv_y", "Sv_z"]].to_numpy(),
             dtype=torch.float32,
             device=self.device,
         )
-
-        uv_min = uv.min(dim=0, keepdim=True).values
-        uv_max = uv.max(dim=0, keepdim=True).values
-        uv = (uv - uv_min) / (uv_max - uv_min + 1e-12)
-
         faces_ijk = torch.tensor(
             faces_df[["i", "j", "k"]].to_numpy(),
             dtype=torch.long,
@@ -677,14 +834,19 @@ class CADTensorGenerator:
         num_verts = uv.shape[0]
         pv_faces = self.faces_df_to_pv_faces_autodetect(faces_df)
 
-        boundary_idx = self.boundary_vertex_indices_from_faces_numpy(faces_ijk).to(device=uv.device)
-        adj = self.vertex_adjacency_from_faces(faces_ijk, num_verts)
-
-        boundary_idx_ring1 = self.k_ring(boundary_idx, adj, k=input_ring)
-        boundary_idx_ring2 = self.k_ring(boundary_idx, adj, k=8)  # kept for compatibility
-
-        face_areas = self.precompute_face_areas(points_xyz, faces_ijk)
-        min_vol_frac = self.compute_min_fraction(points_xyz, faces_ijk, boundary_idx_ring1)
+        if faces_ijk.numel():
+            boundary_idx = self.boundary_vertex_indices_from_faces_numpy(faces_ijk).to(device=uv.device)
+            adj = self.vertex_adjacency_from_faces(faces_ijk, num_verts)
+            boundary_idx_ring1 = self.k_ring(boundary_idx, adj, k=input_ring)
+            boundary_idx_ring2 = self.k_ring(boundary_idx, adj, k=8)
+            face_areas = self.precompute_face_areas(points_xyz, faces_ijk)
+            min_vol_frac = self.compute_min_fraction(points_xyz, faces_ijk, boundary_idx_ring1)
+        else:
+            boundary_idx = self._empty_long(self.device)
+            boundary_idx_ring1 = self._empty_long(self.device)
+            boundary_idx_ring2 = self._empty_long(self.device)
+            face_areas = torch.empty((0,), dtype=torch.float32, device=self.device)
+            min_vol_frac = 0.0
 
         face_id = torch.tensor(
             mesh_df_ord["face_id"].to_numpy(),
@@ -692,13 +854,14 @@ class CADTensorGenerator:
             device=self.device,
         )
 
-        # -------------------------------------------------------------------------
-        # Build per-face bounding-box dictionary: BBX[face_id] = {...}
-        # Expected columns in mesh_df:
-        # x, y, z, face_id
-        # -------------------------------------------------------------------------
         BBX = {}
+        face_tensors = []
+        face_tensors_by_id = {}
+        face_periodicity = {}
+
         for fid, grp in mesh_df_ord.groupby("face_id", sort=True):
+            fid = int(fid)
+
             xmin = float(grp["x"].min())
             xmax = float(grp["x"].max())
             ymin = float(grp["y"].min())
@@ -706,13 +869,25 @@ class CADTensorGenerator:
             zmin = float(grp["z"].min())
             zmax = float(grp["z"].max())
 
-            BBX[int(fid)] = {
+            BBX[fid] = {
                 "xmin": xmin,
                 "xmax": xmax,
                 "ymin": ymin,
                 "ymax": ymax,
                 "zmin": zmin,
                 "zmax": zmax,
+            }
+
+            faces_face_df = faces_df[faces_df["face_id"] == fid].copy().reset_index(drop=False)
+            face_dict = self._build_single_face_tensor_dict(grp.copy(), faces_face_df, input_ring=input_ring)
+
+            face_tensors.append(face_dict)
+            face_tensors_by_id[fid] = face_dict
+            face_periodicity[fid] = {
+                "u_periodic": face_dict["u_periodic"],
+                "v_periodic": face_dict["v_periodic"],
+                "u_period": face_dict["u_period"],
+                "v_period": face_dict["v_period"],
             }
 
         print("MinVolFrac:", min_vol_frac)
@@ -727,12 +902,16 @@ class CADTensorGenerator:
             "faces_ijk": faces_ijk,
             "pv_faces": pv_faces,
             "face_id": face_id,
+            "boundary_idx": boundary_idx,
             "boundary_idx_ring1": boundary_idx_ring1,
             "boundary_idx_ring2": boundary_idx_ring2,
             "min_vol_frac": min_vol_frac,
             "BBX": BBX,
+            "face_tensors": face_tensors,
+            "face_tensors_by_id": face_tensors_by_id,
+            "face_periodicity": face_periodicity,
+            "num_faces": len(face_tensors),
         }
-
     def generate_from_file(self, shape_path: str, input_ring: int, visualize: bool = False, visualize_face_id: int | None = None):
         """
         Full pipeline:

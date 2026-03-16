@@ -15,7 +15,7 @@ from .problemBase import problemBase
 class ThickenShell(problemBase):
     problemName = 'ThickenShell'
 
-    def __init__(self, thickness, voxel_size, extra_layers=1, tensors=None,tangential_tol=None):
+    def __init__(self, thickness,BC_dir,Load_magnitude, voxel_size, extra_layers=1, tensors=None,tangential_tol=None):
         super().__init__()
         self.name = self.problemName
 
@@ -24,6 +24,8 @@ class ThickenShell(problemBase):
         self.voxel_size = float(voxel_size)
         self.extra_layers = int(extra_layers)
         self.tangential_tol = None if tangential_tol is None else float(tangential_tol)
+        self.BC_dir = BC_dir
+        self.Load_magnitude = Load_magnitude
 
         self.grid_geom = None
         self.elem_centers = None
@@ -99,17 +101,49 @@ class ThickenShell(problemBase):
         # Recompute the padded bounding box used to build the voxel grid
         bbox = self.padded_bbox_from_midsurface(self.brep_bbox, self.thickness, self.voxel_size, self.extra_layers)
 
-        # Nodes in a small region near the bottom of the grid → candidate fixed support nodes
-        fixed_box_nodes = self.select_nodes_in_box(
-            xmin=bbox['xmin'] ,
-            xmax=bbox['xmin'] + tol
-        )
+        force_box_nodes= None
+        force_nodes = None
 
-        # Nodes in a small region near the top of the grid → candidate load nodes
-        force_box_nodes = self.select_nodes_in_box(
-            xmin=bbox['xmax'] - tol,
-            xmax=bbox['xmax'] ,
-        )
+        if(self.BC_dir == "x"):
+                    # Nodes in a small region near the bottom of the grid → candidate fixed support nodes
+            fixed_box_nodes = self.select_nodes_in_box(
+                xmin=bbox['xmin'] ,
+                xmax=bbox['xmin'] + tol
+            )
+
+            # Nodes in a small region near the top of the grid → candidate load nodes
+            force_box_nodes = self.select_nodes_in_box(
+                xmin=bbox['xmax'] - tol,
+                xmax=bbox['xmax'] ,
+            )
+            
+        elif (self.BC_dir == "y"):
+
+            fixed_box_nodes = self.select_nodes_in_box(
+                ymin=bbox['ymin'] ,
+                ymax=bbox['ymin'] + tol
+            )
+
+            # Nodes in a small region near the top of the grid → candidate load nodes
+            force_box_nodes = self.select_nodes_in_box(
+                ymin=bbox['ymax'] - tol,
+                ymax=bbox['ymax'] ,
+            )
+
+        elif (self.BC_dir == "z"):
+
+            fixed_box_nodes = self.select_nodes_in_box(
+                zmin=bbox['zmin'] ,
+                zmax=bbox['zmin'] + tol
+            )
+
+            # Nodes in a small region near the top of the grid → candidate load nodes
+            force_box_nodes = self.select_nodes_in_box(
+                zmin=bbox['zmax'] - tol,
+                zmax=bbox['zmax'] ,
+            )
+        else:
+           raise ValueError(f"Unsupported BC_dir: {self.BC_dir}")
 
         # Restrict the above selections to nodes that actually belong to shell voxels
         # (removes nodes from empty parts of the padded grid)
@@ -122,8 +156,8 @@ class ThickenShell(problemBase):
         self.set_boundary_conditions_from_regions(
             fixed_nodes=fixed_nodes,
             force_nodes=force_nodes,
-            force_direction='x',
-            force_value=1,
+            force_direction=self.BC_dir,
+            force_value=self.Load_magnitude,
         )
 
     def shellSettings(self):
@@ -699,6 +733,59 @@ class ThickenShell(problemBase):
             "mesh": self.mesh,
             "materialProperty": self.materialProperty,
         }
+    def show_voxels_surface_and_bc_NEW(self):
+        occ = self.elem_occupancy
+        centers = self.elem_centers
+        surface = self.points_xyz
+
+        vox_pts = centers[occ.astype(bool)]
+
+        plotter = pv.Plotter()
+
+        if vox_pts.shape[0] > 0:
+            plotter.add_mesh(
+                pv.PolyData(vox_pts),
+                color="lightblue",
+                point_size=6,
+                render_points_as_spheres=True,
+            )
+
+        if surface is not None and surface.shape[0] > 0:
+            plotter.add_mesh(
+                pv.PolyData(surface),
+                color="red",
+                point_size=4,
+                render_points_as_spheres=True,
+            )
+
+        node_ids, coords = self.get_flat_node_coords()
+
+        fixed_dofs = self.boundaryCondition['fixed']
+        fixed_node_ids = np.unique(fixed_dofs // 3)
+
+        force = self.boundaryCondition['force'].reshape(-1)
+        force_node_ids = np.unique(np.where(np.abs(force) > 0)[0] // 3)
+
+        if fixed_node_ids.size > 0:
+            fixed_pts = coords[fixed_node_ids]
+            plotter.add_mesh(
+                pv.PolyData(fixed_pts),
+                color="green",
+                point_size=12,
+                render_points_as_spheres=True
+            )
+
+        if force_node_ids.size > 0:
+            force_pts = coords[force_node_ids]
+            plotter.add_mesh(
+                pv.PolyData(force_pts),
+                color="yellow",
+                point_size=12,
+                render_points_as_spheres=True
+            )
+
+        plotter.show_axes()
+        plotter.show()
 
 #if __name__ == '__main__':
     # expects `tensors` to already exist in the current scope
