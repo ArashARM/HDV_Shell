@@ -794,7 +794,15 @@ class NN_Trainer:
             for _ in face_tensors
         ]
 
+
+
         opt = self._build_optimizer(ppnets)
+
+        scheduler = torch.optim.lr_scheduler.MultiStepLR(
+    opt,
+    milestones=[80, 160],
+    gamma=0.5,
+)
 
         norm_vol = RunningNorm()
         norm_rep = RunningNorm()
@@ -1045,6 +1053,7 @@ class NN_Trainer:
                 opt.zero_grad(set_to_none=True)
                 L_total.backward()
                 opt.step()
+                scheduler.step()
             else:
                 print(f"[step {step}] L_total is non-finite, optimizer step skipped.")
 
@@ -1058,6 +1067,7 @@ class NN_Trainer:
 
                 if best_candidate_is_valid and score < (best_score - cfg.min_delta):
                     best_score = score
+                    diff = best_step - step
                     best_step = step
                     best_vol_frac = float(vol_frac.detach().item())
                     best_comp = float(comp_val.detach().item())
@@ -1075,6 +1085,10 @@ class NN_Trainer:
                         }
                         for p in pred_list
                     ]
+                    if(diff>50):
+                        print(
+                            f"New best_step={best_step} | best_score={best_score:.6f} | vol={best_vol_frac} Comp ={best_comp} W ={best_w_geo}"
+                        )
                     steps_since_improve = 0
                 elif best_candidate_is_valid:
                     steps_since_improve += 1
@@ -1159,25 +1173,25 @@ class NN_Trainer:
                     fem_status = "OK" if fem_is_valid else f"BAD({fem_failure_reason})"
                     print(
                         f"[{step:05d}] "
-                        f"L_total={row['L_total']:.2e} | "
-                        f"L_vol={row['loss_vol']:.2e} "
-                        f"L_fem={row['loss_fem']:.2e} "
-                        f"L_strut={row['loss_strut']:.2e} "
-                        f"L_rep={row['loss_rep']:.2e} "
-                        f"L_bnd={row['loss_bnd']:.2e} | "
-                        f"vol={row['vol_frac']:.2f} "
-                        f"vol_eff={row['vol_frac_eff']:.2f} "
-                        f"(/{cfg.target_volfrac:.2f}) "
-                        f"comp={row['comp']:.2e} "
-                        f"w={row['w_geo_mean']:.2e} | "
-                        f"Lse={row['loss_strut_edge']:.2e} "
-                        f"Lsv={row['loss_strut_void']:.2e} "
-                        f"rho(min/mean/max)={rho_min:.2f}/{rho_mean:.2f}/{rho_max:.2f} | "
-                        f"rho_b={row['rho_boundary_mean']:.2f} "
-                        f"rho_v={row['rho_v_mean']:.2f} | "
+                        f"L_total={row['L_total']:.4e} | "
+                        f"L_vol={row['loss_vol']:.3e} "
+                        f"L_fem={row['loss_fem']:.3e} "
+                        f"L_strut={row['loss_strut']:.3e} "
+                        f"L_rep={row['loss_rep']:.3e} "
+                        f"L_bnd={row['loss_bnd']:.3e} | "
+                        f"vol={row['vol_frac']:.3f} "
+                        f"vol_eff={row['vol_frac_eff']:.3f} "
+                        f"(/{cfg.target_volfrac:.3f}) "
+                        f"comp={row['comp']:.3e} "
+                        f"w={row['w_geo_mean']:.3e} | "
+                        f"Lse={row['loss_strut_edge']:.3e} "
+                        f"Lsv={row['loss_strut_void']:.3e} "
+                        f"rho(min/mean/max)={rho_min:.3f}/{rho_mean:.3f}/{rho_max:.3f} | "
+                        f"rho_b={row['rho_boundary_mean']:.3f} "
+                        f"rho_v={row['rho_v_mean']:.3f} | "
                         f"Δrho={drho:.2e} Δseed={dseed:.2e} grad_mean={g_mean:.2e} | "
                         f"fem={fem_status} | "
-                        f"best={best_score:.2e}@{best_step}"
+                        f"best={best_score:.4e}@{best_step}"
                     )
 
                 if step >= cfg.early_stop_start and steps_since_improve >= cfg.patience:
@@ -1204,7 +1218,7 @@ class NN_Trainer:
 
         print(
             f"FINAL RETURNED: best_step={best_step}, best_score={best_score:.6f} | "
-            f"vol={best_vol_frac:.2e}, comp={best_comp:.3e}, w_geo={best_w_geo:.2e}"
+            f"vol={best_vol_frac:.3e}, comp={best_comp:.3e}, w_geo={best_w_geo:.3e}"
         )
 
         if self.writer is not None:
