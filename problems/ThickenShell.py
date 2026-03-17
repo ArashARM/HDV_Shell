@@ -784,6 +784,13 @@ class ThickenShell(problemBase):
                 render_points_as_spheres=True
             )
 
+    # Better text placement
+        plotter.add_text("Yellow: Applied load", position="upper_right", font_size=12, color="yellow")
+        plotter.add_text("Green: Fixed nodes", position="upper_left", font_size=12, color="green")
+        plotter.add_text("Blue: Occupied voxels", position="lower_left", font_size=12, color="lightblue")
+        plotter.add_text("Red: Surface points", position="lower_right", font_size=12, color="red")
+
+   
         plotter.show_axes()
         plotter.show()
 

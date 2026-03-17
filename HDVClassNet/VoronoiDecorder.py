@@ -71,6 +71,11 @@ class VoronoiDecoder(nn.Module):
         big_thr_default: float = 0.10,
         alpha_default: float = 0.05,
         eta_default: float = 0.05,
+        # boundary attachment field
+        use_boundary_attachment: bool = True,
+        boundary_attach_width: float = 0.03,
+        boundary_attach_beta: float = 0.01,
+        boundary_attach_alpha: float = 0.35,
     ):
         super().__init__()
 
@@ -104,6 +109,11 @@ class VoronoiDecoder(nn.Module):
         self.big_thr_default = float(big_thr_default)
         self.alpha_default = float(alpha_default)
         self.eta_default = float(eta_default)
+
+        self.use_boundary_attachment = bool(use_boundary_attachment)
+        self.boundary_attach_width = float(boundary_attach_width)
+        self.boundary_attach_beta = float(boundary_attach_beta)
+        self.boundary_attach_alpha = float(boundary_attach_alpha)
 
         if boundary_solid_idx is None:
             boundary_solid_idx = torch.empty(0, dtype=torch.long)
@@ -231,42 +241,69 @@ class VoronoiDecoder(nn.Module):
         return F.normalize(T, eps=eps)
 
     # -------------------- boundary band --------------------
-
-    def apply_boundary_band(
+    def boundary_attachment_field(
         self,
-        rho_v: torch.Tensor,
-        strength: float = 1.0,
-        detach_override: bool = False,
-        ref_mode: str = "quantile",
-        ref_q: float = 0.99,
+        points_uv: torch.Tensor,
+        boundary_uv: torch.Tensor | None,
+        points_face_id: torch.Tensor | None = None,
+        boundary_face_id: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        if self.boundary_solid_idx.numel() == 0:
-            return rho_v
+        """
+        Smooth boundary attachment field rho_b in [0,1].
 
-        rho = rho_v.clone()
-        N = rho.numel()
+        High near the shell boundary, decays smoothly away from it.
+        """
+        if boundary_uv is None or boundary_uv.numel() == 0:
+            return torch.zeros(
+                points_uv.shape[0],
+                device=points_uv.device,
+                dtype=points_uv.dtype,
+            )
 
-        interior_mask = torch.ones(N, device=rho.device, dtype=torch.bool)
-        interior_mask[self.boundary_solid_idx] = False
+        # piecewise-smooth nearest-boundary distance
+        if boundary_face_id is not None and points_face_id is not None:
+            if boundary_face_id.dtype != torch.long:
+                boundary_face_id = boundary_face_id.to(torch.long)
+            if points_face_id.dtype != torch.long:
+                points_face_id = points_face_id.to(torch.long)
 
-        vals = rho[interior_mask] if interior_mask.any() else rho
-        if detach_override:
-            vals = vals.detach()
-
-        if ref_mode == "max":
-            ref_level = vals.max()
-        elif ref_mode == "quantile":
-            ref_level = torch.quantile(vals, ref_q)
+            dmat = torch.cdist(points_uv, boundary_uv)  # [Nv, Nb]
+            cross_face = points_face_id[:, None] != boundary_face_id[None, :]
+            dmat = dmat + cross_face.to(dmat.dtype) * 1e6
+            dmin = dmat.amin(dim=1)
         else:
-            raise ValueError(f"Unknown ref_mode={ref_mode}. Use 'max' or 'quantile'.")
+            dmin = torch.cdist(points_uv, boundary_uv).amin(dim=1)
 
-        ref_level = ref_level.clamp(0.0, 1.0)
+        tb = torch.as_tensor(
+            self.boundary_attach_width,
+            device=points_uv.device,
+            dtype=points_uv.dtype,
+        )
+        bb = torch.as_tensor(
+            self.boundary_attach_beta,
+            device=points_uv.device,
+            dtype=points_uv.dtype,
+        )
 
-        rho[self.boundary_solid_idx] = ref_level.detach() if detach_override else ref_level
+        rho_b = torch.sigmoid((tb - dmin) / (bb + self.eps))
+        return rho_b.clamp(0.0, 1.0)
+    
+    def smooth_union(
+        self,
+        rho_a: torch.Tensor,
+        rho_b: torch.Tensor,
+        alpha_b: float | torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Smooth union of two density-like fields in [0,1].
+
+        rho = 1 - (1-rho_a)(1-alpha_b*rho_b)
+        """
+        alpha_b = torch.as_tensor(alpha_b, device=rho_a.device, dtype=rho_a.dtype)
+        rho = 1.0 - (1.0 - rho_a) * (1.0 - alpha_b * rho_b)
         return rho.clamp(0.0, 1.0)
 
-    # -------------------- pair gating --------------------
-
+  # -------------------- pair gating --------------------
     def _pair_gates(
         self,
         w_soft: torch.Tensor,
@@ -294,7 +331,6 @@ class VoronoiDecoder(nn.Module):
         return (g_gap * g_big) * tri
 
     # -------------------- new geometric strut density --------------------
-
     def _bisector_band_density(
         self,
         d: torch.Tensor,                 # (N,S)
@@ -348,11 +384,23 @@ class VoronoiDecoder(nn.Module):
 
         rho = 1.0 - torch.exp(-self.alpha_union * R)
         rho = rho.clamp(0.0, 1.0)
+        band_soft = band_ij.clamp(0.0, 1.0)
 
-        return rho, pair_strength, band_ij, pair_relevance
+        S = band_soft.shape[1]
+        eye = torch.eye(S, dtype=torch.bool, device=band_soft.device).unsqueeze(0)  # (1,S,S)
+
+        one_minus = torch.where(
+            eye,
+            torch.ones_like(band_soft),   # ignore diagonal terms
+            1.0 - band_soft
+        )
+
+        edge_field = 1.0 - one_minus.prod(dim=2).prod(dim=1)
+        edge_field = edge_field.clamp(0.0, 1.0)
+
+        return rho, pair_strength, band_ij, pair_relevance,edge_field
 
     # -------------------- forward --------------------
-
     def forward(
         self,
         points_uv: torch.Tensor,
@@ -365,6 +413,8 @@ class VoronoiDecoder(nn.Module):
         theta: torch.Tensor | None = None,
         a_raw: torch.Tensor | None = None,
         points_face_id: torch.Tensor | None = None,
+        boundary_uv: torch.Tensor | None = None,
+        boundary_face_id: torch.Tensor | None = None,
         gap_thr_raw: torch.Tensor | None = None,
         big_thr_raw: torch.Tensor | None = None,
         alpha_raw: torch.Tensor | None = None,
@@ -400,9 +450,12 @@ class VoronoiDecoder(nn.Module):
         d = torch.sqrt(d2.clamp_min(self.eps))
 
         if points_face_id is not None:
+            if self.seed_face_id is None:
+                raise ValueError("points_face_id was provided but self.seed_face_id is None.")
             if points_face_id.dtype != torch.long:
                 points_face_id = points_face_id.to(torch.long)
-            mask = (points_face_id[:, None] != self.seed_face_id[None, :])
+            seed_face_id = self.seed_face_id.to(device=points_face_id.device, dtype=torch.long)
+            mask = (points_face_id[:, None] != seed_face_id[None, :])
             d = d + mask.to(d.dtype) * 1e6
 
         logits = -d / float(tau)
@@ -433,11 +486,9 @@ class VoronoiDecoder(nn.Module):
         else:
             eta = self._map_raw_to_range(eta_raw, self.eta_min, self.eta_max, temp=1.0)
 
-        # NEW: geometric strut half-width
         w_geo = self.width(w_raw)
 
-        # NEW: geometric density around bisectors
-        rho, pair_strength, band_ij, pair_relevance = self._bisector_band_density(
+        rho, pair_strength, band_ij, pair_relevance,edge_field = self._bisector_band_density(
             d=d,
             w_soft=w_soft,
             w_geo=w_geo,
@@ -448,7 +499,25 @@ class VoronoiDecoder(nn.Module):
             eta=eta,
         )
 
-        rho = self.apply_boundary_band(rho)
+        rho_v = rho.clamp(0.0, 1.0)
+
+        if self.use_boundary_attachment:
+            rho_b = self.boundary_attachment_field(
+                points_uv=points_uv,
+                boundary_uv=boundary_uv,
+                points_face_id=points_face_id,
+                boundary_face_id=boundary_face_id,
+            )
+            rho = self.smooth_union(
+                rho_a=rho_v,
+                rho_b=rho_b,
+                alpha_b=self.boundary_attach_alpha,
+            )
+        else:
+            rho_b = torch.zeros_like(rho_v)
+            rho = rho_v
+
+        rho = rho.clamp(0.0, 1.0)
 
         t_uv_raw = self._blended_uv_fiber(w_soft, seeds)
         rho0, gamma = 0.5, 0.05
@@ -458,19 +527,21 @@ class VoronoiDecoder(nn.Module):
 
         h = self.height(h_raw, ref_tensor=points_uv)
 
-        # Return w_geo as the meaningful width output.
         return (
-            w_soft,          # (N,S)
-            d,               # (N,S)
-            M,               # (S,2,2)
-            seeds,           # (S,2)
-            rho,             # (N,)
-            t_uv_raw,        # (N,2)
-            t_uv,            # (N,2)
-            h,               # scalar
-            w_geo,           # scalar geometric half-width
-            fiber3d,         # (N,3)
-            pair_strength,   # (N,S,S)
-            band_ij,         # (N,S,S)
-            pair_relevance,  # (N,S,S)
+            w_soft,
+            d,
+            M,
+            seeds,
+            rho,
+            t_uv_raw,
+            t_uv,
+            h,
+            w_geo,
+            fiber3d,
+            pair_strength,
+            band_ij,
+            pair_relevance,
+            rho_v,
+            rho_b,
+            edge_field,
         )
