@@ -1,316 +1,373 @@
-# Differentiable Voronoi Lattice Optimization
+# 🧠 Differentiable Voronoi Lattice Optimization
+
+[![Python](https://img.shields.io/badge/python-3.10-blue.svg)]
+[![PyTorch](https://img.shields.io/badge/PyTorch-2.x-red.svg)]
+[![License](https://img.shields.io/badge/license-MIT-green.svg)]
 
 A differentiable Voronoi-based lattice generator for shell structures optimized using **neural networks** and **finite element methods (FEM)**.
 
 The system learns to place Voronoi seeds and control strut thickness so the resulting structure:
 
-* satisfies a **target volume fraction**
-* minimizes **structural compliance**
-* forms clear **Voronoi struts**
-* remains **fully differentiable for gradient-based optimization**
-
-The framework is implemented with **PyTorch**, allowing gradients to propagate through:
-
-```
-Seeds → Voronoi Geometry → Density Field → FEM → Compliance Loss
-```
+- satisfies a **target volume fraction**
+- minimizes **structural compliance**
+- forms clear **Voronoi struts**
+- remains **fully differentiable for gradient-based optimization**
 
 ---
 
-# Project Architecture
+## 🔁 Differentiable Pipeline
 
-The system contains four main components.
 
-## 1. PPNet (Neural Parameter Predictor)
+Latent Context
+↓
+PPNet (Neural Predictor)
+↓
+Voronoi Decoder (Differentiable Geometry)
+↓
+Density Field ρ(x)
+↓
+FEM Solver
+↓
+Compliance Loss
+↓
+Backpropagation
 
-PPNet predicts geometric parameters from a latent context vector.
 
-### Outputs
+Gradients propagate through the full chain:
+
+
+Seeds → Geometry → Density → FEM → Loss
+
+
+---
+
+## 🏗️ Project Architecture
+
+The system consists of four main components.
+
+---
+
+### 1. 🧠 PPNet (Neural Parameter Predictor)
+
+Predicts geometric parameters from a latent vector.
 
 | Parameter     | Shape    | Description                          |
-| ------------- | -------- | ------------------------------------ |
-| seeds_raw     | (S × 2)  | Voronoi seed coordinates in UV space |
-| w_raw         | scalar   | global strut half-width              |
-| h_raw         | scalar   | optional height parameter            |
-| gate_probs    | (S)      | optional seed gating                 |
-| theta / a_raw | optional | anisotropy parameters                |
+|--------------|----------|--------------------------------------|
+| seeds_raw    | (S × 2)  | Voronoi seed coordinates (UV space)  |
+| w_raw        | scalar   | strut half-width                     |
+| h_raw        | scalar   | optional height                      |
+| gate_probs   | (S)      | optional seed gating                 |
+| theta / a_raw| optional | anisotropy parameters                |
 
-### Seed Refinement
+#### Seed Refinement
 
-Seeds are refined using a **logit-space offset parameterization**:
 
-```
 seeds = sigmoid(logit(uv_init) + tanh(delta))
-```
 
-This avoids gradient problems caused by clamping.
 
----
-
-# 2. Voronoi Decoder
-
-The decoder converts predicted parameters into a **density field over the surface mesh**.
-
-### Pipeline
-
-```
-Seeds → Voronoi diagram → bisector distance → density field
-```
-
-The key geometric quantity:
-
-```
-d(x) = signed distance to Voronoi bisector
-```
-
-Density is defined as:
-
-```
-rho(x) = sigmoid((w - |d(x)|) / beta)
-```
-
-Where
-
-* `w` = strut half-width
-* `beta` = smoothing parameter
-
-This produces a **smooth differentiable strut band centered on Voronoi edges**.
+✔ stable gradients  
+✔ no hard clipping  
+✔ bounded domain  
 
 ---
 
-# 3. FEM Solver
+### 2. 🔷 Voronoi Decoder (Differentiable Geometry)
 
-The density field is mapped to FEM material density.
+Converts predicted parameters into a **density field over the surface mesh**.
 
-The solver returns:
+#### Pipeline
 
-* structural **compliance**
-* **stress field**
 
-Compliance is used as the main structural objective.
+Seeds → Soft Voronoi → Bisector Distance → Density Field
 
-To avoid numerical instability:
 
-```
+#### Density Definition
+
+
+ρ(x) = sigmoid((w - |d(x)|) / beta)
+
+
+Where:
+
+- `d(x)` = distance to Voronoi bisector  
+- `w` = strut half-width  
+- `beta` = smoothing parameter  
+
+---
+
+### 🔶 Differentiable Edge Field
+
+To capture Voronoi edges:
+
+
+edge_field = 1 - ∏ (1 - band_ij)
+
+
+This:
+
+- approximates the union of Voronoi edges  
+- remains fully differentiable  
+- is critical for clean strut formation  
+
+---
+
+### 🔷 Boundary Handling
+
+To prevent boundary artifacts:
+
+
+weight = 1 - rho_boundary + alpha * rho_boundary
+
+
+Used in volume computation to reduce boundary material.
+
+---
+
+### 3. 🏗️ FEM Solver
+
+Maps density to structural response.
+
+Outputs:
+
+- compliance
+- optional stress field
+
+#### Stability
+
+
 rho_FEM = max(rho, density_floor)
-```
+
 
 ---
 
-# 4. Training Loop (NN_Trainer)
+### 4. 🔁 Training Loop (NN_Trainer)
 
-The trainer optimizes PPNet parameters using multiple losses.
+Optimizes:
 
-Optimized variables include:
-
-* seed positions
-* strut width
-* optional anisotropy parameters
+- seed positions
+- strut width
+- optional anisotropy
 
 ---
 
-# Loss Functions
+## 🎯 Loss Function
 
-The total loss combines multiple objectives:
 
-```
 L_total =
-  λ_vol   L_vol
-+ λ_fem   L_fem
-+ λ_rep   L_seed_repulsion
-+ λ_bnd   L_boundary
-+ λ_strut L_strut
-```
+λ_vol L_vol
+
+λ_fem L_fem
+
+λ_rep L_rep
+
+λ_bnd L_bnd
+
+λ_strut L_strut
+
 
 ---
 
-## Volume Loss
+### 📦 Volume Loss
 
-Matches the target volume fraction.
 
-```
-vol = Σ (rho * vertex_area) / Σ(vertex_area)
-L_vol = (vol - target_volfrac)^2
-```
+vol = Σ (ρ A_v) / Σ(A_v)
+L_vol = (vol - target)^2
+
 
 ---
 
-## FEM Compliance Loss
+### 🏗️ FEM Loss
 
-Minimizes structural compliance.
 
-```
 L_fem = compliance / normalization_factor
-```
+
 
 ---
 
-## Seed Repulsion Loss
+### 🔁 Seed Repulsion
 
-Prevents Voronoi seeds from collapsing together.
 
-```
 L_rep = mean(exp(-||si - sj||² / σ²))
-```
+
 
 ---
 
-## Boundary Repulsion Loss
+### 🚧 Boundary Repulsion
 
-Prevents seeds from approaching the surface boundary.
 
-```
 penalty = exp(-distance_to_boundary / margin)
-```
+
 
 ---
 
-# Strutness Loss
+### 🔷 Strutness Loss
 
-Ensures material aligns with Voronoi edges.
+#### Edge solidification
 
-It contains two components.
 
-### Edge Solidification
+L_edge = mean(edge_field * (1 - ρ)^2)
 
-Encourages density near Voronoi bisectors.
 
-```
-Lse = mean((1 - rho_edge)^2)
-```
+#### Void suppression
 
-### Void Suppression
 
-Encourages empty space away from edges.
+L_void = mean((1 - edge_field) * ρ^2)
 
-```
-Lsv = mean(rho_void^2)
-```
 
-### Combined Loss
+#### Combined
 
-```
-L_strut = λ_se Lse + λ_sv Lsv
-```
 
-This enforces:
+L_strut = λ_edge L_edge + λ_void L_void
 
-* solid struts
-* clear void regions
 
 ---
 
-# Geometric Width Parameter
+## 📏 Geometric Width Parameter
 
-Previously strut thickness depended on a Voronoi threshold parameter `τ`, which caused instability.
 
-The updated model introduces a **direct geometric width parameter**:
-
-```
 w = strut half-width
 thickness = 2w
-```
 
-The neural network predicts:
 
-```
-w_raw → w
-```
-
-This provides:
-
-* explicit thickness control
-* smooth differentiability
-* stable optimization
+✔ explicit  
+✔ differentiable  
+✔ stable  
 
 ---
 
-# Training Diagnostics
-
-During training the system logs:
-
-* `L_total`
-* `L_vol`
-* `L_fem`
-* `L_strut`
-* `L_rep`
-* `L_bnd`
-* volume fraction
-* compliance
-* `w_geo` (average width)
-* `Lse`
-* `Lsv`
-* `rho(min/mean/max)`
-* `Δrho`
-* `Δseed`
-* gradient magnitude
-
-These diagnostics help monitor optimization behaviour.
-
----
-
-# Visualization
-
-Two visualization modes are available.
+## 🎨 Visualization
 
 ### Stepwise Evolution
 
-Displays:
+| Initial | Mid | Final |
+|--------|-----|------|
+| ![](assets/init.png) | ![](assets/mid.png) | ![](assets/final.png) |
 
-* initial density
-* mid optimization
-* final density
-
-along with seed positions.
+---
 
 ### Final Structure
 
-Optionally shows a **thresholded density visualization**.
+
+ρ > threshold → solid
+
+
+Recommended:
+
+- `0.5` → true geometry  
+- `0.6–0.7` → cleaner struts  
 
 ---
 
-# Current System Behaviour
+## 🎥 Evolution (GIF)
 
-Typical observations:
-
-* the optimizer strongly adjusts **strut width**
-* width decreases to reduce volume
-* seeds move moderately
-* topology remains mostly fixed
-
-Typical evolution:
-
-```
-large width → high volume
-optimizer shrinks width → volume decreases
-structure converges
-```
+<p align="center">
+  <img src="assets/stepwise.gif" width="80%">
+</p>
 
 ---
 
-# Current Challenges
+## ⚙️ Recommended Settings
 
-### Volume vs Structural Strength
 
-Very low volume fractions force struts to become extremely thin.
+beta = 0.005
+lam_strut = 0.1 – 0.2
+lam_fem = 3 – 5
 
-### Strut Solidification
-
-Struts can become weak if width shrinks excessively.
-
-### Topology Change
-
-Seed motion is limited and topology changes are rare.
 
 ---
 
-# Future Work
+## 📊 Training Diagnostics
 
-Potential improvements include:
+Logged per iteration:
 
-* adaptive seed insertion/removal
-* topology exploration strategies
-* anisotropic Voronoi structures
-* multi-objective structural optimization
+- total loss + components
+- compliance
+- volume fraction
+- density stats (min / mean / max)
+- Δrho, Δseed
+- gradient magnitude
+- width (`w_geo`)
 
 ---
+
+## ⚠️ Common Issues
+
+| Problem | Fix |
+|--------|-----|
+| blurry structures | decrease `beta` |
+| weak struts | increase `lam_strut` |
+| FEM dominates | reduce `lam_fem` |
+| boundary artifacts | enable boundary weighting |
+
+---
+
+## 🧠 Key Insights
+
+- structure emerges from **geometry + optimization**
+- width is the **main control variable**
+- FEM provides **global guidance**
+- strutness enforces **local structure**
+
+---
+
+# 📊 Results (TO FILL)
+
+## Quantitative Results
+
+| Metric | Value |
+|-------|------|
+| Target Volume Fraction | XXX |
+| Achieved Volume Fraction | XXX |
+| Compliance | XXX |
+| Mean Strut Width | XXX |
+
+---
+
+## Qualitative Observations
+
+- [ ] Struts are continuous and well-defined  
+- [ ] No boundary artifacts  
+- [ ] Clear Voronoi topology  
+- [ ] Good structural performance  
+
+---
+
+## Comparison (Optional)
+
+| Method | Compliance ↓ | Volume | Notes |
+|-------|-------------|--------|------|
+| Ours | XXX | XXX | Voronoi structured |
+| Baseline (SIMP) | XXX | XXX | irregular |
+
+---
+
+# 🔮 Future Work
+
+- adaptive seed insertion/removal  
+- topology exploration  
+- anisotropic Voronoi lattices  
+- manufacturing constraints  
+- binary (threshold-free) output  
+
+---
+
+# 📄 Paper (Work in Progress)
+
+SIGGRAPH-style paper draft available in `/paper/`.
+
+---
+
+# ⭐ Acknowledgements
+
+If you use this work, please consider citing (to be added).
+
+---
+
+# 📌 Summary
+
+This framework enables:
+
+- differentiable Voronoi geometry  
+- neural topology optimization  
+- FEM-driven structural design  
+- interpretable lattice structures  
