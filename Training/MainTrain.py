@@ -1069,7 +1069,7 @@ class NN_Trainer:
                     best_score = score
                     diff = best_step - step
                     best_step = step
-                    best_vol_frac = float(vol_frac.detach().item())
+                    best_vol_frac = float(vol_frac_eff.detach().item())
                     best_comp = float(comp_val.detach().item())
                     best_w_geo = float(w_geo_mean.detach().item())
                     best_rho = rho.detach().clone()
@@ -1218,7 +1218,7 @@ class NN_Trainer:
 
         print(
             f"FINAL RETURNED: best_step={best_step}, best_score={best_score:.6f} | "
-            f"vol={best_vol_frac:.3e}, comp={best_comp:.3e}, w_geo={best_w_geo:.3e}"
+            f"vol_eff={best_vol_frac:.3e}, comp={best_comp:.3e}, w_geo={best_w_geo:.3e}"
         )
 
         if self.writer is not None:

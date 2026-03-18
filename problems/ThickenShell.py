@@ -21,6 +21,8 @@ class ThickenShell(problemBase):
 
         self.brep_bbox = None
         self.thickness = float(thickness)
+        self.face_bboxes = None
+        self.samples_by_face = None
         self.voxel_size = float(voxel_size)
         self.extra_layers = int(extra_layers)
         self.tangential_tol = None if tangential_tol is None else float(tangential_tol)
@@ -53,9 +55,10 @@ class ThickenShell(problemBase):
 
         if tensors is None:
             raise ValueError("tensors must be provided at this stage")
-        
+
         # Get CAD info about the shell geometry and samples from the tensors. Sample: points_xyz, Xu, Xv, face_areas, etc. Also parse the bounding box of the BREP geometry.
         self.set_cad_samples(tensors)
+   
 
         # Build a full structured voxel grid that covers the padded bounding box of the shell.
         # This creates a rectangular grid (mesh), initializes empty boundary conditions,
@@ -64,6 +67,7 @@ class ThickenShell(problemBase):
         # shape is imposed later by voxelize_shell_from_samples(), which marks which voxels
         # belong to the shell thickness via elem_occupancy.
         self.mesh, self.boundaryCondition, self.materialProperty = self.shellSettings()
+
 
 
         # Voxelize the shell midsurface samples into the structured voxel grid.
@@ -98,11 +102,16 @@ class ThickenShell(problemBase):
         # Nodes belonging to voxels that are part of the shell (avoid selecting nodes in empty space)
         shell_nodes = self.occupied_node_ids()
 
+        # Use the actual occupied shell extent rather than the full padded grid box.
+        # This works better for multi-face inputs and avoids selecting nodes from empty padding.
+        bbox = self.occupied_axis_bounds()
         # Recompute the padded bounding box used to build the voxel grid
         bbox = self.padded_bbox_from_midsurface(self.brep_bbox, self.thickness, self.voxel_size, self.extra_layers)
 
         force_box_nodes= None
         force_nodes = None
+
+        
 
         if(self.BC_dir == "x"):
                     # Nodes in a small region near the bottom of the grid → candidate fixed support nodes
@@ -214,35 +223,57 @@ class ThickenShell(problemBase):
             pass
         return np.asarray(x)
 
+    def _normalize_single_bbox(self, bbox):
+        required = ('xmin', 'xmax', 'ymin', 'ymax', 'zmin', 'zmax')
+        if not isinstance(bbox, dict) or not all(k in bbox for k in required):
+            raise ValueError(f"Unsupported single-face BBX format: {bbox}")
+        return {
+            'xmin': float(bbox['xmin']),
+            'xmax': float(bbox['xmax']),
+            'ymin': float(bbox['ymin']),
+            'ymax': float(bbox['ymax']),
+            'zmin': float(bbox['zmin']),
+            'zmax': float(bbox['zmax']),
+        }
     def parse_bbox(self, bbox_raw):
         """
         Accept either:
-          - {'xmin':..., 'xmax':..., 'ymin':..., 'ymax':..., 'zmin':..., 'zmax':...}
-          - {0: {'xmin':..., 'xmax':..., 'ymin':..., 'ymax':..., 'zmin':..., 'zmax':...}}
+        - {'xmin':..., 'xmax':..., 'ymin':..., 'ymax':..., 'zmin':..., 'zmax':...}
+        - {0: {...}, 1: {...}, ...}
+
+        Returns
+        -------
+        union_bbox : dict
+            Global union bounding box across all faces.
+        face_bboxes : dict[int, dict]
+            Per-face bounding boxes. For a single-face input, face id 0 is used.
         """
-        if isinstance(bbox_raw, dict):
-            if all(k in bbox_raw for k in ('xmin', 'xmax', 'ymin', 'ymax', 'zmin', 'zmax')):
-                return {
-                    'xmin': float(bbox_raw['xmin']),
-                    'xmax': float(bbox_raw['xmax']),
-                    'ymin': float(bbox_raw['ymin']),
-                    'ymax': float(bbox_raw['ymax']),
-                    'zmin': float(bbox_raw['zmin']),
-                    'zmax': float(bbox_raw['zmax']),
-                }
+        if not isinstance(bbox_raw, dict):
+            raise ValueError(f"Unsupported BBX format: {bbox_raw}")
 
-            if 0 in bbox_raw and isinstance(bbox_raw[0], dict):
-                b = bbox_raw[0]
-                return {
-                    'xmin': float(b['xmin']),
-                    'xmax': float(b['xmax']),
-                    'ymin': float(b['ymin']),
-                    'ymax': float(b['ymax']),
-                    'zmin': float(b['zmin']),
-                    'zmax': float(b['zmax']),
-                }
+        required = ('xmin', 'xmax', 'ymin', 'ymax', 'zmin', 'zmax')
+        if all(k in bbox_raw for k in required):
+            b = self._normalize_single_bbox(bbox_raw)
+            return b, {0: b.copy()}
 
-        raise ValueError(f"Unsupported BBX format: {bbox_raw}")
+        face_bboxes = {}
+        for fid, bbox in bbox_raw.items():
+            if not isinstance(bbox, dict):
+                raise ValueError(f"Unsupported BBX entry for face {fid}: {bbox}")
+            face_bboxes[int(fid)] = self._normalize_single_bbox(bbox)
+
+        if len(face_bboxes) == 0:
+            raise ValueError(f"Unsupported empty BBX format: {bbox_raw}")
+
+        union_bbox = {
+            'xmin': min(b['xmin'] for b in face_bboxes.values()),
+            'xmax': max(b['xmax'] for b in face_bboxes.values()),
+            'ymin': min(b['ymin'] for b in face_bboxes.values()),
+            'ymax': max(b['ymax'] for b in face_bboxes.values()),
+            'zmin': min(b['zmin'] for b in face_bboxes.values()),
+            'zmax': max(b['zmax'] for b in face_bboxes.values()),
+        }
+        return union_bbox, face_bboxes
 
     def set_cad_samples(self, tensors):
         self.uv = self.to_numpy(tensors["uv"])
@@ -252,14 +283,20 @@ class ThickenShell(problemBase):
         self.Xv = self.to_numpy(tensors["Xv"]).reshape(-1, 3)
         self.faces_ijk = self.to_numpy(tensors["faces_ijk"])
         self.pv_faces = self.to_numpy(tensors["pv_faces"])
-        self.face_id = self.to_numpy(tensors["face_id"]).reshape(-1)
+        self.face_id = self.to_numpy(tensors["face_id"]).reshape(-1).astype(np.int64)
         self.boundary_idx_ring1 = self.to_numpy(tensors["boundary_idx_ring1"])
         self.min_vol_frac = self.to_numpy(tensors["min_vol_frac"])
 
         self.sample_normals = self.compute_sample_normals(self.Xu, self.Xv)
 
         bbox_raw = tensors["BBX"]
-        self.brep_bbox = self.parse_bbox(bbox_raw)
+        self.brep_bbox, self.face_bboxes = self.parse_bbox(bbox_raw)
+
+        self.samples_by_face = {}
+        if self.face_id.shape[0] != self.points_xyz.shape[0]:
+            raise ValueError("face_id must have same length as points_xyz")
+        for fid in np.unique(self.face_id):
+            self.samples_by_face[int(fid)] = np.flatnonzero(self.face_id == fid).astype(np.int64)
 
     def occupied_node_ids(self):
         occ = self.elem_occupancy.astype(bool)   # shape (nelz, nelx, nely)
@@ -284,6 +321,20 @@ class ThickenShell(problemBase):
         normals = normals / np.clip(norm, eps, None)
         return normals
 
+    def voxel_center_is_near_bbox(self, center, bbox, margin):
+        return (
+            (bbox['xmin'] - margin <= center[0] <= bbox['xmax'] + margin) and
+            (bbox['ymin'] - margin <= center[1] <= bbox['ymax'] + margin) and
+            (bbox['zmin'] - margin <= center[2] <= bbox['zmax'] + margin)
+        )
+
+    def candidate_face_ids_for_center(self, center, margin):
+        if not self.face_bboxes:
+            return []
+        return [
+            fid for fid, bbox in self.face_bboxes.items()
+            if self.voxel_center_is_near_bbox(center, bbox, margin)
+        ]
     def voxelize_shell_from_samples(self, thickness, tangential_tol=None):
         centers = self.elem_centers.reshape(-1, 3)
         points = self.points_xyz
@@ -294,14 +345,29 @@ class ThickenShell(problemBase):
 
         half_t = 0.5 * thickness
         max_euclid = np.sqrt(half_t * half_t + tangential_tol * tangential_tol)
+        bbox_margin = half_t + tangential_tol + self.voxel_size
 
         occ = np.zeros((centers.shape[0],), dtype=np.uint8)
         sample_idx = -np.ones((centers.shape[0],), dtype=np.int64)
 
         for i, x in enumerate(centers):
-            diff = points - x[None, :]
+            candidate_face_ids = self.candidate_face_ids_for_center(x, bbox_margin)
+
+            if candidate_face_ids:
+                candidate_idx = np.concatenate([
+                    self.samples_by_face[fid] for fid in candidate_face_ids if fid in self.samples_by_face
+                ])
+            else:
+                candidate_idx = np.arange(points.shape[0], dtype=np.int64)
+
+            if candidate_idx.size == 0:
+                continue
+
+            candidate_points = points[candidate_idx]
+            diff = candidate_points - x[None, :]
             dist2 = np.einsum('ij,ij->i', diff, diff)
-            j = np.argmin(dist2)
+            local_j = np.argmin(dist2)
+            j = candidate_idx[local_j]
 
             p = points[j]
             n = normals[j]
@@ -616,6 +682,22 @@ class ThickenShell(problemBase):
 
         plotter.show()    
 
+    def occupied_axis_bounds(self):
+        occ = self.elem_occupancy.astype(bool)
+        if not np.any(occ):
+            return self.padded_bbox_from_midsurface(self.brep_bbox, self.thickness, self.voxel_size, self.extra_layers)
+
+        occ_centers = self.elem_centers[occ]
+        half = 0.5 * self.voxel_size
+        return {
+            'xmin': float(np.min(occ_centers[:, 0]) - half),
+            'xmax': float(np.max(occ_centers[:, 0]) + half),
+            'ymin': float(np.min(occ_centers[:, 1]) - half),
+            'ymax': float(np.max(occ_centers[:, 1]) + half),
+            'zmin': float(np.min(occ_centers[:, 2]) - half),
+            'zmax': float(np.max(occ_centers[:, 2]) + half),
+        }
+    
     def select_nodes_in_box(self, xmin=None, xmax=None, ymin=None, ymax=None, zmin=None, zmax=None):
         """
         Select node ids whose coordinates lie inside a rectangular box.

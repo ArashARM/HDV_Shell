@@ -20,7 +20,7 @@ from OCC.Core.GeomLProp import GeomLProp_SLProps
 from OCC.Core.BRepClass import BRepClass_FaceClassifier
 from OCC.Core.BRepBndLib import brepbndlib
 from OCC.Core.Bnd import Bnd_Box
-
+from scipy.spatial import Delaunay
 
 class CADTensorGenerator:
     """
@@ -382,6 +382,283 @@ class CADTensorGenerator:
             if tri is not None:
                 return tri
         return cls.triangulate_face_occ(face)
+
+
+    @staticmethod
+    def _jacobian_area_density(surf, u: float, v: float, tol: float = 1e-9):
+        props = GeomLProp_SLProps(surf, float(u), float(v), 1, float(tol))
+        if not props.IsNormalDefined():
+            return None
+        Xu = props.D1U()
+        Xv = props.D1V()
+        cx = Xu.Crossed(Xv)
+        J = float(cx.Magnitude())
+        if not np.isfinite(J) or J <= 1e-14:
+            return None
+        return {
+            "J": J,
+            "Xu": np.array([Xu.X(), Xu.Y(), Xu.Z()], dtype=float),
+            "Xv": np.array([Xv.X(), Xv.Y(), Xv.Z()], dtype=float),
+        }
+
+    @classmethod
+    def sample_surface_points_uniform_weighted_pool(
+        cls,
+        face,
+        M: int,
+        pool_size: int = 20000,
+        tol: float = 1e-7,
+        metric_tol: float = 1e-9,
+        use_fps: bool = True,
+        fps_pool_factor: int = 4,
+        device: str = "cpu",
+        rng: np.random.Generator | None = None,
+    ):
+        if rng is None:
+            rng = np.random.default_rng()
+
+        M = int(M)
+        pool_size = max(int(pool_size), M)
+
+        (umin, umax, vmin, vmax), surf = cls.face_uv_bounds_and_surface(face)
+        classifier = BRepClass_FaceClassifier()
+        u_periodic, v_periodic, u_period, v_period = cls.face_uv_periodicity(face)
+
+        wrap_u = False
+        try:
+            wrap_u = bool(
+                cls._should_wrap_u_true_seam(
+                    face, surf, float(umin), float(umax), float(vmin), float(vmax),
+                    classifier=classifier, tol_uv=tol,
+                )
+            )
+        except Exception:
+            wrap_u = False
+
+        uv_list, xyz_list, Xu_list, Xv_list, J_list = [], [], [], [], []
+        trials = 0
+        max_trials = max(20 * pool_size, 5000)
+
+        while len(uv_list) < pool_size and trials < max_trials:
+            trials += 1
+            u = rng.uniform(float(umin), float(umax))
+            v = rng.uniform(float(vmin), float(vmax))
+            if not cls._classify_inside(face, u, v, classifier, tol):
+                continue
+            geom = cls._jacobian_area_density(surf, u, v, tol=metric_tol)
+            if geom is None:
+                continue
+            p = surf.Value(float(u), float(v))
+            uv_list.append([u, v])
+            xyz_list.append([p.X(), p.Y(), p.Z()])
+            Xu_list.append(geom["Xu"])
+            Xv_list.append(geom["Xv"])
+            J_list.append(geom["J"])
+
+        if len(uv_list) < M:
+            raise RuntimeError(f"Only got {len(uv_list)} valid candidates, need at least {M}.")
+
+        uv_raw = np.asarray(uv_list, dtype=np.float32)
+        xyz = np.asarray(xyz_list, dtype=np.float32)
+        Xu = np.asarray(Xu_list, dtype=np.float32)
+        Xv = np.asarray(Xv_list, dtype=np.float32)
+        J = np.asarray(J_list, dtype=np.float64)
+
+        probs = J / max(J.sum(), 1e-30)
+        keep = min(len(uv_raw), max(M, fps_pool_factor * M))
+        idx = rng.choice(len(uv_raw), size=keep, replace=False, p=probs)
+
+        uv_raw = uv_raw[idx]
+        xyz = xyz[idx]
+        Xu = Xu[idx]
+        Xv = Xv[idx]
+        J = J[idx].astype(np.float32)
+
+        if keep > M:
+            if use_fps:
+                pts_t = torch.tensor(xyz, dtype=torch.float32, device=device)
+                idx_sel = cls.fps_3d(pts_t, S=M).detach().cpu().numpy()
+            else:
+                idx_sel = rng.choice(keep, size=M, replace=False)
+            uv_raw = uv_raw[idx_sel]
+            xyz = xyz[idx_sel]
+            Xu = Xu[idx_sel]
+            Xv = Xv[idx_sel]
+            J = J[idx_sel]
+
+        Lu = float(umax - umin) if abs(float(umax - umin)) > 1e-30 else 1.0
+        Lv = float(vmax - vmin) if abs(float(vmax - vmin)) > 1e-30 else 1.0
+        uv = np.empty_like(uv_raw, dtype=np.float32)
+        uv[:, 0] = (uv_raw[:, 0] - float(umin)) / Lu
+        uv[:, 1] = (uv_raw[:, 1] - float(vmin)) / Lv
+
+        return {
+            "uv_raw": uv_raw,
+            "uv": uv,
+            "points_xyz": xyz,
+            "Xu": Xu,
+            "Xv": Xv,
+            "J": J,
+            "u_raw_bounds": (float(umin), float(umax)),
+            "v_raw_bounds": (float(vmin), float(vmax)),
+            "u_periodic": bool(wrap_u),
+            "v_periodic": bool(v_periodic),
+            "u_period": None if u_period is None else float(u_period),
+            "v_period": None if v_period is None else float(v_period),
+        }
+
+    @classmethod
+    def triangulate_sampled_face(cls, face, uv_raw: np.ndarray, seam_rel_gap: float = 0.35, tol: float = 1e-7):
+        if uv_raw.shape[0] < 3:
+            return np.empty((0, 3), dtype=np.int64)
+
+        (umin, umax, vmin, vmax), _ = cls.face_uv_bounds_and_surface(face)
+        classifier = BRepClass_FaceClassifier()
+        Lu = float(umax - umin) if abs(float(umax - umin)) > 1e-30 else 1.0
+        Lv = float(vmax - vmin) if abs(float(vmax - vmin)) > 1e-30 else 1.0
+        uv_norm = np.empty_like(uv_raw, dtype=np.float64)
+        uv_norm[:, 0] = (uv_raw[:, 0] - float(umin)) / Lu
+        uv_norm[:, 1] = (uv_raw[:, 1] - float(vmin)) / Lv
+
+        try:
+            tri = Delaunay(uv_norm)
+        except Exception:
+            return np.empty((0, 3), dtype=np.int64)
+
+        simplices = np.asarray(tri.simplices, dtype=np.int64)
+        if simplices.size == 0:
+            return np.empty((0, 3), dtype=np.int64)
+
+        keep = []
+        for a, b, c in simplices:
+            tri_uv_raw = uv_raw[[a, b, c]]
+            ctr = tri_uv_raw.mean(axis=0)
+            if not cls._classify_inside(face, float(ctr[0]), float(ctr[1]), classifier, tol):
+                continue
+
+            tri_uv_norm = uv_norm[[a, b, c]]
+            edges = [
+                np.linalg.norm(tri_uv_norm[0] - tri_uv_norm[1]),
+                np.linalg.norm(tri_uv_norm[1] - tri_uv_norm[2]),
+                np.linalg.norm(tri_uv_norm[2] - tri_uv_norm[0]),
+            ]
+            if max(edges) > seam_rel_gap:
+                continue
+
+            area2 = abs(np.cross(tri_uv_norm[1] - tri_uv_norm[0], tri_uv_norm[2] - tri_uv_norm[0]))
+            if not np.isfinite(area2) or area2 <= 1e-12:
+                continue
+            keep.append([a, b, c])
+
+        if len(keep) == 0:
+            return np.empty((0, 3), dtype=np.int64)
+        return np.asarray(keep, dtype=np.int64)
+
+    def export_face_mesh_metric_points_triangulated(
+        self,
+        shape_path: str,
+        M_per_face: int,
+        pool_size_factor: int = 10,
+        fps_pool_factor: int = 4,
+        use_fps: bool = True,
+        triangulation_max_edge_rel: float = 0.35,
+    ):
+        shape = self.load_shape(shape_path)
+
+        mesh_rows = []
+        face_rows = []
+
+        for face_id, face in enumerate(self.iter_faces(shape)):
+            try:
+                samp = self.sample_surface_points_uniform_weighted_pool(
+                    face=face,
+                    M=M_per_face,
+                    pool_size=max(int(pool_size_factor * M_per_face), M_per_face),
+                    tol=1e-7,
+                    metric_tol=self.metric_tol,
+                    use_fps=use_fps,
+                    fps_pool_factor=fps_pool_factor,
+                    device=self.device,
+                )
+            except Exception as e:
+                print(f"[warn] face {face_id}: point sampling failed: {e}")
+                continue
+
+            tri_faces = self.triangulate_sampled_face(
+                face,
+                samp["uv_raw"],
+                seam_rel_gap=triangulation_max_edge_rel,
+                tol=1e-7,
+            )
+            if tri_faces.shape[0] == 0:
+                print(f"[warn] face {face_id}: no valid triangulation from sampled points, skipped")
+                continue
+
+            bbox = self.face_bounding_box(face)
+            base_gvid = len(mesh_rows)
+            for lvid in range(samp["uv_raw"].shape[0]):
+                u_raw = float(samp["uv_raw"][lvid, 0])
+                v_raw = float(samp["uv_raw"][lvid, 1])
+                x, y, z = map(float, samp["points_xyz"][lvid])
+                Su_xyz = samp["Xu"][lvid]
+                Sv_xyz = samp["Xv"][lvid]
+                E = float(np.dot(Su_xyz, Su_xyz))
+                Fm = float(np.dot(Su_xyz, Sv_xyz))
+                G = float(np.dot(Sv_xyz, Sv_xyz))
+                En, Fn, Gn = self.metric_EFG_normalized(E, Fm, G, *samp["u_raw_bounds"], *samp["v_raw_bounds"])
+                det = (En * Gn) - (Fn * Fn)
+                metric_valid = bool(np.isfinite(det) and det > float(self.det_min) and En > 0.0 and Gn > 0.0)
+                mesh_rows.append({
+                    "face_id": int(face_id),
+                    "lvid": int(lvid),
+                    "gvid": int(base_gvid + lvid),
+                    "u": float(samp["uv"][lvid, 0]),
+                    "v": float(samp["uv"][lvid, 1]),
+                    "u_raw": u_raw,
+                    "v_raw": v_raw,
+                    "x": x,
+                    "y": y,
+                    "z": z,
+                    "Su_x": float(Su_xyz[0]),
+                    "Su_y": float(Su_xyz[1]),
+                    "Su_z": float(Su_xyz[2]),
+                    "Sv_x": float(Sv_xyz[0]),
+                    "Sv_y": float(Sv_xyz[1]),
+                    "Sv_z": float(Sv_xyz[2]),
+                    "E": float(En),
+                    "F": float(Fn),
+                    "G": float(Gn),
+                    "det": float(det),
+                    "metric_valid": metric_valid,
+                    "bbox_xmin": float(bbox["xmin"]),
+                    "bbox_ymin": float(bbox["ymin"]),
+                    "bbox_zmin": float(bbox["zmin"]),
+                    "bbox_xmax": float(bbox["xmax"]),
+                    "bbox_ymax": float(bbox["ymax"]),
+                    "bbox_zmax": float(bbox["zmax"]),
+                    "face_u_periodic": bool(samp["u_periodic"]),
+                    "face_v_periodic": bool(samp["v_periodic"]),
+                    "surface_u_periodic": bool(samp["u_periodic"]),
+                    "surface_v_periodic": bool(samp["v_periodic"]),
+                    "face_u_period": samp["u_period"],
+                    "face_v_period": samp["v_period"],
+                    "face_u_raw_min": float(samp["u_raw_bounds"][0]),
+                    "face_u_raw_max": float(samp["u_raw_bounds"][1]),
+                    "face_v_raw_min": float(samp["v_raw_bounds"][0]),
+                    "face_v_raw_max": float(samp["v_raw_bounds"][1]),
+                })
+
+            for a, b, c in tri_faces:
+                face_rows.append({
+                    "face_id": int(face_id),
+                    "i": int(base_gvid + a),
+                    "j": int(base_gvid + b),
+                    "k": int(base_gvid + c),
+                })
+
+        mesh_df = pd.DataFrame(mesh_rows)
+        faces_df = pd.DataFrame(face_rows)
+        return mesh_df, faces_df
 
     # =========================================================================
     # 6) Export mesh tables
@@ -891,7 +1168,6 @@ class CADTensorGenerator:
             }
 
         print("MinVolFrac:", min_vol_frac)
-        print("uv device:", uv.device)
 
         return {
             "uv": uv,
@@ -912,16 +1188,68 @@ class CADTensorGenerator:
             "face_periodicity": face_periodicity,
             "num_faces": len(face_tensors),
         }
-    def generate_from_file(self, shape_path: str, input_ring: int, visualize: bool = False, visualize_face_id: int | None = None):
+    def generate_from_file_points_triangulated(
+        self,
+        shape_path: str,
+        input_ring: int,
+        M_per_face: int,
+        pool_size_factor: int = 10,
+        fps_pool_factor: int = 4,
+        use_fps: bool = True,
+        triangulation_max_edge_rel: float = 0.35,
+    ):
+        mesh_df, faces_df = self.export_face_mesh_metric_points_triangulated(
+            shape_path=shape_path,
+            M_per_face=M_per_face,
+            pool_size_factor=pool_size_factor,
+            fps_pool_factor=fps_pool_factor,
+            use_fps=use_fps,
+            triangulation_max_edge_rel=triangulation_max_edge_rel,
+        )
+        tensors = self.generate_input_tensors_from_dataframes(mesh_df, faces_df, input_ring=input_ring)
+        return mesh_df, faces_df, tensors
+
+    def generate_from_file(
+        self,
+        shape_path: str,
+        input_ring: int,
+        visualize: bool = False,
+        visualize_face_id: int | None = None,
+        mode: str = "mesh",
+        M_per_face: int | None = None,
+        pool_size_factor: int = 10,
+        fps_pool_factor: int = 4,
+        use_fps: bool = True,
+        triangulation_max_edge_rel: float = 0.35,
+    ):
         """
         Full pipeline:
           CAD file -> mesh_df/faces_df -> tensors
+
+        mode:
+          - "mesh": original OCC/manual triangulation path
+          - "points_triangulated": area-weighted surface sampling + UV triangulation
         """
-        mesh_df, faces_df = self.export_face_mesh_metric(
-            shape_path=shape_path,
-            visualize=visualize,
-            visualize_face_id=visualize_face_id,
-        )
+        if mode == "mesh":
+            mesh_df, faces_df = self.export_face_mesh_metric(
+                shape_path=shape_path,
+                visualize=visualize,
+                visualize_face_id=visualize_face_id,
+            )
+        elif mode == "Sampled_points":
+            if M_per_face is None:
+                raise ValueError("M_per_face must be provided when mode='points_triangulated'.")
+            mesh_df, faces_df = self.export_face_mesh_metric_points_triangulated(
+                shape_path=shape_path,
+                M_per_face=M_per_face,
+                pool_size_factor=pool_size_factor,
+                fps_pool_factor=fps_pool_factor,
+                use_fps=use_fps,
+                triangulation_max_edge_rel=triangulation_max_edge_rel,
+            )
+        else:
+            raise ValueError(f"Unknown mode: {mode}")
+
         tensors = self.generate_input_tensors_from_dataframes(mesh_df, faces_df, input_ring=input_ring)
         return mesh_df, faces_df, tensors
     @staticmethod
@@ -1123,4 +1451,4 @@ class CADTensorGenerator:
             "ymax": float(ymax),
             "zmin": float(zmin),
             "zmax": float(zmax),
-        }
+        }    
