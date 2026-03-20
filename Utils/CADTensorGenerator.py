@@ -655,7 +655,7 @@ class CADTensorGenerator:
                     "j": int(base_gvid + b),
                     "k": int(base_gvid + c),
                 })
-
+ 
         mesh_df = pd.DataFrame(mesh_rows)
         faces_df = pd.DataFrame(face_rows)
         return mesh_df, faces_df
@@ -837,6 +837,7 @@ class CADTensorGenerator:
                     "j": int(face_lvid_to_gvid[kb]),
                     "k": int(face_lvid_to_gvid[kc]),
                 })
+            #break    
 
         mesh_df = pd.DataFrame(mesh_rows)
         faces_df = pd.DataFrame(face_rows)

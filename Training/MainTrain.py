@@ -11,10 +11,14 @@ from torch.utils.tensorboard import SummaryWriter
 class TrainingConfig:
     seed_number: int = 15
     use_anisotropy: bool = True
+    # height is predicted; otherwise height is fixed
     fixed_height: float | None = None
     target_volfrac: float = 0.5
+    # radius/scale for seed-seed repulsion
     seed_repulsion_sigma: float = 0.08
+    # how strongly seeds are kept away from boundaries
     boundary_margin: float = 0.05
+    freeze_w: bool = False
 
     w_min: float = 0.005
     w_max: float = 0.5
@@ -25,13 +29,14 @@ class TrainingConfig:
     lam_bnd: float = 0.5
 
     # Differentiable strutness loss
-    lam_strut: float = 0.0
+    lam_strut: float = 0.02
     lam_strut_edge: float = 1.0
     lam_strut_void: float = 0.25
 
+    # Raw compliance can be very large, so it gets divided by 1e10.
     comp_normalize_by: float | None = 1e10
     normalize_losses: bool = True
-
+    #Density passed to FEM is clamped from below to avoid near-zero stiffness collapse.
     fem_density_floor: float = 0.02
     skip_bad_fem_steps: bool = True
 
@@ -57,6 +62,13 @@ class TrainingConfig:
     use_boundary_weighted_volume: bool = True
     boundary_vol_weight: float = 0.20
 
+    Offset_scale:float = 1.00
+    scheduler_milestones: tuple[int, ...] = (80, 160)
+    scheduler_gamma: float = 0.5
+
+    save_fem_debug_history: bool = True
+    grad_clip_norm: float | None = 1.0
+
     # TensorBoard
     tensorboard_enabled: bool = True
     tensorboard_log_root: str = "runs"
@@ -64,7 +76,12 @@ class TrainingConfig:
     tb_flush_secs: int = 10
     tb_log_histograms_every: int = 200
 
-
+# Running exponential moving average of loss magnitude:
+# new_scale = m * old_scale + (1 - m) * |x| (where Later ->  Normalized loss = RawLoss / new_scale)
+# Interpretation:
+# - Each loss is scaled relative to its recent average magnitude (EMA).
+# - Losses contribute strongly when they are large compared to their typical value.
+# - Even when a loss is small (optimized), it still contributes to maintain that level.
 class RunningNorm:
     def __init__(self, momentum: float = 0.99, eps: float = 1e-12):
         self.val = None
@@ -109,7 +126,7 @@ class NN_Trainer:
         self.writer = None
         self.tensorboard_log_dir = None
         self._init_tensorboard()
-
+    ##### *************************************************** tensorboard settings and inputs ***************************************************
     def _init_tensorboard(self):
         if not self.cfg.tensorboard_enabled:
             return
@@ -139,6 +156,58 @@ class NN_Trainer:
             self.writer.close()
             self.writer = None
 
+
+    def _true_open_boundary_idx(self, ft, tol=None):
+        """
+        Return boundary vertex indices that correspond to real open boundaries,
+        excluding periodic seam vertices.
+
+        Assumes:
+        - ft["uv"] is local UV, shape [N, 2]
+        - ft["boundary_idx_ring1"] is raw topological boundary indices
+        - ft may contain "u_periodic" and "v_periodic"
+        """
+        if ("boundary_idx_ring1" not in ft) or ft["boundary_idx_ring1"] is None:
+            return torch.empty(0, dtype=torch.long, device=ft["uv"].device)
+
+        bidx = torch.unique(ft["boundary_idx_ring1"].to(dtype=torch.long))
+        if bidx.numel() == 0:
+            return bidx
+
+        uv = ft["uv"]
+        u = uv[:, 0]
+        v = uv[:, 1]
+
+        u_periodic = bool(ft.get("u_periodic", False))
+        v_periodic = bool(ft.get("v_periodic", False))
+
+        # tolerance for detecting seam-side vertices
+        if tol is None:
+            u_span = (u.max() - u.min()).abs()
+            v_span = (v.max() - v.min()).abs()
+            base_span = torch.maximum(u_span, v_span).clamp_min(torch.as_tensor(1.0, device=uv.device, dtype=uv.dtype))
+            tol = 1e-4 * float(base_span.detach().item())
+
+        ub = u[bidx]
+        vb = v[bidx]
+
+        keep = torch.ones_like(bidx, dtype=torch.bool)
+
+        if u_periodic:
+            umin = u.min()
+            umax = u.max()
+            is_u_seam = (ub - umin).abs() <= tol
+            is_u_seam = is_u_seam | ((ub - umax).abs() <= tol)
+            keep = keep & (~is_u_seam)
+
+        if v_periodic:
+            vmin = v.min()
+            vmax = v.max()
+            is_v_seam = (vb - vmin).abs() <= tol
+            is_v_seam = is_v_seam | ((vb - vmax).abs() <= tol)
+            keep = keep & (~is_v_seam)
+
+        return bidx[keep]
     @staticmethod
     def _to_float_if_finite(x):
         if isinstance(x, torch.Tensor):
@@ -273,7 +342,7 @@ class NN_Trainer:
 
             if dbg.get("failure_reason"):
                 self.writer.add_text("FEMDebug/FailureReason", str(dbg["failure_reason"]), step)
-
+    ##### *************************************************** tensorboard settings and inputs ***************************************************
     @staticmethod
     def volume_loss_constant_height(
         rho: torch.Tensor,
@@ -282,7 +351,8 @@ class NN_Trainer:
         eps: float = 1e-12,
     ) -> torch.Tensor:
         vol_frac = (rho * A_v).sum() / (A_v.sum() + eps)
-        return (vol_frac - target_volfrac) ** 2
+        vol_loss= (vol_frac - target_volfrac) ** 2
+        return  vol_loss
 
     @staticmethod
     def volume_loss_with_boundary_discount(
@@ -353,9 +423,61 @@ class NN_Trainer:
         if normalize_by is not None:
             return comp / (float(normalize_by) + eps)
         return comp
-
     @staticmethod
     def strutness_loss_from_edge_field(
+        rho: torch.Tensor,
+        edge_field: torch.Tensor,
+        w: torch.Tensor | float,
+        w_ref: float,
+        lam_edge: float = 1.0,
+        lam_void: float = 1.0,
+        eps: float = 1e-12,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+
+        rho = rho.clamp(0.0, 1.0)
+        edge_field = edge_field.clamp(0.0, 1.0)
+        void_field = 1.0 - edge_field
+
+        # Convert w to tensor on correct device/dtype
+        if not torch.is_tensor(w):
+            w = torch.tensor(w, device=rho.device, dtype=rho.dtype)
+        else:
+            w = w.to(device=rho.device, dtype=rho.dtype)
+
+        # Broadcast w to rho shape.
+        # Common case:
+        #   rho.shape = (B, H, W) or (B, 1, H, W)
+        #   w.shape   = (B,)
+        if w.dim() == 0:
+            while w.dim() < rho.dim():
+                w = w.unsqueeze(0)
+        elif w.dim() == 1 and rho.dim() >= 2 and w.shape[0] == rho.shape[0]:
+            while w.dim() < rho.dim():
+                w = w.unsqueeze(-1)
+        else:
+            while w.dim() < rho.dim():
+                w = w.unsqueeze(-1)
+
+        # Width ratio in [0, 1+], then clamp to [0,1] for stable target scaling.
+        # If w < w_ref, edge target weakens.
+        # If w >= w_ref, target saturates at the original edge_field strength.
+        width_scale = (w / max(w_ref, eps)).clamp(0.0, 1.0)
+
+        # Width-aware edge target:
+        #   small w -> lower desired rho on edge regions
+        #   large w -> stronger desired rho on edge regions
+        edge_target = width_scale * edge_field
+
+        # Penalize mismatch to width-conditioned edge target
+        loss_edge = (edge_field * (rho - edge_target).pow(2)).sum() / (edge_field.sum() + eps)
+
+        # Keep non-edge regions empty
+        loss_void = (void_field * rho.pow(2)).sum() / (void_field.sum() + eps)
+
+        loss = lam_edge * loss_edge + lam_void * loss_void
+        return loss, loss_edge, loss_void
+    @staticmethod
+    def strutness_loss_from_edge_field_old(
         rho: torch.Tensor,
         edge_field: torch.Tensor,
         lam_edge: float = 1.0,
@@ -381,6 +503,7 @@ class NN_Trainer:
         loss = lam_edge * loss_edge + lam_void * loss_void
         return loss, loss_edge, loss_void
 
+    #“Is this scalar tensor a real finite number, not NaN or Inf?”
     @staticmethod
     def _scalar_tensor_is_finite(x: torch.Tensor) -> bool:
         return bool(torch.isfinite(x).reshape(()).detach().item())
@@ -635,6 +758,7 @@ class NN_Trainer:
         v_periodic,
         use_anisotropy,
         context_vector_size,
+        freeze_w,
     ):
         face_u_periodic = torch.tensor([bool(u_periodic)], dtype=torch.bool, device=device)
         face_v_periodic = torch.tensor([bool(v_periodic)], dtype=torch.bool, device=device)
@@ -658,6 +782,7 @@ class NN_Trainer:
             use_anisotropy=use_anisotropy,
             predict_height=(self.cfg.fixed_height is None),
             use_gating=False,
+            freeze_w= freeze_w
         ).to(device)
 
         return decoder, ppnet
@@ -676,6 +801,7 @@ class NN_Trainer:
                 v_periodic=ft.get("v_periodic", False),
                 use_anisotropy=cfg.use_anisotropy,
                 context_vector_size=cfg.context_vector_size,
+                freeze_w = cfg.freeze_w,
             )
             decoders.append(decoder)
             ppnets.append(ppnet)
@@ -710,7 +836,7 @@ class NN_Trainer:
         uv_init_list = []
 
         for ft in face_tensors:
-            boundary = torch.unique(ft["boundary_idx_ring1"])
+            boundary = self._true_open_boundary_idx(ft)
             seed_idx = self.generator.fps_3d(
                 ft["points_xyz"],
                 cfg.seed_number,
@@ -751,58 +877,134 @@ class NN_Trainer:
     # Training
     # ------------------------------------------------------------------
 
-    def train(
-        self,
-        uv,
-        Xu,
-        Xv,
-        points_xyz,
-        face_areas,
-        faces_ijk,
-        face_id,
-        boundary_idx_ring1,
-        face_tensors=None,
-    ):
+    def _validate_face_tensors(self, face_tensors):
+        required_keys = [
+            "face_id",
+            "uv",
+            "Xu",
+            "Xv",
+            "points_xyz",
+            "faces_ijk",
+            "face_areas",
+            "global_vertex_idx",
+        ]
+
+        if not isinstance(face_tensors, (list, tuple)) or len(face_tensors) == 0:
+            raise ValueError("face_tensors must be a non-empty list.")
+
+        ref_uv = face_tensors[0]["uv"]
+        ref_device = ref_uv.device
+        ref_dtype = ref_uv.dtype
+
+        for i, ft in enumerate(face_tensors):
+            missing = [k for k in required_keys if k not in ft]
+            if missing:
+                raise ValueError(f"face_tensors[{i}] is missing required keys: {missing}")
+
+            uv = ft["uv"]
+            Xu = ft["Xu"]
+            Xv = ft["Xv"]
+            points_xyz = ft["points_xyz"]
+            faces_ijk = ft["faces_ijk"]
+            face_areas = ft["face_areas"]
+            gidx = ft["global_vertex_idx"]
+
+            if uv.device != ref_device:
+                raise ValueError(f"face_tensors[{i}]['uv'] device mismatch: {uv.device} != {ref_device}")
+            if uv.dtype != ref_dtype:
+                raise ValueError(f"face_tensors[{i}]['uv'] dtype mismatch: {uv.dtype} != {ref_dtype}")
+
+            n_local = uv.shape[0]
+            if Xu.shape[0] != n_local or Xv.shape[0] != n_local or points_xyz.shape[0] != n_local:
+                raise ValueError(f"face_tensors[{i}] local tensor lengths do not match uv.shape[0]={n_local}")
+
+            if gidx.shape[0] != n_local:
+                raise ValueError(f"face_tensors[{i}]['global_vertex_idx'] length mismatch with local vertex count")
+
+            if gidx.dtype != torch.long:
+                raise ValueError(f"face_tensors[{i}]['global_vertex_idx'] must be torch.long")
+
+            if gidx.numel() > 0 and int(gidx.min().item()) < 0:
+                raise ValueError(f"face_tensors[{i}]['global_vertex_idx'] contains negative indices")
+
+            if faces_ijk.numel() > 0:
+                if faces_ijk.dtype != torch.long:
+                    raise ValueError(f"face_tensors[{i}]['faces_ijk'] must be torch.long")
+                fmin = int(faces_ijk.min().item())
+                fmax = int(faces_ijk.max().item())
+                if fmin < 0 or fmax >= n_local:
+                    raise ValueError(
+                        f"face_tensors[{i}]['faces_ijk'] contains invalid local indices "
+                        f"(min={fmin}, max={fmax}, n_local={n_local})"
+                    )
+
+            if face_areas.ndim != 1:
+                raise ValueError(f"face_tensors[{i}]['face_areas'] must be 1D")
+
+            if face_areas.shape[0] != faces_ijk.shape[0]:
+                raise ValueError(
+                    f"face_tensors[{i}]['face_areas'] length must match number of faces "
+                    f"({face_areas.shape[0]} != {faces_ijk.shape[0]})"
+                )
+
+
+    def _safe_weighted_mean(self, values, weights, dtype, device, eps):
+        if len(values) == 0:
+            return torch.zeros((), dtype=dtype, device=device)
+        v = torch.stack(values)
+        w = torch.stack(weights).to(dtype=v.dtype, device=v.device)
+        return (v * w).sum() / w.sum().clamp_min(eps)
+
+
+    def train(self, face_tensors):
         cfg = self.cfg
-        device = uv.device
-        dtype = uv.dtype
+        self._validate_face_tensors(face_tensors)
+
+        ref_uv = face_tensors[0]["uv"]
+        device = ref_uv.device
+        dtype = ref_uv.dtype
         mid_step = cfg.num_steps // 2
-        vertices_number = uv.shape[0]
 
-        if face_tensors is None:
-            face_tensors = [{
-                "face_id": 0,
-                "uv": uv,
-                "Xu": Xu,
-                "Xv": Xv,
-                "points_xyz": points_xyz,
-                "faces_ijk": faces_ijk,
-                "face_areas": face_areas,
-                "boundary_idx_ring1": boundary_idx_ring1,
-                "boundary_idx": boundary_idx_ring1,
-                "u_periodic": False,
-                "v_periodic": False,
-                "global_vertex_idx": torch.arange(vertices_number, device=device, dtype=torch.long),
-            }]
+        all_global_idx = torch.cat([ft["global_vertex_idx"] for ft in face_tensors], dim=0)
+        vertices_number = int(all_global_idx.max().item()) + 1
 
-        A_v = self.generator.vertex_area_lumped(vertices_number, faces_ijk, face_areas)
+        # Global area vector and local area cache
+        A_v = torch.zeros((vertices_number,), dtype=dtype, device=device)
+        local_vertex_areas = []
+        local_face_weights = []
+
+        for ft in face_tensors:
+            gidx = ft["global_vertex_idx"]
+            A_local = self.generator.vertex_area_lumped(
+                ft["uv"].shape[0],
+                ft["faces_ijk"],
+                ft["face_areas"],
+            ).to(device=device, dtype=dtype)
+
+            local_vertex_areas.append(A_local)
+            local_face_weights.append(A_local.sum().clamp_min(cfg.eps))
+
+            # This assumes triangle ownership is partitioned across face_tensors.
+            # If face patches overlap in area, A_v will reflect that overlap.
+            A_v[gidx] += A_local
 
         decoders, ppnets = self._build_face_models(face_tensors=face_tensors, device=device)
         uv_init_list = self._init_face_seeds(face_tensors)
+
         contexts = [
             torch.zeros(1, cfg.context_vector_size, device=device, dtype=dtype)
             for _ in face_tensors
         ]
 
-
-
         opt = self._build_optimizer(ppnets)
 
-        scheduler = torch.optim.lr_scheduler.MultiStepLR(
-    opt,
-    milestones=[80, 160],
-    gamma=0.5,
-)
+        scheduler = None
+        if getattr(cfg, "scheduler_milestones", None):
+            scheduler = torch.optim.lr_scheduler.MultiStepLR(
+                opt,
+                milestones=list(cfg.scheduler_milestones),
+                gamma=cfg.scheduler_gamma,
+            )
 
         norm_vol = RunningNorm()
         norm_rep = RunningNorm()
@@ -811,9 +1013,9 @@ class NN_Trainer:
         norm_fem = RunningNorm()
 
         best_score = float("inf")
-        best_vol_frac = float("inf")
-        best_comp = float("inf")
-        best_w_geo = float("inf")
+        best_vol_frac = None
+        best_comp = None
+        best_w_geo = None
         best_step = -1
         best_rho = None
         best_seeds = None
@@ -833,31 +1035,45 @@ class NN_Trainer:
         history = []
 
         for step in range(cfg.num_steps):
-            rho = torch.zeros((vertices_number,), dtype=dtype, device=device)
-            rho_boundary = torch.zeros((vertices_number,), dtype=dtype, device=device)
-            rho_v_all = torch.zeros((vertices_number,), dtype=dtype, device=device)
+            # Global accumulators with overlap-safe weighted averaging
+            rho_acc = torch.zeros((vertices_number,), dtype=dtype, device=device)
+            rho_wgt = torch.zeros((vertices_number,), dtype=dtype, device=device)
 
-            fiber_surface = torch.zeros((vertices_number, 3), dtype=dtype, device=device)
-            fiber_surface[:, 0] = 1.0
+            rho_b_acc = torch.zeros((vertices_number,), dtype=dtype, device=device)
+            rho_b_wgt = torch.zeros((vertices_number,), dtype=dtype, device=device)
+
+            rho_v_acc = torch.zeros((vertices_number,), dtype=dtype, device=device)
+            rho_v_wgt = torch.zeros((vertices_number,), dtype=dtype, device=device)
+
+            fiber_acc = torch.zeros((vertices_number, 3), dtype=dtype, device=device)
+            fiber_wgt = torch.zeros((vertices_number,), dtype=dtype, device=device)
 
             seeds_list = []
             pred_list = []
+
             rep_terms = []
             bnd_terms = []
-
             strut_terms = []
             strut_edge_terms = []
             strut_void_terms = []
             w_geo_terms = []
+            face_weights_this_step = []
 
-            for ft, decoder, ppnet, uv_init_i, context_i in zip(
-                face_tensors, decoders, ppnets, uv_init_list, contexts
+            for ft, decoder, ppnet, uv_init_i, context_i, A_local, face_weight_i in zip(
+                face_tensors,
+                decoders,
+                ppnets,
+                uv_init_list,
+                contexts,
+                local_vertex_areas,
+                local_face_weights,
             ):
-                pred_i = ppnet(context_i, uv_init_i, offset_scale=1)
+                pred_i = ppnet(context_i, uv_init_i, offset_scale=cfg.Offset_scale)
 
                 seeds_raw_i = pred_i["seeds_raw"][0]
                 w_raw_i = pred_i["w_raw"][0]
-                h_raw_i = None if self.cfg.fixed_height is not None else pred_i["h_raw"][0]
+                h_raw_i = None if cfg.fixed_height is not None else pred_i["h_raw"][0]
+
                 gates_i = pred_i.get("gate_probs", None)
                 gates_i = gates_i[0] if gates_i is not None else None
 
@@ -872,12 +1088,10 @@ class NN_Trainer:
 
                 boundary_uv_i = None
                 boundary_face_id_i = None
-                if (
-                    ("boundary_idx_ring1" in ft)
-                    and ft["boundary_idx_ring1"] is not None
-                    and ft["boundary_idx_ring1"].numel() > 0
-                ):
-                    boundary_uv_i = ft["uv"][ft["boundary_idx_ring1"]]
+
+                true_bidx_i = self._true_open_boundary_idx(ft)
+                if true_bidx_i.numel() > 0:
+                    boundary_uv_i = ft["uv"][true_bidx_i]
                     boundary_face_id_i = torch.zeros(
                         boundary_uv_i.shape[0],
                         dtype=torch.long,
@@ -899,37 +1113,62 @@ class NN_Trainer:
                     boundary_face_id=boundary_face_id_i,
                 )
 
-                if len(decoder_out) == 16:
-                    (
-                        _w_soft_i,
-                        _d_i,
-                        _M_i,
-                        seeds_i,
-                        rho_i,
-                        _t_uv_raw_i,
-                        _t_uv_i,
-                        _h_i,
-                        w_geo_i,
-                        fiber3d_i,
-                        _pair_strength_i,
-                        _band_ij_i,
-                        _pair_relevance_i,
-                        rho_v_i,
-                        rho_b_i,
-                        edge_field_i,
-                    ) = decoder_out
-                else:
+
+
+                if len(decoder_out) != 16:
                     raise ValueError(
                         "Decoder output does not match expected signature "
                         "(..., w_geo, fiber3d, pair_strength, band_ij, pair_relevance, "
                         "rho_v, rho_b, edge_field)."
                     )
 
+                (
+                    _w_soft_i,
+                    _d_i,
+                    _M_i,
+                    seeds_i,
+                    rho_i,
+                    _t_uv_raw_i,
+                    _t_uv_i,
+                    _h_i,
+                    w_geo_i,
+                    fiber3d_i,
+                    _pair_strength_i,
+                    _band_ij_i,
+                    _pair_relevance_i,
+                    rho_v_i,
+                    rho_b_i,
+                    edge_field_i,
+                ) = decoder_out
+
+                face_valid = True
+                for name, t in {
+                    "seeds_i": seeds_i,
+                    "rho_i": rho_i,
+                    "fiber3d_i": fiber3d_i,
+                    "rho_v_i": rho_v_i,
+                    "rho_b_i": rho_b_i,
+                    "edge_field_i": edge_field_i,
+                }.items():
+                    if not torch.isfinite(t).all():
+                        print(f"[step {step}] face {ft['face_id']} invalid tensor: {name}")
+                        face_valid = False
+                        break
+
                 gidx = ft["global_vertex_idx"]
-                rho[gidx] = rho_i
-                rho_boundary[gidx] = rho_b_i
-                rho_v_all[gidx] = rho_v_i
-                fiber_surface[gidx] = fiber3d_i
+                w_local = A_local.clamp_min(cfg.eps)
+
+                rho_acc[gidx] += rho_i * w_local
+                rho_wgt[gidx] += w_local
+
+                rho_b_acc[gidx] += rho_b_i * w_local
+                rho_b_wgt[gidx] += w_local
+
+                rho_v_acc[gidx] += rho_v_i * w_local
+                rho_v_wgt[gidx] += w_local
+
+                fiber_acc[gidx] += fiber3d_i * w_local[:, None]
+                fiber_wgt[gidx] += w_local
 
                 seeds_list.append(seeds_i)
                 pred_list.append({
@@ -949,7 +1188,6 @@ class NN_Trainer:
                         eps=cfg.eps,
                     )
                 )
-
                 bnd_terms.append(
                     self.boundary_repulsion_term(
                         seeds=seeds_i,
@@ -961,11 +1199,14 @@ class NN_Trainer:
                 )
 
                 w_geo_terms.append(w_geo_i.reshape(()))
+                face_weights_this_step.append(face_weight_i.reshape(()))
 
                 if cfg.lam_strut != 0.0:
                     loss_strut_i, loss_strut_edge_i, loss_strut_void_i = self.strutness_loss_from_edge_field(
                         rho=rho_v_i,
                         edge_field=edge_field_i,
+                        w=w_raw_i,
+                        w_ref = 0.25,
                         lam_edge=cfg.lam_strut_edge,
                         lam_void=cfg.lam_strut_void,
                         eps=cfg.eps,
@@ -973,6 +1214,33 @@ class NN_Trainer:
                     strut_terms.append(loss_strut_i)
                     strut_edge_terms.append(loss_strut_edge_i)
                     strut_void_terms.append(loss_strut_void_i)
+
+            rho = rho_acc / rho_wgt.clamp_min(cfg.eps)
+            rho_boundary = rho_b_acc / rho_b_wgt.clamp_min(cfg.eps)
+            rho_v_all = rho_v_acc / rho_v_wgt.clamp_min(cfg.eps)
+
+            fiber_surface = fiber_acc / fiber_wgt.clamp_min(cfg.eps)[:, None]
+            fiber_norm = fiber_surface.norm(dim=1, keepdim=True).clamp_min(cfg.eps)
+            fiber_surface = fiber_surface / fiber_norm
+
+            loss_rep = self._safe_weighted_mean(
+                rep_terms, face_weights_this_step, dtype, device, cfg.eps
+            )
+            loss_bnd = self._safe_weighted_mean(
+                bnd_terms, face_weights_this_step, dtype, device, cfg.eps
+            )
+            loss_strut = self._safe_weighted_mean(
+                strut_terms, face_weights_this_step, dtype, device, cfg.eps
+            )
+            loss_strut_edge = self._safe_weighted_mean(
+                strut_edge_terms, face_weights_this_step, dtype, device, cfg.eps
+            )
+            loss_strut_void = self._safe_weighted_mean(
+                strut_void_terms, face_weights_this_step, dtype, device, cfg.eps
+            )
+            w_geo_mean = self._safe_weighted_mean(
+                w_geo_terms, face_weights_this_step, dtype, device, cfg.eps
+            )
 
             if cfg.use_boundary_weighted_volume:
                 loss_vol, vol_frac_eff = self.volume_loss_with_boundary_discount(
@@ -992,13 +1260,6 @@ class NN_Trainer:
                 )
                 vol_frac_eff = (rho * A_v).sum() / (A_v.sum() + cfg.eps)
 
-            loss_rep = torch.stack(rep_terms).mean() if len(rep_terms) else torch.zeros((), dtype=dtype, device=device)
-            loss_bnd = torch.stack(bnd_terms).mean() if len(bnd_terms) else torch.zeros((), dtype=dtype, device=device)
-            loss_strut = torch.stack(strut_terms).mean() if len(strut_terms) else torch.zeros((), dtype=dtype, device=device)
-            loss_strut_edge = torch.stack(strut_edge_terms).mean() if len(strut_edge_terms) else torch.zeros((), dtype=dtype, device=device)
-            loss_strut_void = torch.stack(strut_void_terms).mean() if len(strut_void_terms) else torch.zeros((), dtype=dtype, device=device)
-            w_geo_mean = torch.stack(w_geo_terms).mean() if len(w_geo_terms) else torch.zeros((), dtype=dtype, device=device)
-
             fem_out = {
                 "fem_total": torch.zeros((), dtype=dtype, device=device),
                 "comp": torch.zeros((), dtype=dtype, device=device),
@@ -1014,7 +1275,7 @@ class NN_Trainer:
                     comp_normalize_by=cfg.comp_normalize_by,
                     density_floor=cfg.fem_density_floor,
                     eps=cfg.eps,
-                    save_debug_history=True,
+                    save_debug_history=getattr(cfg, "save_fem_debug_history", True),
                 )
 
             loss_fem = fem_out["fem_total"]
@@ -1033,9 +1294,9 @@ class NN_Trainer:
                 n_vol = n_rep = n_bnd = n_strut = n_fem = 1.0
 
             L_total = (
-                cfg.lam_vol * (loss_vol / n_vol) +
-                cfg.lam_rep * (loss_rep / n_rep) +
-                cfg.lam_bnd * (loss_bnd / n_bnd)
+                cfg.lam_vol * (loss_vol / n_vol)
+                + cfg.lam_rep * (loss_rep / n_rep)
+                + cfg.lam_bnd * (loss_bnd / n_bnd)
             )
 
             if cfg.lam_strut != 0.0:
@@ -1047,13 +1308,36 @@ class NN_Trainer:
                 elif not cfg.skip_bad_fem_steps:
                     L_total = L_total + cfg.lam_fem * loss_fem
 
+            L_total= L_total/len(face_tensors)
             total_is_finite = self._scalar_tensor_is_finite(L_total)
 
+            opt.zero_grad(set_to_none=True)
             if total_is_finite:
-                opt.zero_grad(set_to_none=True)
                 L_total.backward()
+                grad_clip_norm = getattr(cfg, "grad_clip_norm", None)
+                if grad_clip_norm is not None and grad_clip_norm > 0:
+                    params = []
+                    for ppnet in ppnets:
+                        params.extend([p for p in ppnet.parameters() if p.requires_grad])
+                    if len(params):
+                        torch.nn.utils.clip_grad_norm_(params, max_norm=grad_clip_norm)
+
+                for fi, ppnet in enumerate(ppnets):
+                    for pn, p in ppnet.named_parameters():
+                        if p.grad is not None:
+                            if not torch.isfinite(p.grad).all():
+                                raise RuntimeError(
+                                    f"Non-finite gradient before opt.step(): face={fi}, param={pn}"
+                                )
                 opt.step()
-                scheduler.step()
+                for fi, ppnet in enumerate(ppnets):
+                    for pn, p in ppnet.named_parameters():
+                        if not torch.isfinite(p).all():
+                            raise RuntimeError(
+                             f"Non-finite parameter after opt.step(): face={fi}, param={pn}"
+                           )
+                if scheduler is not None:
+                    scheduler.step()
             else:
                 print(f"[step {step}] L_total is non-finite, optimizer step skipped.")
 
@@ -1065,9 +1349,11 @@ class NN_Trainer:
                 score = float(L_total.detach().item()) if total_is_finite else float("inf")
                 best_candidate_is_valid = (cfg.lam_fem == 0.0) or fem_is_valid
 
+                prev_best_step = best_step
+                improvement_gap = (step - prev_best_step) if prev_best_step >= 0 else None
+
                 if best_candidate_is_valid and score < (best_score - cfg.min_delta):
                     best_score = score
-                    diff = best_step - step
                     best_step = step
                     best_vol_frac = float(vol_frac_eff.detach().item())
                     best_comp = float(comp_val.detach().item())
@@ -1085,9 +1371,14 @@ class NN_Trainer:
                         }
                         for p in pred_list
                     ]
-                    if(diff>50):
+
+                    if improvement_gap is None or improvement_gap > 50:
                         print(
-                            f"New best_step={best_step} | best_score={best_score:.6f} | vol={best_vol_frac} Comp ={best_comp} W ={best_w_geo}"
+                            f"New best_step={best_step} | "
+                            f"best_score={best_score:.6f} | "
+                            f"vol_eff={best_vol_frac:.6f} | "
+                            f"comp={best_comp:.6e} | "
+                            f"w={best_w_geo:.6e}"
                         )
                     steps_since_improve = 0
                 elif best_candidate_is_valid:
@@ -1155,6 +1446,7 @@ class NN_Trainer:
                     "w_geo_mean": self._finite_or_default(w_geo_mean),
                 }
                 history.append(row)
+
                 self._tb_log_step(
                     step=step,
                     row=row,
@@ -1205,8 +1497,25 @@ class NN_Trainer:
             with torch.no_grad():
                 best_rho = rho.detach().clone()
                 best_seeds = [s.detach().clone() for s in seeds_list]
+                best_pred = [
+                    {
+                        "face_id": p["face_id"],
+                        "seeds_raw": p["seeds_raw"].detach().clone(),
+                        "w_raw": p["w_raw"].detach().clone(),
+                        "h_raw": None if p["h_raw"] is None else p["h_raw"].detach().clone(),
+                        "gates": None if p["gates"] is None else p["gates"].detach().clone(),
+                        "w_geo": p["w_geo"].detach().clone(),
+                    }
+                    for p in pred_list
+                ]
                 best_step = step
                 best_score = float("inf") if not self._scalar_tensor_is_finite(L_total) else float(L_total.detach().item())
+                if best_vol_frac is None:
+                    best_vol_frac = float(vol_frac_eff.detach().item())
+                if best_comp is None:
+                    best_comp = float(comp_val.detach().item())
+                if best_w_geo is None:
+                    best_w_geo = float(w_geo_mean.detach().item())
 
         with torch.no_grad():
             final_shape_density = best_rho.clone()
@@ -1249,7 +1558,6 @@ class NN_Trainer:
             "last_fem_debug": self.last_fem_debug,
             "tensorboard_log_dir": self.tensorboard_log_dir,
         }
-
     # ------------------------------------------------------------------
     # Visualization
     # ------------------------------------------------------------------
