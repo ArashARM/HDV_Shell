@@ -1,6 +1,3 @@
-import os
-import math
-import random
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -10,8 +7,10 @@ class VoronoiDecoder(nn.Module):
     """
     Functional Voronoi decoder with geometric strut thickness centered on Voronoi bisectors.
 
-    Main change:
-      - Replace Q-threshold density with a differentiable bisector-band density.
+    Main idea:
+      - The decoder defines a continuous field in UV.
+      - `evaluate_at_uv(...)` evaluates that field at arbitrary UV query points.
+      - `forward(...)` is kept as a thin wrapper for compatibility.
 
     For each pair (i,j):
         Delta_ij = d_i - d_j
@@ -21,9 +20,6 @@ class VoronoiDecoder(nn.Module):
 
     Final density:
         rho = 1 - exp(-alpha_union * sum_{i<j} S_ij)
-
-    This gives width a direct geometric meaning:
-        w = half-thickness around the Voronoi bisector.
     """
 
     def __init__(
@@ -71,6 +67,7 @@ class VoronoiDecoder(nn.Module):
         big_thr_default: float = 0.10,
         alpha_default: float = 0.05,
         eta_default: float = 0.05,
+
         # boundary attachment field
         use_boundary_attachment: bool = True,
         boundary_attach_width: float = 0.03,
@@ -138,18 +135,38 @@ class VoronoiDecoder(nn.Module):
         T = self.raw_temp
         return self.w_min + (self.w_max - self.w_min) * torch.sigmoid(w_raw / T)
 
-    def height(self, h_raw: torch.Tensor | None, ref_tensor: torch.Tensor | None = None) -> torch.Tensor:
+    def height(
+        self,
+        h_raw: torch.Tensor | None,
+        ref_tensor: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         if self.fixed_height is not None:
             if ref_tensor is not None:
-                return torch.tensor(float(self.fixed_height), device=ref_tensor.device, dtype=ref_tensor.dtype)
+                return torch.tensor(
+                    float(self.fixed_height),
+                    device=ref_tensor.device,
+                    dtype=ref_tensor.dtype,
+                )
             if h_raw is not None:
-                return torch.tensor(float(self.fixed_height), device=h_raw.device, dtype=h_raw.dtype)
+                return torch.tensor(
+                    float(self.fixed_height),
+                    device=h_raw.device,
+                    dtype=h_raw.dtype,
+                )
             return torch.tensor(float(self.fixed_height))
+
         if h_raw is None:
             raise ValueError("h_raw must be provided when fixed_height is None")
+
         return self.h_min + (self.h_max - self.h_min) * torch.sigmoid(h_raw)
 
-    def _map_raw_to_range(self, x_raw: torch.Tensor, lo: float, hi: float, temp: float = 1.0) -> torch.Tensor:
+    def _map_raw_to_range(
+        self,
+        x_raw: torch.Tensor,
+        lo: float,
+        hi: float,
+        temp: float = 1.0,
+    ) -> torch.Tensor:
         return lo + (hi - lo) * torch.sigmoid(x_raw / temp)
 
     # -------------------- anisotropic metric --------------------
@@ -162,7 +179,9 @@ class VoronoiDecoder(nn.Module):
         a_max: float = 2.0,
     ) -> torch.Tensor:
         if theta.ndim != 1 or a_raw.ndim != 1 or theta.shape != a_raw.shape:
-            raise ValueError(f"metric_matrices expects theta and a_raw of shape (S,), got {theta.shape}, {a_raw.shape}")
+            raise ValueError(
+                f"metric_matrices expects theta and a_raw of shape (S,), got {theta.shape}, {a_raw.shape}"
+            )
 
         S = theta.shape[0]
         t = torch.tanh(a_raw)
@@ -182,9 +201,14 @@ class VoronoiDecoder(nn.Module):
 
     # -------------------- periodic helpers --------------------
 
-    def _wrap_duv_points_to_seeds(self, diff: torch.Tensor, points_face_id: torch.Tensor | None) -> torch.Tensor:
+    def _wrap_duv_points_to_seeds(
+        self,
+        diff: torch.Tensor,
+        points_face_id: torch.Tensor | None,
+    ) -> torch.Tensor:
         if points_face_id is None:
             return diff
+
         if points_face_id.dtype != torch.long:
             points_face_id = points_face_id.to(torch.long)
 
@@ -193,26 +217,30 @@ class VoronoiDecoder(nn.Module):
 
         du = diff[..., 0]
         dv = diff[..., 1]
+
         du = du - torch.round(du) * uper[:, None]
         dv = dv - torch.round(dv) * vper[:, None]
+
         diff[..., 0] = du
         diff[..., 1] = dv
         return diff
 
     def _pairwise_uv_dirs(self, seeds: torch.Tensor) -> torch.Tensor:
         v = seeds.unsqueeze(0) - seeds.unsqueeze(1)  # (S,S,2)
-        same_face = (self.seed_face_id[:, None] == self.seed_face_id[None, :])
+        same_face = self.seed_face_id[:, None] == self.seed_face_id[None, :]
 
         uper_face = self.face_u_periodic[self.seed_face_id]
         vper_face = self.face_v_periodic[self.seed_face_id]
 
-        uper_pair = (uper_face[:, None] & uper_face[None, :] & same_face)
-        vper_pair = (vper_face[:, None] & vper_face[None, :] & same_face)
+        uper_pair = uper_face[:, None] & uper_face[None, :] & same_face
+        vper_pair = vper_face[:, None] & vper_face[None, :] & same_face
 
         du = v[..., 0]
         dv = v[..., 1]
+
         du = du - torch.round(du) * uper_pair.to(du.dtype)
         dv = dv - torch.round(dv) * vper_pair.to(dv.dtype)
+
         v[..., 0] = du
         v[..., 1] = dv
 
@@ -225,7 +253,10 @@ class VoronoiDecoder(nn.Module):
     def _soft_pair_weights(self, weights: torch.Tensor) -> torch.Tensor:
         N, S = weights.shape
         pair = weights.unsqueeze(2) * weights.unsqueeze(1)
-        mask = torch.triu(torch.ones(S, S, device=weights.device, dtype=weights.dtype), diagonal=1)
+        mask = torch.triu(
+            torch.ones(S, S, device=weights.device, dtype=weights.dtype),
+            diagonal=1,
+        )
         pair = pair * mask
         denom = pair.sum(dim=(1, 2), keepdim=True) + self.eps
         return pair / denom
@@ -236,11 +267,12 @@ class VoronoiDecoder(nn.Module):
         T = (pi.unsqueeze(-1) * t_ij.unsqueeze(0)).sum(dim=(1, 2))
         return T / (torch.norm(T, dim=1, keepdim=True) + self.eps)
 
-    def map_to_3d(self, t_uv, Xu, Xv, eps=1e-8):
+    def map_to_3d(self, t_uv: torch.Tensor, Xu: torch.Tensor, Xv: torch.Tensor, eps: float = 1e-8):
         T = t_uv[:, 0:1] * Xu + t_uv[:, 1:2] * Xv
-        return F.normalize(T, eps=eps)
+        return F.normalize(T, dim=1, eps=eps)
 
     # -------------------- boundary band --------------------
+
     def boundary_attachment_field(
         self,
         points_uv: torch.Tensor,
@@ -260,7 +292,6 @@ class VoronoiDecoder(nn.Module):
                 dtype=points_uv.dtype,
             )
 
-        # piecewise-smooth nearest-boundary distance
         if boundary_face_id is not None and points_face_id is not None:
             if boundary_face_id.dtype != torch.long:
                 boundary_face_id = boundary_face_id.to(torch.long)
@@ -287,7 +318,7 @@ class VoronoiDecoder(nn.Module):
 
         rho_b = torch.sigmoid((tb - dmin) / (bb + self.eps))
         return rho_b.clamp(0.0, 1.0)
-    
+
     def smooth_union(
         self,
         rho_a: torch.Tensor,
@@ -303,7 +334,8 @@ class VoronoiDecoder(nn.Module):
         rho = 1.0 - (1.0 - rho_a) * (1.0 - alpha_b * rho_b)
         return rho.clamp(0.0, 1.0)
 
-  # -------------------- pair gating --------------------
+    # -------------------- pair gating --------------------
+
     def _pair_gates(
         self,
         w_soft: torch.Tensor,
@@ -316,10 +348,14 @@ class VoronoiDecoder(nn.Module):
         Returns pair gates g_ij in [0,1], shape (N,S,S), upper triangular only.
         """
         N, S = w_soft.shape
+
         w_i = w_soft.unsqueeze(2)
         w_j = w_soft.unsqueeze(1)
 
-        tri = torch.triu(torch.ones(S, S, device=w_soft.device, dtype=w_soft.dtype), diagonal=1)
+        tri = torch.triu(
+            torch.ones(S, S, device=w_soft.device, dtype=w_soft.dtype),
+            diagonal=1,
+        )
 
         gap = torch.abs(w_i - w_j)
         g_gap = torch.sigmoid((gap_thr - gap) / (alpha + self.eps))
@@ -330,13 +366,14 @@ class VoronoiDecoder(nn.Module):
 
         return (g_gap * g_big) * tri
 
-    # -------------------- new geometric strut density --------------------
+    # -------------------- bisector band density --------------------
+
     def _bisector_band_density(
         self,
         d: torch.Tensor,                 # (N,S)
         w_soft: torch.Tensor,            # (N,S)
-        w_geo: torch.Tensor,             # scalar half-width
-        beta: float | torch.Tensor,      # scalar
+        w_geo: torch.Tensor,             # scalar-like
+        beta: float | torch.Tensor,
         gap_thr: torch.Tensor | None = None,
         big_thr: torch.Tensor | None = None,
         alpha: torch.Tensor | None = None,
@@ -345,27 +382,22 @@ class VoronoiDecoder(nn.Module):
         """
         Smooth strut density centered on Voronoi bisectors.
 
-        For each pair (i,j):
-            Delta_ij = d_i - d_j
-            band_ij = sigmoid((w_geo - smooth_abs(Delta_ij)) / beta)
-            pair_relevance_ij = w_i w_j [optionally gated]
-            s_ij = pair_relevance_ij * band_ij
-
-        Aggregate:
-            R = sum_{i<j} s_ij
-            rho = 1 - exp(-alpha_union * R)
-
         Returns:
             rho: (N,)
             pair_strength: (N,S,S)
             band_ij: (N,S,S)
             pair_relevance: (N,S,S)
+            edge_field: (N,)
         """
         N, S = d.shape
+
         d_i = d.unsqueeze(2)
         d_j = d.unsqueeze(1)
 
-        tri = torch.triu(torch.ones(S, S, device=d.device, dtype=d.dtype), diagonal=1)
+        tri = torch.triu(
+            torch.ones(S, S, device=d.device, dtype=d.dtype),
+            diagonal=1,
+        )
 
         delta = d_i - d_j
         abs_delta = torch.sqrt(delta * delta + self.eps)
@@ -375,7 +407,13 @@ class VoronoiDecoder(nn.Module):
 
         pair_relevance = (w_soft.unsqueeze(2) * w_soft.unsqueeze(1)) * tri
 
-        if self.use_pair_gating and gap_thr is not None and big_thr is not None and alpha is not None and eta is not None:
+        if (
+            self.use_pair_gating
+            and gap_thr is not None
+            and big_thr is not None
+            and alpha is not None
+            and eta is not None
+        ):
             gates = self._pair_gates(w_soft, gap_thr, big_thr, alpha, eta)
             pair_relevance = pair_relevance * gates
 
@@ -384,24 +422,65 @@ class VoronoiDecoder(nn.Module):
 
         rho = 1.0 - torch.exp(-self.alpha_union * R)
         rho = rho.clamp(0.0, 1.0)
+
         band_soft = band_ij.clamp(0.0, 1.0)
 
-        S = band_soft.shape[1]
-        eye = torch.eye(S, dtype=torch.bool, device=band_soft.device).unsqueeze(0)  # (1,S,S)
+        eye = torch.eye(S, dtype=torch.bool, device=band_soft.device).unsqueeze(0)
 
         one_minus = torch.where(
             eye,
-            torch.ones_like(band_soft),   # ignore diagonal terms
-            1.0 - band_soft
+            torch.ones_like(band_soft),
+            1.0 - band_soft,
         )
 
         edge_field = 1.0 - one_minus.prod(dim=2).prod(dim=1)
         edge_field = edge_field.clamp(0.0, 1.0)
 
-        return rho, pair_strength, band_ij, pair_relevance,edge_field
+        return rho, pair_strength, band_ij, pair_relevance, edge_field
 
-    # -------------------- forward --------------------
-    def forward(
+    # -------------------- validation --------------------
+
+    def _validate_inputs(
+        self,
+        points_uv: torch.Tensor,
+        Xu: torch.Tensor,
+        Xv: torch.Tensor,
+        tau: float,
+        seeds_raw: torch.Tensor,
+        theta: torch.Tensor | None,
+        a_raw: torch.Tensor | None,
+    ) -> None:
+        if points_uv.ndim != 2 or points_uv.shape[1] != 2:
+            raise ValueError(f"points_uv must be (N,2), got {tuple(points_uv.shape)}")
+
+        if Xu.ndim != 2 or Xu.shape[1] != 3:
+            raise ValueError(f"Xu must be (N,3), got {tuple(Xu.shape)}")
+
+        if Xv.ndim != 2 or Xv.shape[1] != 3:
+            raise ValueError(f"Xv must be (N,3), got {tuple(Xv.shape)}")
+
+        if Xu.shape[0] != points_uv.shape[0] or Xv.shape[0] != points_uv.shape[0]:
+            raise ValueError("points_uv, Xu, and Xv must have the same first dimension")
+
+        if seeds_raw.shape != (self.n_seeds, 2):
+            raise ValueError(
+                f"seeds_raw must be (S,2) with S={self.n_seeds}, got {tuple(seeds_raw.shape)}"
+            )
+
+        if not (tau > 0.0):
+            raise ValueError(f"tau must be > 0, got {tau}")
+
+        if self.use_anisotropy:
+            if theta is None or a_raw is None:
+                raise ValueError("use_anisotropy=True requires theta and a_raw.")
+            if theta.shape != (self.n_seeds,) or a_raw.shape != (self.n_seeds,):
+                raise ValueError(
+                    f"theta/a_raw must be (S,) with S={self.n_seeds}, got {theta.shape}, {a_raw.shape}"
+                )
+
+    # -------------------- field evaluation --------------------
+
+    def evaluate_at_uv(
         self,
         points_uv: torch.Tensor,
         Xu: torch.Tensor,
@@ -419,21 +498,25 @@ class VoronoiDecoder(nn.Module):
         big_thr_raw: torch.Tensor | None = None,
         alpha_raw: torch.Tensor | None = None,
         eta_raw: torch.Tensor | None = None,
-    ):
-        if points_uv.ndim != 2 or points_uv.shape[1] != 2:
-            raise ValueError(f"points_uv must be (N,2), got {tuple(points_uv.shape)}")
+    ) -> dict[str, torch.Tensor]:
+        """
+        Evaluate the Voronoi surface field at arbitrary UV query points.
 
-        if seeds_raw.shape != (self.n_seeds, 2):
-            raise ValueError(f"seeds_raw must be (S,2) with S={self.n_seeds}, got {tuple(seeds_raw.shape)}")
+        Inputs:
+            points_uv : (N,2)
+            Xu, Xv    : (N,3) local surface derivatives at query points
 
-        if not (tau > 0.0):
-            raise ValueError(f"tau must be > 0, got {tau}")
-
-        if self.use_anisotropy:
-            if theta is None or a_raw is None:
-                raise ValueError("use_anisotropy=True requires theta and a_raw.")
-            if theta.shape != (self.n_seeds,) or a_raw.shape != (self.n_seeds,):
-                raise ValueError(f"theta/a_raw must be (S,) with S={self.n_seeds}, got {theta.shape}, {a_raw.shape}")
+        Returns dictionary with named outputs.
+        """
+        self._validate_inputs(
+            points_uv=points_uv,
+            Xu=Xu,
+            Xv=Xv,
+            tau=tau,
+            seeds_raw=seeds_raw,
+            theta=theta,
+            a_raw=a_raw,
+        )
 
         seeds = self.seeds_uv(seeds_raw)
         S = seeds.shape[0]
@@ -444,19 +527,22 @@ class VoronoiDecoder(nn.Module):
             I = torch.eye(2, device=points_uv.device, dtype=points_uv.dtype)
             M = I.unsqueeze(0).expand(S, 2, 2)
 
-        diff = points_uv.unsqueeze(1) - seeds.unsqueeze(0)
+        diff = points_uv.unsqueeze(1) - seeds.unsqueeze(0)   # (N,S,2)
         diff = self._wrap_duv_points_to_seeds(diff, points_face_id)
+
         d2 = torch.einsum("nsi,sij,nsj->ns", diff, M, diff)
         d = torch.sqrt(d2.clamp_min(self.eps))
 
         if points_face_id is not None:
-            if self.seed_face_id is None:
-                raise ValueError("points_face_id was provided but self.seed_face_id is None.")
             if points_face_id.dtype != torch.long:
                 points_face_id = points_face_id.to(torch.long)
-            seed_face_id = self.seed_face_id.to(device=points_face_id.device, dtype=torch.long)
-            mask = (points_face_id[:, None] != seed_face_id[None, :])
-            d = d + mask.to(d.dtype) * 1e6
+
+            seed_face_id = self.seed_face_id.to(
+                device=points_face_id.device,
+                dtype=torch.long,
+            )
+            cross_face_mask = points_face_id[:, None] != seed_face_id[None, :]
+            d = d + cross_face_mask.to(d.dtype) * 1e6
 
         logits = -d / float(tau)
         logits = logits - logits.max(dim=1, keepdim=True).values
@@ -469,26 +555,34 @@ class VoronoiDecoder(nn.Module):
         if gap_thr_raw is None:
             gap_thr = torch.tensor(self.gap_thr_default, device=device, dtype=dtype)
         else:
-            gap_thr = self._map_raw_to_range(gap_thr_raw, self.gap_thr_min, self.gap_thr_max, temp=1.0)
+            gap_thr = self._map_raw_to_range(
+                gap_thr_raw, self.gap_thr_min, self.gap_thr_max, temp=1.0
+            )
 
         if big_thr_raw is None:
             big_thr = torch.tensor(self.big_thr_default, device=device, dtype=dtype)
         else:
-            big_thr = self._map_raw_to_range(big_thr_raw, self.big_thr_min, self.big_thr_max, temp=1.0)
+            big_thr = self._map_raw_to_range(
+                big_thr_raw, self.big_thr_min, self.big_thr_max, temp=1.0
+            )
 
         if alpha_raw is None:
             alpha = torch.tensor(self.alpha_default, device=device, dtype=dtype)
         else:
-            alpha = self._map_raw_to_range(alpha_raw, self.alpha_min, self.alpha_max, temp=1.0)
+            alpha = self._map_raw_to_range(
+                alpha_raw, self.alpha_min, self.alpha_max, temp=1.0
+            )
 
         if eta_raw is None:
             eta = torch.tensor(self.eta_default, device=device, dtype=dtype)
         else:
-            eta = self._map_raw_to_range(eta_raw, self.eta_min, self.eta_max, temp=1.0)
+            eta = self._map_raw_to_range(
+                eta_raw, self.eta_min, self.eta_max, temp=1.0
+            )
 
         w_geo = self.width(w_raw)
 
-        rho, pair_strength, band_ij, pair_relevance,edge_field = self._bisector_band_density(
+        rho_v, pair_strength, band_ij, pair_relevance, edge_field = self._bisector_band_density(
             d=d,
             w_soft=w_soft,
             w_geo=w_geo,
@@ -498,8 +592,6 @@ class VoronoiDecoder(nn.Module):
             alpha=alpha,
             eta=eta,
         )
-
-        rho_v = rho.clamp(0.0, 1.0)
 
         if self.use_boundary_attachment:
             rho_b = self.boundary_attachment_field(
@@ -520,28 +612,74 @@ class VoronoiDecoder(nn.Module):
         rho = rho.clamp(0.0, 1.0)
 
         t_uv_raw = self._blended_uv_fiber(w_soft, seeds)
+
         rho0, gamma = 0.5, 0.05
         m = torch.sigmoid((rho - rho0) / gamma).unsqueeze(1)
         t_uv = t_uv_raw * m
+
         fiber3d = self.map_to_3d(t_uv, Xu=Xu, Xv=Xv)
 
         h = self.height(h_raw, ref_tensor=points_uv)
 
-        return (
-            w_soft,
-            d,
-            M,
-            seeds,
-            rho,
-            t_uv_raw,
-            t_uv,
-            h,
-            w_geo,
-            fiber3d,
-            pair_strength,
-            band_ij,
-            pair_relevance,
-            rho_v,
-            rho_b,
-            edge_field,
+        return {
+            "w_soft": w_soft,
+            "d": d,
+            "M": M,
+            "seeds": seeds,
+            "rho": rho,
+            "rho_v": rho_v,
+            "rho_b": rho_b,
+            "t_uv_raw": t_uv_raw,
+            "t_uv": t_uv,
+            "fiber3d": fiber3d,
+            "h": h,
+            "w_geo": w_geo,
+            "pair_strength": pair_strength,
+            "band_ij": band_ij,
+            "pair_relevance": pair_relevance,
+            "edge_field": edge_field,
+            "gap_thr": gap_thr,
+            "big_thr": big_thr,
+            "alpha": alpha,
+            "eta": eta,
+        }
+
+    # -------------------- compatibility wrapper --------------------
+
+    def forward(
+        self,
+        points_uv: torch.Tensor,
+        Xu: torch.Tensor,
+        Xv: torch.Tensor,
+        tau: float,
+        seeds_raw: torch.Tensor,
+        w_raw: torch.Tensor,
+        h_raw: torch.Tensor | None,
+        theta: torch.Tensor | None = None,
+        a_raw: torch.Tensor | None = None,
+        points_face_id: torch.Tensor | None = None,
+        boundary_uv: torch.Tensor | None = None,
+        boundary_face_id: torch.Tensor | None = None,
+        gap_thr_raw: torch.Tensor | None = None,
+        big_thr_raw: torch.Tensor | None = None,
+        alpha_raw: torch.Tensor | None = None,
+        eta_raw: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
+        return self.evaluate_at_uv(
+            points_uv=points_uv,
+            Xu=Xu,
+            Xv=Xv,
+            tau=tau,
+            seeds_raw=seeds_raw,
+            w_raw=w_raw,
+            h_raw=h_raw,
+            theta=theta,
+            a_raw=a_raw,
+            points_face_id=points_face_id,
+            boundary_uv=boundary_uv,
+            boundary_face_id=boundary_face_id,
+            gap_thr_raw=gap_thr_raw,
+            big_thr_raw=big_thr_raw,
+            alpha_raw=alpha_raw,
+            eta_raw=eta_raw,
         )

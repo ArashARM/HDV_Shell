@@ -1080,7 +1080,7 @@ class CADTensorGenerator:
             "num_faces": int(faces_ijk.shape[0]),
         }
 
-    def generate_input_tensors_from_dataframes(self, mesh_df, faces_df, input_ring: int):
+    def generate_input_tensors_from_dataframes(self,shape_path, mesh_df, faces_df, input_ring: int):
         mesh_df_ord = mesh_df.sort_values("gvid").reset_index(drop=True)
 
         uv = torch.tensor(
@@ -1188,6 +1188,7 @@ class CADTensorGenerator:
             "face_tensors_by_id": face_tensors_by_id,
             "face_periodicity": face_periodicity,
             "num_faces": len(face_tensors),
+            "shape_path": shape_path
         }
     def generate_from_file_points_triangulated(
         self,
@@ -1207,7 +1208,7 @@ class CADTensorGenerator:
             use_fps=use_fps,
             triangulation_max_edge_rel=triangulation_max_edge_rel,
         )
-        tensors = self.generate_input_tensors_from_dataframes(mesh_df, faces_df, input_ring=input_ring)
+        tensors = self.generate_input_tensors_from_dataframes(shape_path,mesh_df, faces_df, input_ring=input_ring)
         return mesh_df, faces_df, tensors
 
     def generate_from_file(
@@ -1251,7 +1252,7 @@ class CADTensorGenerator:
         else:
             raise ValueError(f"Unknown mode: {mode}")
 
-        tensors = self.generate_input_tensors_from_dataframes(mesh_df, faces_df, input_ring=input_ring)
+        tensors = self.generate_input_tensors_from_dataframes(shape_path,mesh_df,  faces_df, input_ring=input_ring)
         return mesh_df, faces_df, tensors
     @staticmethod
     def faces_ijk_to_pv_faces(faces_ijk: torch.Tensor) -> np.ndarray:
@@ -1452,4 +1453,246 @@ class CADTensorGenerator:
             "ymax": float(ymax),
             "zmin": float(zmin),
             "zmax": float(zmax),
-        }    
+        }
+
+    # =========================================================================
+    # 6) CAD-native face evaluation at arbitrary UV
+    # =========================================================================
+
+    @staticmethod
+    def get_face_by_id(shape, face_id: int):
+        """
+        Return the TopoDS_Face with the given enumeration index.
+        """
+        for i, face in enumerate(CADTensorGenerator.iter_faces(shape)):
+            if int(i) == int(face_id):
+                return face
+        raise KeyError(f"Face with face_id={face_id} not found.")
+
+    @staticmethod
+    def uv_norm_to_raw_from_bounds(
+        uv_norm: np.ndarray,
+        u_raw_bounds: tuple[float, float],
+        v_raw_bounds: tuple[float, float],
+    ) -> np.ndarray:
+        """
+        Convert normalized UV in [0,1]^2 to raw CAD face UV.
+        """
+        uv_norm = np.asarray(uv_norm, dtype=float)
+        if uv_norm.ndim != 2 or uv_norm.shape[1] != 2:
+            raise ValueError(f"uv_norm must be (N,2), got {uv_norm.shape}")
+
+        umin, umax = map(float, u_raw_bounds)
+        vmin, vmax = map(float, v_raw_bounds)
+
+        uv_raw = np.empty_like(uv_norm, dtype=float)
+        uv_raw[:, 0] = umin + uv_norm[:, 0] * (umax - umin)
+        uv_raw[:, 1] = vmin + uv_norm[:, 1] * (vmax - vmin)
+        return uv_raw
+
+    @staticmethod
+    def uv_raw_to_norm_from_bounds(
+        uv_raw: np.ndarray,
+        u_raw_bounds: tuple[float, float],
+        v_raw_bounds: tuple[float, float],
+    ) -> np.ndarray:
+        """
+        Convert raw CAD UV to normalized [0,1]^2 UV.
+        """
+        uv_raw = np.asarray(uv_raw, dtype=float)
+        if uv_raw.ndim != 2 or uv_raw.shape[1] != 2:
+            raise ValueError(f"uv_raw must be (N,2), got {uv_raw.shape}")
+
+        umin, umax = map(float, u_raw_bounds)
+        vmin, vmax = map(float, v_raw_bounds)
+
+        Lu = (umax - umin) if abs(umax - umin) > 1e-30 else 1.0
+        Lv = (vmax - vmin) if abs(vmax - vmin) > 1e-30 else 1.0
+
+        uv_norm = np.empty_like(uv_raw, dtype=float)
+        uv_norm[:, 0] = (uv_raw[:, 0] - umin) / Lu
+        uv_norm[:, 1] = (uv_raw[:, 1] - vmin) / Lv
+        return uv_norm
+
+    @classmethod
+    def classify_uv_points_on_face(
+        cls,
+        face,
+        uv_raw: np.ndarray,
+        tol: float = 1e-7,
+    ) -> np.ndarray:
+        """
+        Trim-aware inside mask for raw UV points on a CAD face.
+        Returns boolean array of shape (N,).
+        """
+        uv_raw = np.asarray(uv_raw, dtype=float)
+        if uv_raw.ndim != 2 or uv_raw.shape[1] != 2:
+            raise ValueError(f"uv_raw must be (N,2), got {uv_raw.shape}")
+
+        classifier = BRepClass_FaceClassifier()
+        inside = np.zeros((uv_raw.shape[0],), dtype=bool)
+
+        for i, (u, v) in enumerate(uv_raw):
+            inside[i] = cls._classify_inside(face, float(u), float(v), classifier, tol)
+
+        return inside
+
+    @classmethod
+    def eval_face_uv_raw(
+        cls,
+        face,
+        uv_raw: np.ndarray,
+        metric_tol: float = 1e-9,
+        trim_tol: float = 1e-7,
+        return_inside_mask: bool = True,
+    ):
+        """
+        Evaluate CAD face geometry at arbitrary RAW UV coordinates.
+
+        Returns dict:
+            {
+                "uv_raw": (N,2),
+                "xyz": (N,3),
+                "Xu": (N,3),
+                "Xv": (N,3),
+                "inside_mask": (N,),
+                "valid_geom_mask": (N,),
+                "valid_mask": (N,),
+            }
+        """
+        uv_raw = np.asarray(uv_raw, dtype=float)
+        if uv_raw.ndim != 2 or uv_raw.shape[1] != 2:
+            raise ValueError(f"uv_raw must be (N,2), got {uv_raw.shape}")
+
+        (umin, umax, vmin, vmax), surf = cls.face_uv_bounds_and_surface(face)
+
+        xyz = np.zeros((uv_raw.shape[0], 3), dtype=np.float32)
+        Xu = np.zeros((uv_raw.shape[0], 3), dtype=np.float32)
+        Xv = np.zeros((uv_raw.shape[0], 3), dtype=np.float32)
+        valid_geom = np.zeros((uv_raw.shape[0],), dtype=bool)
+
+        inside_mask = cls.classify_uv_points_on_face(face, uv_raw, tol=trim_tol) if return_inside_mask else np.ones((uv_raw.shape[0],), dtype=bool)
+
+        for i, (u, v) in enumerate(uv_raw):
+            # optional hard raw-bounds check before evaluation
+            if not (umin - 1e-12 <= float(u) <= umax + 1e-12 and vmin - 1e-12 <= float(v) <= vmax + 1e-12):
+                continue
+
+            try:
+                p = surf.Value(float(u), float(v))
+                geom = cls._jacobian_area_density(surf, float(u), float(v), tol=metric_tol)
+                if geom is None:
+                    continue
+
+                xyz[i, :] = [p.X(), p.Y(), p.Z()]
+                Xu[i, :] = geom["Xu"]
+                Xv[i, :] = geom["Xv"]
+                valid_geom[i] = True
+            except Exception:
+                continue
+
+        valid_mask = inside_mask & valid_geom
+
+        return {
+            "uv_raw": uv_raw.astype(np.float32),
+            "xyz": xyz,
+            "Xu": Xu,
+            "Xv": Xv,
+            "inside_mask": inside_mask,
+            "valid_geom_mask": valid_geom,
+            "valid_mask": valid_mask,
+        }
+
+    @classmethod
+    def eval_face_uv_norm(
+        cls,
+        face,
+        uv_norm: np.ndarray,
+        u_raw_bounds: tuple[float, float],
+        v_raw_bounds: tuple[float, float],
+        metric_tol: float = 1e-9,
+        trim_tol: float = 1e-7,
+        return_inside_mask: bool = True,
+    ):
+        """
+        Evaluate CAD face geometry at arbitrary NORMALIZED UV coordinates.
+        """
+        uv_raw = cls.uv_norm_to_raw_from_bounds(
+            uv_norm=uv_norm,
+            u_raw_bounds=u_raw_bounds,
+            v_raw_bounds=v_raw_bounds,
+        )
+
+        out = cls.eval_face_uv_raw(
+            face=face,
+            uv_raw=uv_raw,
+            metric_tol=metric_tol,
+            trim_tol=trim_tol,
+            return_inside_mask=return_inside_mask,
+        )
+
+        out["uv_norm"] = np.asarray(uv_norm, dtype=np.float32)
+        return out
+
+    def eval_face_uv_from_face_tensor(
+        self,
+        shape_or_path,
+        face_tensor: dict,
+        uv_norm,
+        metric_tol: float | None = None,
+        trim_tol: float = 1e-7,
+        as_torch: bool = True,
+    ):
+        """
+        CAD-native evaluation using a face_tensor produced by this generator.
+
+        Inputs:
+            shape_or_path : either loaded OCC shape or STEP/IGES path
+            face_tensor   : one entry from face_tensors
+            uv_norm       : (N,2) normalized UV query points
+
+        Returns:
+            dict with xyz, Xu, Xv, valid masks, and uv_raw/uv_norm.
+        """
+        if metric_tol is None:
+            metric_tol = self.metric_tol
+
+        if isinstance(shape_or_path, str):
+            shape = self.load_shape(shape_or_path)
+        else:
+            shape = shape_or_path
+
+        face_id = int(face_tensor["face_id"])
+        face = self.get_face_by_id(shape, face_id)
+
+        if isinstance(uv_norm, torch.Tensor):
+            uv_norm_np = uv_norm.detach().cpu().numpy()
+        else:
+            uv_norm_np = np.asarray(uv_norm, dtype=float)
+
+        out = self.eval_face_uv_norm(
+            face=face,
+            uv_norm=uv_norm_np,
+            u_raw_bounds=face_tensor["u_raw_bounds"],
+            v_raw_bounds=face_tensor["v_raw_bounds"],
+            metric_tol=metric_tol,
+            trim_tol=trim_tol,
+            return_inside_mask=True,
+        )
+
+        if not as_torch:
+            return out
+
+        device = face_tensor["uv"].device
+        dtype = face_tensor["uv"].dtype
+
+        return {
+            "uv_norm": torch.tensor(out["uv_norm"], dtype=dtype, device=device),
+            "uv_raw": torch.tensor(out["uv_raw"], dtype=dtype, device=device),
+            "points_xyz": torch.tensor(out["xyz"], dtype=torch.float32, device=device),
+            "Xu": torch.tensor(out["Xu"], dtype=torch.float32, device=device),
+            "Xv": torch.tensor(out["Xv"], dtype=torch.float32, device=device),
+            "inside_mask": torch.tensor(out["inside_mask"], dtype=torch.bool, device=device),
+            "valid_geom_mask": torch.tensor(out["valid_geom_mask"], dtype=torch.bool, device=device),
+            "valid_mask": torch.tensor(out["valid_mask"], dtype=torch.bool, device=device),
+        }   

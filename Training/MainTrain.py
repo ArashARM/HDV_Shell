@@ -6,17 +6,20 @@ from datetime import datetime
 import torch
 from torch.utils.tensorboard import SummaryWriter
 
+import pyvista as pv
+try:
+    pv.set_jupyter_backend("trame")
+except Exception:
+    pass
+
 
 @dataclass
 class TrainingConfig:
     seed_number: int = 15
     use_anisotropy: bool = True
-    # height is predicted; otherwise height is fixed
     fixed_height: float | None = None
     target_volfrac: float = 0.5
-    # radius/scale for seed-seed repulsion
     seed_repulsion_sigma: float = 0.08
-    # how strongly seeds are kept away from boundaries
     boundary_margin: float = 0.05
     freeze_w: bool = False
 
@@ -28,15 +31,12 @@ class TrainingConfig:
     lam_rep: float = 0.5
     lam_bnd: float = 0.5
 
-    # Differentiable strutness loss
     lam_strut: float = 0.02
     lam_strut_edge: float = 1.0
     lam_strut_void: float = 0.25
 
-    # Raw compliance can be very large, so it gets divided by 1e10.
     comp_normalize_by: float | None = 1e10
     normalize_losses: bool = True
-    #Density passed to FEM is clamped from below to avoid near-zero stiffness collapse.
     fem_density_floor: float = 0.02
     skip_bad_fem_steps: bool = True
 
@@ -62,26 +62,20 @@ class TrainingConfig:
     use_boundary_weighted_volume: bool = True
     boundary_vol_weight: float = 0.20
 
-    Offset_scale:float = 1.00
+    Offset_scale: float = 1.00
     scheduler_milestones: tuple[int, ...] = (80, 160)
     scheduler_gamma: float = 0.5
 
     save_fem_debug_history: bool = True
     grad_clip_norm: float | None = 1.0
 
-    # TensorBoard
     tensorboard_enabled: bool = True
     tensorboard_log_root: str = "runs"
     experiment_name: str | None = None
     tb_flush_secs: int = 10
     tb_log_histograms_every: int = 200
 
-# Running exponential moving average of loss magnitude:
-# new_scale = m * old_scale + (1 - m) * |x| (where Later ->  Normalized loss = RawLoss / new_scale)
-# Interpretation:
-# - Each loss is scaled relative to its recent average magnitude (EMA).
-# - Losses contribute strongly when they are large compared to their typical value.
-# - Even when a loss is small (optimized), it still contributes to maintain that level.
+
 class RunningNorm:
     def __init__(self, momentum: float = 0.99, eps: float = 1e-12):
         self.val = None
@@ -126,7 +120,11 @@ class NN_Trainer:
         self.writer = None
         self.tensorboard_log_dir = None
         self._init_tensorboard()
-    ##### *************************************************** tensorboard settings and inputs ***************************************************
+
+    # ------------------------------------------------------------------
+    # TensorBoard
+    # ------------------------------------------------------------------
+
     def _init_tensorboard(self):
         if not self.cfg.tensorboard_enabled:
             return
@@ -144,7 +142,6 @@ class NN_Trainer:
         )
         self.tensorboard_log_dir = log_dir
 
-        # Save config as text
         cfg_lines = [f"{k}: {v}" for k, v in vars(self.cfg).items()]
         self.writer.add_text("config", "\n".join(cfg_lines), global_step=0)
 
@@ -156,17 +153,7 @@ class NN_Trainer:
             self.writer.close()
             self.writer = None
 
-
     def _true_open_boundary_idx(self, ft, tol=None):
-        """
-        Return boundary vertex indices that correspond to real open boundaries,
-        excluding periodic seam vertices.
-
-        Assumes:
-        - ft["uv"] is local UV, shape [N, 2]
-        - ft["boundary_idx_ring1"] is raw topological boundary indices
-        - ft may contain "u_periodic" and "v_periodic"
-        """
         if ("boundary_idx_ring1" not in ft) or ft["boundary_idx_ring1"] is None:
             return torch.empty(0, dtype=torch.long, device=ft["uv"].device)
 
@@ -181,16 +168,17 @@ class NN_Trainer:
         u_periodic = bool(ft.get("u_periodic", False))
         v_periodic = bool(ft.get("v_periodic", False))
 
-        # tolerance for detecting seam-side vertices
         if tol is None:
             u_span = (u.max() - u.min()).abs()
             v_span = (v.max() - v.min()).abs()
-            base_span = torch.maximum(u_span, v_span).clamp_min(torch.as_tensor(1.0, device=uv.device, dtype=uv.dtype))
+            base_span = torch.maximum(
+                u_span,
+                v_span,
+            ).clamp_min(torch.as_tensor(1.0, device=uv.device, dtype=uv.dtype))
             tol = 1e-4 * float(base_span.detach().item())
 
         ub = u[bidx]
         vb = v[bidx]
-
         keep = torch.ones_like(bidx, dtype=torch.bool)
 
         if u_periodic:
@@ -208,6 +196,7 @@ class NN_Trainer:
             keep = keep & (~is_v_seam)
 
         return bidx[keep]
+
     @staticmethod
     def _to_float_if_finite(x):
         if isinstance(x, torch.Tensor):
@@ -253,7 +242,6 @@ class NN_Trainer:
         if self.writer is None:
             return
 
-        # Total / loss terms
         self._tb_add_scalar("Loss/Total", row["L_total"], step)
         self._tb_add_scalar("Loss/Volume", row["loss_vol"], step)
         self._tb_add_scalar("Loss/Repulsion", row["loss_rep"], step)
@@ -264,7 +252,6 @@ class NN_Trainer:
         self._tb_add_scalar("Loss/FEM", row["loss_fem"], step)
         self._tb_add_scalar("Loss/Compliance", row["loss_comp"], step)
 
-        # Physics / optimization metrics
         self._tb_add_scalar("Physics/ComplianceRaw", row["comp"], step)
         self._tb_add_scalar("Physics/VolumeFraction", row["vol_frac"], step)
         self._tb_add_scalar("Physics/VolumeFractionEffective", row["vol_frac_eff"], step)
@@ -274,28 +261,28 @@ class NN_Trainer:
         self._tb_add_scalar("Physics/RhoVoronoiMean", row["rho_v_mean"], step)
         self._tb_add_scalar("Physics/WGeoMean", row["w_geo_mean"], step)
 
-        # Density stats
         self._tb_add_scalar("Density/Min", row["rho_min"], step)
         self._tb_add_scalar("Density/Mean", row["rho_mean"], step)
         self._tb_add_scalar("Density/Max", row["rho_max"], step)
 
-        # Training dynamics
         self._tb_add_scalar("Train/DeltaRho", row["drho"], step)
         self._tb_add_scalar("Train/DeltaSeed", row["dseed"], step)
         self._tb_add_scalar("Train/GradMean", row["grad_mean"], step)
         self._tb_add_scalar("Train/BestScore", row["best_score"], step)
         self._tb_add_scalar("Train/BestStep", row["best_step"], step)
         self._tb_add_scalar("Train/FEMValid", 1.0 if row["fem_valid"] else 0.0, step)
-        self._tb_add_scalar("Train/OptimizerStepSkipped", 1.0 if row["optimizer_step_skipped"] else 0.0, step)
+        self._tb_add_scalar(
+            "Train/OptimizerStepSkipped",
+            1.0 if row["optimizer_step_skipped"] else 0.0,
+            step,
+        )
 
-        # Fiber norm summary
         fiber_norm = torch.linalg.norm(fiber_surface, dim=1)
         if fiber_norm.numel() > 0:
             self._tb_add_scalar("Fiber/NormMean", fiber_norm.mean(), step)
             self._tb_add_scalar("Fiber/NormMin", fiber_norm.min(), step)
             self._tb_add_scalar("Fiber/NormMax", fiber_norm.max(), step)
 
-        # Histograms every N steps
         if step % self.cfg.tb_log_histograms_every == 0 or step == self.cfg.num_steps - 1:
             self._tb_add_histogram("Density/Rho", rho, step)
             self._tb_add_histogram("Density/RhoBoundary", rho_boundary, step)
@@ -317,7 +304,6 @@ class NN_Trainer:
             if len(w_geo_vals) > 0:
                 self._tb_add_histogram("Geometry/WGeo", torch.cat(w_geo_vals, dim=0), step)
 
-        # FEM debug values when available
         if self.last_fem_debug:
             dbg = self.last_fem_debug
             for key in [
@@ -342,7 +328,11 @@ class NN_Trainer:
 
             if dbg.get("failure_reason"):
                 self.writer.add_text("FEMDebug/FailureReason", str(dbg["failure_reason"]), step)
-    ##### *************************************************** tensorboard settings and inputs ***************************************************
+
+    # ------------------------------------------------------------------
+    # Losses / helpers
+    # ------------------------------------------------------------------
+
     @staticmethod
     def volume_loss_constant_height(
         rho: torch.Tensor,
@@ -351,8 +341,8 @@ class NN_Trainer:
         eps: float = 1e-12,
     ) -> torch.Tensor:
         vol_frac = (rho * A_v).sum() / (A_v.sum() + eps)
-        vol_loss= (vol_frac - target_volfrac) ** 2
-        return  vol_loss
+        vol_loss = (vol_frac - target_volfrac) ** 2
+        return vol_loss
 
     @staticmethod
     def volume_loss_with_boundary_discount(
@@ -363,10 +353,6 @@ class NN_Trainer:
         boundary_weight: float = 0.20,
         eps: float = 1e-12,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Interior material counts fully.
-        Boundary attachment counts with a discounted weight.
-        """
         weight = 1.0 - rho_boundary + boundary_weight * rho_boundary
         vol_frac_eff = (rho * weight * A_v).sum() / ((weight * A_v).sum() + eps)
         loss = (vol_frac_eff - target_volfrac) ** 2
@@ -423,77 +409,15 @@ class NN_Trainer:
         if normalize_by is not None:
             return comp / (float(normalize_by) + eps)
         return comp
+
     @staticmethod
     def strutness_loss_from_edge_field(
         rho: torch.Tensor,
         edge_field: torch.Tensor,
-        w: torch.Tensor | float,
-        w_ref: float,
         lam_edge: float = 1.0,
         lam_void: float = 1.0,
         eps: float = 1e-12,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-
-        rho = rho.clamp(0.0, 1.0)
-        edge_field = edge_field.clamp(0.0, 1.0)
-        void_field = 1.0 - edge_field
-
-        # Convert w to tensor on correct device/dtype
-        if not torch.is_tensor(w):
-            w = torch.tensor(w, device=rho.device, dtype=rho.dtype)
-        else:
-            w = w.to(device=rho.device, dtype=rho.dtype)
-
-        # Broadcast w to rho shape.
-        # Common case:
-        #   rho.shape = (B, H, W) or (B, 1, H, W)
-        #   w.shape   = (B,)
-        if w.dim() == 0:
-            while w.dim() < rho.dim():
-                w = w.unsqueeze(0)
-        elif w.dim() == 1 and rho.dim() >= 2 and w.shape[0] == rho.shape[0]:
-            while w.dim() < rho.dim():
-                w = w.unsqueeze(-1)
-        else:
-            while w.dim() < rho.dim():
-                w = w.unsqueeze(-1)
-
-        # Width ratio in [0, 1+], then clamp to [0,1] for stable target scaling.
-        # If w < w_ref, edge target weakens.
-        # If w >= w_ref, target saturates at the original edge_field strength.
-        width_scale = (w / max(w_ref, eps)).clamp(0.0, 1.0)
-
-        # Width-aware edge target:
-        #   small w -> lower desired rho on edge regions
-        #   large w -> stronger desired rho on edge regions
-        edge_target = width_scale * edge_field
-
-        # Penalize mismatch to width-conditioned edge target
-        loss_edge = (edge_field * (rho - edge_target).pow(2)).sum() / (edge_field.sum() + eps)
-
-        # Keep non-edge regions empty
-        loss_void = (void_field * rho.pow(2)).sum() / (void_field.sum() + eps)
-
-        loss = lam_edge * loss_edge + lam_void * loss_void
-        return loss, loss_edge, loss_void
-    @staticmethod
-    def strutness_loss_from_edge_field_old(
-        rho: torch.Tensor,
-        edge_field: torch.Tensor,
-        lam_edge: float = 1.0,
-        lam_void: float = 1.0,
-        eps: float = 1e-12,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Differentiable strutness loss based on a smooth geometric edge target.
-
-        edge_field in [0,1]:
-            1 -> should be solid strut
-            0 -> should be void
-
-        This stays differentiable as long as edge_field itself is produced
-        smoothly in the decoder.
-        """
         edge_field = edge_field.clamp(0.0, 1.0)
         void_field = 1.0 - edge_field
 
@@ -503,10 +427,18 @@ class NN_Trainer:
         loss = lam_edge * loss_edge + lam_void * loss_void
         return loss, loss_edge, loss_void
 
-    #“Is this scalar tensor a real finite number, not NaN or Inf?”
     @staticmethod
     def _scalar_tensor_is_finite(x: torch.Tensor) -> bool:
         return bool(torch.isfinite(x).reshape(()).detach().item())
+
+    @staticmethod
+    def _require_decoder_keys(decoder_out: dict, required_keys: list[str]):
+        missing = [k for k in required_keys if k not in decoder_out]
+        if missing:
+            raise ValueError(
+                f"Decoder output missing required keys: {missing}. "
+                f"Available keys: {list(decoder_out.keys())}"
+            )
 
     def _record_invalid_fem_debug(
         self,
@@ -667,9 +599,6 @@ class NN_Trainer:
         eps: float = 1e-12,
         save_debug_history: bool = True,
     ) -> dict:
-        """
-        Kept simple. The differentiable strutness supervision is handled inside train().
-        """
         sigma = self.cfg.seed_repulsion_sigma
         margin = self.cfg.boundary_margin
 
@@ -782,7 +711,7 @@ class NN_Trainer:
             use_anisotropy=use_anisotropy,
             predict_height=(self.cfg.fixed_height is None),
             use_gating=False,
-            freeze_w= freeze_w
+            freeze_w=freeze_w,
         ).to(device)
 
         return decoder, ppnet
@@ -801,7 +730,7 @@ class NN_Trainer:
                 v_periodic=ft.get("v_periodic", False),
                 use_anisotropy=cfg.use_anisotropy,
                 context_vector_size=cfg.context_vector_size,
-                freeze_w = cfg.freeze_w,
+                freeze_w=cfg.freeze_w,
             )
             decoders.append(decoder)
             ppnets.append(ppnet)
@@ -947,14 +876,12 @@ class NN_Trainer:
                     f"({face_areas.shape[0]} != {faces_ijk.shape[0]})"
                 )
 
-
     def _safe_weighted_mean(self, values, weights, dtype, device, eps):
         if len(values) == 0:
             return torch.zeros((), dtype=dtype, device=device)
         v = torch.stack(values)
         w = torch.stack(weights).to(dtype=v.dtype, device=v.device)
         return (v * w).sum() / w.sum().clamp_min(eps)
-
 
     def train(self, face_tensors):
         cfg = self.cfg
@@ -968,7 +895,6 @@ class NN_Trainer:
         all_global_idx = torch.cat([ft["global_vertex_idx"] for ft in face_tensors], dim=0)
         vertices_number = int(all_global_idx.max().item()) + 1
 
-        # Global area vector and local area cache
         A_v = torch.zeros((vertices_number,), dtype=dtype, device=device)
         local_vertex_areas = []
         local_face_weights = []
@@ -983,9 +909,6 @@ class NN_Trainer:
 
             local_vertex_areas.append(A_local)
             local_face_weights.append(A_local.sum().clamp_min(cfg.eps))
-
-            # This assumes triangle ownership is partitioned across face_tensors.
-            # If face patches overlap in area, A_v will reflect that overlap.
             A_v[gidx] += A_local
 
         decoders, ppnets = self._build_face_models(face_tensors=face_tensors, device=device)
@@ -1035,7 +958,6 @@ class NN_Trainer:
         history = []
 
         for step in range(cfg.num_steps):
-            # Global accumulators with overlap-safe weighted averaging
             rho_acc = torch.zeros((vertices_number,), dtype=dtype, device=device)
             rho_wgt = torch.zeros((vertices_number,), dtype=dtype, device=device)
 
@@ -1113,33 +1035,26 @@ class NN_Trainer:
                     boundary_face_id=boundary_face_id_i,
                 )
 
+                self._require_decoder_keys(
+                    decoder_out,
+                    [
+                        "seeds",
+                        "rho",
+                        "fiber3d",
+                        "w_geo",
+                        "rho_v",
+                        "rho_b",
+                        "edge_field",
+                    ],
+                )
 
-
-                if len(decoder_out) != 16:
-                    raise ValueError(
-                        "Decoder output does not match expected signature "
-                        "(..., w_geo, fiber3d, pair_strength, band_ij, pair_relevance, "
-                        "rho_v, rho_b, edge_field)."
-                    )
-
-                (
-                    _w_soft_i,
-                    _d_i,
-                    _M_i,
-                    seeds_i,
-                    rho_i,
-                    _t_uv_raw_i,
-                    _t_uv_i,
-                    _h_i,
-                    w_geo_i,
-                    fiber3d_i,
-                    _pair_strength_i,
-                    _band_ij_i,
-                    _pair_relevance_i,
-                    rho_v_i,
-                    rho_b_i,
-                    edge_field_i,
-                ) = decoder_out
+                seeds_i = decoder_out["seeds"]
+                rho_i = decoder_out["rho"]
+                w_geo_i = decoder_out["w_geo"]
+                fiber3d_i = decoder_out["fiber3d"]
+                rho_v_i = decoder_out["rho_v"]
+                rho_b_i = decoder_out["rho_b"]
+                edge_field_i = decoder_out["edge_field"]
 
                 face_valid = True
                 for name, t in {
@@ -1154,6 +1069,9 @@ class NN_Trainer:
                         print(f"[step {step}] face {ft['face_id']} invalid tensor: {name}")
                         face_valid = False
                         break
+
+                if not face_valid:
+                    raise RuntimeError(f"Invalid decoder output on face {ft['face_id']} at step {step}")
 
                 gidx = ft["global_vertex_idx"]
                 w_local = A_local.clamp_min(cfg.eps)
@@ -1177,6 +1095,8 @@ class NN_Trainer:
                     "w_raw": w_raw_i,
                     "h_raw": None if h_raw_i is None else h_raw_i,
                     "gates": None if gates_i is None else gates_i,
+                    "theta": None if theta_i is None else theta_i.detach().clone(),
+                    "a_raw": None if a_raw_i is None else a_raw_i.detach().clone(),
                     "w_geo": w_geo_i.detach().clone(),
                 })
 
@@ -1205,8 +1125,6 @@ class NN_Trainer:
                     loss_strut_i, loss_strut_edge_i, loss_strut_void_i = self.strutness_loss_from_edge_field(
                         rho=rho_v_i,
                         edge_field=edge_field_i,
-                        w=w_raw_i,
-                        w_ref = 0.25,
                         lam_edge=cfg.lam_strut_edge,
                         lam_void=cfg.lam_strut_void,
                         eps=cfg.eps,
@@ -1308,7 +1226,7 @@ class NN_Trainer:
                 elif not cfg.skip_bad_fem_steps:
                     L_total = L_total + cfg.lam_fem * loss_fem
 
-            L_total= L_total/len(face_tensors)
+            L_total = L_total / len(face_tensors)
             total_is_finite = self._scalar_tensor_is_finite(L_total)
 
             opt.zero_grad(set_to_none=True)
@@ -1329,13 +1247,16 @@ class NN_Trainer:
                                 raise RuntimeError(
                                     f"Non-finite gradient before opt.step(): face={fi}, param={pn}"
                                 )
+
                 opt.step()
+
                 for fi, ppnet in enumerate(ppnets):
                     for pn, p in ppnet.named_parameters():
                         if not torch.isfinite(p).all():
                             raise RuntimeError(
-                             f"Non-finite parameter after opt.step(): face={fi}, param={pn}"
-                           )
+                                f"Non-finite parameter after opt.step(): face={fi}, param={pn}"
+                            )
+
                 if scheduler is not None:
                     scheduler.step()
             else:
@@ -1367,6 +1288,8 @@ class NN_Trainer:
                             "w_raw": p["w_raw"].detach().clone(),
                             "h_raw": None if p["h_raw"] is None else p["h_raw"].detach().clone(),
                             "gates": None if p["gates"] is None else p["gates"].detach().clone(),
+                            "theta": None if p["theta"] is None else p["theta"].detach().clone(),
+                            "a_raw": None if p["a_raw"] is None else p["a_raw"].detach().clone(),
                             "w_geo": p["w_geo"].detach().clone(),
                         }
                         for p in pred_list
@@ -1557,7 +1480,9 @@ class NN_Trainer:
             "fem_debug_history": self.fem_debug_history,
             "last_fem_debug": self.last_fem_debug,
             "tensorboard_log_dir": self.tensorboard_log_dir,
+            "shape_path": face_tensors[0].get("shape_path", None),
         }
+
     # ------------------------------------------------------------------
     # Visualization
     # ------------------------------------------------------------------
@@ -1592,3 +1517,402 @@ class NN_Trainer:
             show_solid=show_solid,
         )
         return solid, thr_used
+    def sample_face_field_for_visualization(
+        self,
+        ft: dict,
+        decoder,
+        pred: dict,
+        shape_or_path,
+        grid_res_u: int = 120,
+        grid_res_v: int = 120,
+        uv_mask_tol: float | None = None,
+        use_boundary_attachment: bool = True,
+        trim_tol: float = 1e-7,
+    ):
+        """
+        Dense CAD-native field sampling on one face for smooth visualization.
+
+        This version:
+        - builds a dense UV grid in normalized face UV
+        - optionally prefilters points by proximity to sampled UV cloud
+        - evaluates xyz, Xu, Xv on the actual CAD face
+        - keeps only trim-valid points
+        - evaluates decoder on those dense query points
+
+        Returns:
+            {
+                "uv_dense": (Nd,2),
+                "uv_raw_dense": (Nd,2),
+                "xyz_dense": (Nd,3),
+                "Xu_dense": (Nd,3),
+                "Xv_dense": (Nd,3),
+                "rho_dense": (Nd,),
+                "rho_v_dense": (Nd,),
+                "rho_b_dense": (Nd,),
+                "fiber3d_dense": (Nd,3),
+                "edge_field_dense": (Nd,),
+                "mask_dense_prefilter": (Nu*Nv,),
+                "grid_shape": (Nu, Nv),
+            }
+        """
+        device = ft["uv"].device
+        dtype = ft["uv"].dtype
+
+        uv_face = ft["uv"]
+
+        # ------------------------------------------------------------
+        # 1) Dense UV grid in normalized face UV coordinates
+        # ------------------------------------------------------------
+        u = uv_face[:, 0]
+        v = uv_face[:, 1]
+
+        u_lin = torch.linspace(u.min(), u.max(), grid_res_u, device=device, dtype=dtype)
+        v_lin = torch.linspace(v.min(), v.max(), grid_res_v, device=device, dtype=dtype)
+
+        UU, VV = torch.meshgrid(u_lin, v_lin, indexing="ij")
+        uv_grid = torch.stack([UU.reshape(-1), VV.reshape(-1)], dim=1)  # (Nu*Nv, 2)
+
+        # ------------------------------------------------------------
+        # 2) Optional UV-cloud prefilter
+        #    Helps avoid querying huge empty regions on trimmed faces.
+        # ------------------------------------------------------------
+        if uv_mask_tol is None:
+            if uv_face.shape[0] >= 2:
+                d_self = torch.cdist(uv_face, uv_face)
+                big = torch.eye(uv_face.shape[0], device=device, dtype=d_self.dtype) * 1e6
+                d_self = d_self + big
+                spacing = d_self.min(dim=1).values.median()
+                uv_mask_tol = float((2.5 * spacing).detach().item())
+            else:
+                uv_mask_tol = 0.05
+
+        d_uv = torch.cdist(uv_grid, uv_face)
+        dmin = d_uv.min(dim=1).values
+        mask_dense_prefilter = dmin <= uv_mask_tol
+        uv_query = uv_grid[mask_dense_prefilter]
+
+        if uv_query.numel() == 0:
+            raise ValueError(
+                f"No dense UV query points survived prefilter on face {ft.get('face_id', 'unknown')}. "
+                f"Try increasing uv_mask_tol."
+            )
+
+        # ------------------------------------------------------------
+        # 3) CAD-native geometry evaluation
+        # ------------------------------------------------------------
+        geom = self.generator.eval_face_uv_from_face_tensor(
+            shape_or_path=shape_or_path,
+            face_tensor=ft,
+            uv_norm=uv_query,
+            metric_tol=getattr(self.generator, "metric_tol", 1e-9),
+            trim_tol=trim_tol,
+            as_torch=True,
+        )
+
+        valid_mask = geom["valid_mask"]
+        if valid_mask.numel() == 0 or not bool(valid_mask.any().item()):
+            raise ValueError(
+                f"No valid CAD-evaluable dense points on face {ft.get('face_id', 'unknown')}."
+            )
+
+        uv_dense = geom["uv_norm"][valid_mask]
+        uv_raw_dense = geom["uv_raw"][valid_mask]
+        xyz_dense = geom["points_xyz"][valid_mask]
+        Xu_dense = geom["Xu"][valid_mask]
+        Xv_dense = geom["Xv"][valid_mask]
+
+        # ------------------------------------------------------------
+        # 4) Boundary data for decoder
+        # ------------------------------------------------------------
+        local_face_id = torch.zeros(
+            uv_dense.shape[0],
+            dtype=torch.long,
+            device=device,
+        )
+
+        boundary_uv_i = None
+        boundary_face_id_i = None
+
+        if use_boundary_attachment:
+            true_bidx_i = self._true_open_boundary_idx(ft)
+            if true_bidx_i.numel() > 0:
+                boundary_uv_i = uv_face[true_bidx_i]
+                boundary_face_id_i = torch.zeros(
+                    boundary_uv_i.shape[0],
+                    dtype=torch.long,
+                    device=device,
+                )
+
+        # ------------------------------------------------------------
+        # 5) Recover trained parameters
+        # ------------------------------------------------------------
+        seeds_raw = pred["seeds_raw"]
+        w_raw = pred["w_raw"]
+        h_raw = pred.get("h_raw", None)
+
+        theta = pred.get("theta", None)
+        a_raw = pred.get("a_raw", None)
+
+        gap_thr_raw = pred.get("gap_thr_raw", None)
+        big_thr_raw = pred.get("big_thr_raw", None)
+        alpha_raw = pred.get("alpha_raw", None)
+        eta_raw = pred.get("eta_raw", None)
+
+        # ------------------------------------------------------------
+        # 6) Evaluate decoder on CAD-native dense query points
+        # ------------------------------------------------------------
+        decoder_out = decoder.evaluate_at_uv(
+            points_uv=uv_dense,
+            Xu=Xu_dense,
+            Xv=Xv_dense,
+            tau=self.cfg.tau,
+            seeds_raw=seeds_raw,
+            w_raw=w_raw,
+            h_raw=h_raw,
+            theta=theta,
+            a_raw=a_raw,
+            points_face_id=local_face_id,
+            boundary_uv=boundary_uv_i,
+            boundary_face_id=boundary_face_id_i,
+            gap_thr_raw=gap_thr_raw,
+            big_thr_raw=big_thr_raw,
+            alpha_raw=alpha_raw,
+            eta_raw=eta_raw,
+        )
+
+        self._require_decoder_keys(
+            decoder_out,
+            ["rho", "rho_v", "rho_b", "fiber3d", "edge_field"],
+        )
+
+        return {
+            "uv_dense": uv_dense,
+            "uv_raw_dense": uv_raw_dense,
+            "xyz_dense": xyz_dense,
+            "Xu_dense": Xu_dense,
+            "Xv_dense": Xv_dense,
+            "rho_dense": decoder_out["rho"],
+            "rho_v_dense": decoder_out["rho_v"],
+            "rho_b_dense": decoder_out["rho_b"],
+            "fiber3d_dense": decoder_out["fiber3d"],
+            "edge_field_dense": decoder_out["edge_field"],
+            "mask_dense_prefilter": mask_dense_prefilter,
+            "grid_shape": (grid_res_u, grid_res_v),
+        }
+   
+    def sample_result_field_dense_for_visualization(
+        self,
+        result: dict,
+        shape_or_path=None,
+        grid_res_u: int = 120,
+        grid_res_v: int = 120,
+        uv_mask_tol: float | None = None,
+        use_best_pred: bool = True,
+    ):
+        """
+        Dense CAD-native field sampling over all faces for smooth visualization.
+        """
+        face_tensors = result["face_tensors"]
+        decoders = result["decoders"]
+
+        if use_best_pred:
+            pred_list = result["best_pred"]
+        else:
+            raise ValueError("Only use_best_pred=True is currently supported.")
+
+        if shape_or_path is None:
+            shape_or_path = result.get("shape_path", None)
+
+        if shape_or_path is None:
+            raise ValueError(
+                "shape_or_path is required for CAD-native dense sampling. "
+                "Pass it explicitly or store 'shape_path' in result."
+            )
+
+        pred_by_face_id = {p["face_id"]: p for p in pred_list}
+
+        xyz_parts = []
+        rho_parts = []
+        rho_v_parts = []
+        rho_b_parts = []
+        fiber_parts = []
+        edge_parts = []
+        face_ranges = []
+        per_face = []
+
+        start = 0
+        for ft, decoder in zip(face_tensors, decoders):
+            face_id = ft["face_id"]
+            if face_id not in pred_by_face_id:
+                raise KeyError(f"Missing best_pred for face_id={face_id}")
+
+            pred = pred_by_face_id[face_id]
+
+            sampled = self.sample_face_field_for_visualization(
+                ft=ft,
+                decoder=decoder,
+                pred=pred,
+                shape_or_path=shape_or_path,
+                grid_res_u=grid_res_u,
+                grid_res_v=grid_res_v,
+                uv_mask_tol=uv_mask_tol,
+            )
+
+            n = sampled["xyz_dense"].shape[0]
+            end = start + n
+
+            xyz_parts.append(sampled["xyz_dense"])
+            rho_parts.append(sampled["rho_dense"])
+            rho_v_parts.append(sampled["rho_v_dense"])
+            rho_b_parts.append(sampled["rho_b_dense"])
+            fiber_parts.append(sampled["fiber3d_dense"])
+            edge_parts.append(sampled["edge_field_dense"])
+
+            face_ranges.append((start, end, face_id))
+            per_face.append(sampled)
+            start = end
+
+        return {
+            "points_xyz": torch.cat(xyz_parts, dim=0),
+            "rho": torch.cat(rho_parts, dim=0),
+            "rho_v": torch.cat(rho_v_parts, dim=0),
+            "rho_b": torch.cat(rho_b_parts, dim=0),
+            "fiber3d": torch.cat(fiber_parts, dim=0),
+            "edge_field": torch.cat(edge_parts, dim=0),
+            "face_ranges": face_ranges,
+            "per_face": per_face,
+        }
+    def visualize_result_final_smooth_points(
+        self,
+        result,
+        shape_or_path=None,
+        thr: float = 0.5,
+        grid_res_u: int = 120,
+        grid_res_v: int = 120,
+        uv_mask_tol: float | None = None,
+    ):
+        """
+        Smooth point-cloud style threshold visualization from dense CAD-native decoder sampling.
+        """
+        dense = self.sample_result_field_dense_for_visualization(
+            result=result,
+            shape_or_path=shape_or_path,
+            grid_res_u=grid_res_u,
+            grid_res_v=grid_res_v,
+            uv_mask_tol=uv_mask_tol,
+            use_best_pred=True,
+        )
+
+        points_xyz = dense["points_xyz"].detach().cpu().numpy()
+        rho = dense["rho"].detach().cpu().numpy()
+
+        keep = rho >= thr
+        solid_points = points_xyz[keep]
+
+        print(
+            f"Smooth CAD-native visualization: kept {keep.sum()} / {keep.shape[0]} dense points "
+            f"with threshold {thr:.3f}"
+        )
+
+
+        cloud = pv.PolyData(solid_points)
+
+        plotter = pv.Plotter()
+        plotter.add_points(
+            cloud,
+            render_points_as_spheres=True,
+            point_size=6,
+        )
+
+        plotter.show()
+
+        return {
+            "solid_points": solid_points,
+            "points_xyz": points_xyz,
+            "rho": rho,
+            "keep_mask": keep,
+            "dense": dense,
+        }
+    
+
+    def visualize_result_final_smooth_surface_pyvista(
+        self,
+        result,
+        shape_or_path=None,
+        thr: float = 0.5,
+        grid_res_u: int = 120,
+        grid_res_v: int = 120,
+        uv_mask_tol: float | None = None,
+        show_density: bool = True,
+    ):
+        import pyvista as pv
+        import numpy as np
+
+        dense = self.sample_result_field_dense_for_visualization(
+            result=result,
+            shape_or_path=shape_or_path,
+            grid_res_u=grid_res_u,
+            grid_res_v=grid_res_v,
+            uv_mask_tol=uv_mask_tol,
+        )
+
+        plotter = pv.Plotter()
+
+        for face_data in dense["per_face"]:
+            uv_dense = face_data["uv_dense"]
+            xyz = face_data["xyz_dense"].detach().cpu().numpy()
+            rho = face_data["rho_dense"].detach().cpu().numpy()
+
+            Nu, Nv = face_data["grid_shape"]
+
+            # We need full grid mapping
+            mask = face_data["mask_dense_prefilter"].cpu().numpy()
+
+            # Build full grid index map
+            full_indices = -np.ones(mask.shape[0], dtype=int)
+            full_indices[mask] = np.arange(mask.sum())
+
+            faces = []
+
+            def idx(i, j):
+                return i * Nv + j
+
+            for i in range(Nu - 1):
+                for j in range(Nv - 1):
+                    ids = [
+                        idx(i, j),
+                        idx(i, j + 1),
+                        idx(i + 1, j),
+                        idx(i + 1, j + 1),
+                    ]
+
+                    mapped = [full_indices[k] for k in ids]
+
+                    if any(m < 0 for m in mapped):
+                        continue
+
+                    i0, i1, i2, i3 = mapped
+
+                    # triangle 1
+                    if rho[i0] >= thr and rho[i1] >= thr and rho[i2] >= thr:
+                        faces.append([3, i0, i1, i2])
+
+                    # triangle 2
+                    if rho[i2] >= thr and rho[i1] >= thr and rho[i3] >= thr:
+                        faces.append([3, i2, i1, i3])
+
+            if len(faces) == 0:
+                continue
+
+            faces = np.array(faces).reshape(-1)
+
+            mesh = pv.PolyData(xyz, faces)
+
+            if show_density:
+                mesh["rho"] = rho
+                plotter.add_mesh(mesh, scalars="rho", cmap="viridis", clim=[0, 1])
+            else:
+                plotter.add_mesh(mesh, color="lightblue")
+
+
+        plotter.show()
