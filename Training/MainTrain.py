@@ -1142,7 +1142,9 @@ class NN_Trainer:
 
         opt = self._build_optimizer(ppnets)
 
-        recorder = TimelapseRecorder(out_dir="timelapse_frames", video_path="timelapse.mp4",fps=8)
+        if cfg.MakeTimelaps:
+            Case_name = shape_path.stem
+            recorder = TimelapseRecorder(out_dir="timelapse_frames", video_path=Case_name + "_timelapse.mp4",fps=8)
 
         scheduler = None
         if getattr(cfg, "scheduler_milestones", None):
@@ -1182,13 +1184,14 @@ class NN_Trainer:
 
         self.current_face_tensors = face_tensors
 
-        render_cache = self.build_timelapse_render_cache(
-            face_tensors=face_tensors,
-            shape_or_path=str(shape_path),
-            grid_res_u=cfg.TM_laps_res_u,
-            grid_res_v=cfg.TM_laps_res_v,
-            uv_mask_tol=None,
-        )
+        if cfg.MakeTimelaps:
+            render_cache = self.build_timelapse_render_cache(
+                face_tensors=face_tensors,
+                shape_or_path=str(shape_path),
+                grid_res_u=cfg.TM_laps_res_u,
+                grid_res_v=cfg.TM_laps_res_v,
+                uv_mask_tol=None,
+            )
 
         for step in range(cfg.num_steps):
             rho_acc = torch.zeros((vertices_number,), dtype=dtype, device=device)
@@ -1721,10 +1724,11 @@ class NN_Trainer:
             self.writer.close()
             self.writer = None
 
-        try:
-            recorder.build_video()
-        except Exception as e:
-            print(f"Failed to build timelapse video: {e}")    
+        if cfg.MakeTimelaps:
+            try:
+                recorder.build_video()
+            except Exception as e:
+                print(f"Failed to build timelapse video: {e}")    
 
         return {
             "decoders": decoders,
