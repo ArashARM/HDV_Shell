@@ -5,6 +5,7 @@ from datetime import datetime
 
 import torch
 from torch.utils.tensorboard import SummaryWriter
+from Utils.TimelapseRecorder import TimelapseRecorder
 
 import pyvista as pv
 try:
@@ -74,6 +75,13 @@ class TrainingConfig:
     experiment_name: str | None = None
     tb_flush_secs: int = 10
     tb_log_histograms_every: int = 200
+
+    MakeTimelaps : bool = True
+
+    timelapse_frame_step: int =20
+    TM_laps_res_u: int = 100
+    TM_laps_res_v: int = 100
+    TM_laps_Thr:float = 0.45
 
 
 class RunningNorm:
@@ -453,6 +461,7 @@ class NN_Trainer:
         if save_debug_history:
             self.fem_debug_history.append(debug.copy())
 
+    
     def fem_loss(
         self,
         rho_surface: torch.Tensor,
@@ -882,8 +891,220 @@ class NN_Trainer:
         v = torch.stack(values)
         w = torch.stack(weights).to(dtype=v.dtype, device=v.device)
         return (v * w).sum() / w.sum().clamp_min(eps)
+    def _make_density_image(self, face_tensors, rho_global, res=256):
+        import numpy as np
+        from scipy.interpolate import griddata
 
-    def train(self, face_tensors):
+        uv_all = []
+        rho_all = []
+
+        for ft in face_tensors:
+            uv_i = ft["uv"].detach().cpu().numpy()                          # (Ni, 2)
+            gidx_i = ft["global_vertex_idx"]                                # (Ni,)
+            rho_i = rho_global[gidx_i].detach().cpu().numpy()               # (Ni,)
+
+            uv_all.append(uv_i)
+            rho_all.append(rho_i)
+
+        uv_all = np.concatenate(uv_all, axis=0)
+        rho_all = np.concatenate(rho_all, axis=0)
+
+        gx, gy = np.meshgrid(
+            np.linspace(0.0, 1.0, res),
+            np.linspace(0.0, 1.0, res),
+        )
+
+        density_img = griddata(
+            uv_all,
+            rho_all,
+            (gx, gy),
+            method="linear",
+            fill_value=0.0,
+        )
+
+        density_img = np.nan_to_num(density_img, nan=0.0, posinf=1.0, neginf=0.0)
+        density_img = np.clip(density_img, 0.0, 1.0)
+        return density_img
+
+    def build_timelapse_render_cache(
+        self,
+        face_tensors,
+        shape_or_path,
+        grid_res_u=80,
+        grid_res_v=80,
+        uv_mask_tol=None,
+        trim_tol=1e-7,
+    ):
+        cache = []
+
+        for ft in face_tensors:
+            device = ft["uv"].device
+            dtype = ft["uv"].dtype
+            uv_face = ft["uv"]
+
+            u = uv_face[:, 0]
+            v = uv_face[:, 1]
+
+            u_lin = torch.linspace(u.min(), u.max(), grid_res_u, device=device, dtype=dtype)
+            v_lin = torch.linspace(v.min(), v.max(), grid_res_v, device=device, dtype=dtype)
+            UU, VV = torch.meshgrid(u_lin, v_lin, indexing="ij")
+            uv_grid = torch.stack([UU.reshape(-1), VV.reshape(-1)], dim=1)
+
+            if uv_mask_tol is None:
+                if uv_face.shape[0] >= 2:
+                    d_self = torch.cdist(uv_face, uv_face)
+                    big = torch.eye(uv_face.shape[0], device=device, dtype=d_self.dtype) * 1e6
+                    d_self = d_self + big
+                    spacing = d_self.min(dim=1).values.median()
+                    uv_mask_tol_i = float((2.5 * spacing).detach().item())
+                else:
+                    uv_mask_tol_i = 0.05
+            else:
+                uv_mask_tol_i = uv_mask_tol
+
+            d_uv = torch.cdist(uv_grid, uv_face)
+            dmin = d_uv.min(dim=1).values
+            mask_dense_prefilter = dmin <= uv_mask_tol_i
+            uv_query = uv_grid[mask_dense_prefilter]
+
+            geom = self.generator.eval_face_uv_from_face_tensor(
+                shape_or_path=shape_or_path,
+                face_tensor=ft,
+                uv_norm=uv_query,
+                metric_tol=getattr(self.generator, "metric_tol", 1e-9),
+                trim_tol=trim_tol,
+                as_torch=True,
+            )
+
+            valid_mask = geom["valid_mask"]
+            uv_dense = geom["uv_norm"][valid_mask]
+            xyz_dense = geom["points_xyz"][valid_mask]
+            Xu_dense = geom["Xu"][valid_mask]
+            Xv_dense = geom["Xv"][valid_mask]
+
+            local_face_id = torch.zeros(
+                uv_dense.shape[0], dtype=torch.long, device=device
+            )
+
+            boundary_uv_i = None
+            boundary_face_id_i = None
+            true_bidx_i = self._true_open_boundary_idx(ft)
+            if true_bidx_i.numel() > 0:
+                boundary_uv_i = uv_face[true_bidx_i]
+                boundary_face_id_i = torch.zeros(
+                    boundary_uv_i.shape[0], dtype=torch.long, device=device
+                )
+
+            cache.append({
+                "face_id": ft["face_id"],
+                "uv_dense": uv_dense,
+                "xyz_dense": xyz_dense,
+                "Xu_dense": Xu_dense,
+                "Xv_dense": Xv_dense,
+                "local_face_id": local_face_id,
+                "boundary_uv": boundary_uv_i,
+                "boundary_face_id": boundary_face_id_i,
+                "mask_dense_prefilter": mask_dense_prefilter,
+                "grid_shape": (grid_res_u, grid_res_v),
+            })
+
+        return cache
+    
+    def evaluate_cached_face_fields(self, render_cache, decoder, pred):
+        decoder_out = decoder.evaluate_at_uv(
+            points_uv=render_cache["uv_dense"],
+            Xu=render_cache["Xu_dense"],
+            Xv=render_cache["Xv_dense"],
+            tau=self.cfg.tau,
+            seeds_raw=pred["seeds_raw"],
+            w_raw=pred["w_raw"],
+            h_raw=pred.get("h_raw", None),
+            theta=pred.get("theta", None),
+            a_raw=pred.get("a_raw", None),
+            points_face_id=render_cache["local_face_id"],
+            boundary_uv=render_cache["boundary_uv"],
+            boundary_face_id=render_cache["boundary_face_id"],
+            gap_thr_raw=pred.get("gap_thr_raw", None),
+            big_thr_raw=pred.get("big_thr_raw", None),
+            alpha_raw=pred.get("alpha_raw", None),
+            eta_raw=pred.get("eta_raw", None),
+        )
+
+        return {
+            "xyz_dense": render_cache["xyz_dense"],
+            "rho_dense": decoder_out["rho"],
+            "grid_shape": render_cache["grid_shape"],
+            "mask_dense_prefilter": render_cache["mask_dense_prefilter"],
+        }
+    def _render_current_cad_frame_cached(
+        self,
+        seeds_list,
+        decoders,
+        pred_list,
+        render_cache,
+        thr=0.5,
+    ):
+        import pyvista as pv
+        import numpy as np
+
+        plotter = pv.Plotter(off_screen=True, window_size=(900, 700))
+        plotter.set_background("white")
+
+        pred_by_face_id = {p["face_id"]: p for p in pred_list}
+        dec_by_face_id = {ft["face_id"]: dec for ft, dec in zip(self.current_face_tensors, decoders)}
+
+        for cache_i in render_cache:
+            face_id = cache_i["face_id"]
+            pred = pred_by_face_id[face_id]
+            decoder = dec_by_face_id[face_id]
+
+            out = self.evaluate_cached_face_fields(cache_i, decoder, pred)
+
+            xyz = out["xyz_dense"].detach().cpu().numpy()
+            rho_dense = out["rho_dense"].detach().cpu().numpy()
+            Nu, Nv = out["grid_shape"]
+            mask = out["mask_dense_prefilter"].cpu().numpy()
+
+            full_indices = -np.ones(mask.shape[0], dtype=int)
+            full_indices[mask] = np.arange(mask.sum())
+
+            faces = []
+
+            def idx(i, j):
+                return i * Nv + j
+
+            for i in range(Nu - 1):
+                for j in range(Nv - 1):
+                    ids = [idx(i, j), idx(i, j + 1), idx(i + 1, j), idx(i + 1, j + 1)]
+                    mapped = [full_indices[k] for k in ids]
+                    if any(m < 0 for m in mapped):
+                        continue
+
+                    i0, i1, i2, i3 = mapped
+
+                    if rho_dense[i0] >= thr and rho_dense[i1] >= thr and rho_dense[i2] >= thr:
+                        faces.append([3, i0, i1, i2])
+                    if rho_dense[i2] >= thr and rho_dense[i1] >= thr and rho_dense[i3] >= thr:
+                        faces.append([3, i2, i1, i3])
+
+            if len(faces) == 0:
+                continue
+
+            mesh = pv.PolyData(xyz, np.array(faces).reshape(-1))
+            plotter.add_mesh(mesh, color="lightblue", opacity=1.0)
+
+        seed_xyz = self._seed_points_xyz_all_faces(seeds_list, self.current_face_tensors)
+        if seed_xyz is not None and len(seed_xyz) > 0:
+            seed_cloud = pv.PolyData(seed_xyz)
+            plotter.add_mesh(seed_cloud, color="red", render_points_as_spheres=True, point_size=12)
+
+        plotter.view_isometric()
+        plotter.show_axes()
+        img = plotter.screenshot(return_img=True)
+        plotter.close()
+        return img
+    
+    def train(self, shape_path,face_tensors):
         cfg = self.cfg
         self._validate_face_tensors(face_tensors)
 
@@ -921,6 +1142,8 @@ class NN_Trainer:
 
         opt = self._build_optimizer(ppnets)
 
+        recorder = TimelapseRecorder(out_dir="timelapse_frames", video_path="timelapse.mp4",fps=8)
+
         scheduler = None
         if getattr(cfg, "scheduler_milestones", None):
             scheduler = torch.optim.lr_scheduler.MultiStepLR(
@@ -956,6 +1179,16 @@ class NN_Trainer:
         rho0 = None
         seeds0 = None
         history = []
+
+        self.current_face_tensors = face_tensors
+
+        render_cache = self.build_timelapse_render_cache(
+            face_tensors=face_tensors,
+            shape_or_path=str(shape_path),
+            grid_res_u=cfg.TM_laps_res_u,
+            grid_res_v=cfg.TM_laps_res_v,
+            uv_mask_tol=None,
+        )
 
         for step in range(cfg.num_steps):
             rho_acc = torch.zeros((vertices_number,), dtype=dtype, device=device)
@@ -1273,6 +1506,13 @@ class NN_Trainer:
                 prev_best_step = best_step
                 improvement_gap = (step - prev_best_step) if prev_best_step >= 0 else None
 
+                if step == 0:
+                    initial_shape_density = rho.detach().clone()
+                    seed_points_init = self._seed_points_xyz_all_faces(seeds_list, face_tensors)
+
+                if step == mid_step:
+                    mid_shape_density = rho.detach().clone()
+                    seed_points_mid = self._seed_points_xyz_all_faces(seeds_list, face_tensors)
                 if best_candidate_is_valid and score < (best_score - cfg.min_delta):
                     best_score = score
                     best_step = step
@@ -1307,13 +1547,7 @@ class NN_Trainer:
                 elif best_candidate_is_valid:
                     steps_since_improve += 1
 
-                if step == 0:
-                    initial_shape_density = rho.detach().clone()
-                    seed_points_init = self._seed_points_xyz_all_faces(seeds_list, face_tensors)
 
-                if step == mid_step:
-                    mid_shape_density = rho.detach().clone()
-                    seed_points_mid = self._seed_points_xyz_all_faces(seeds_list, face_tensors)
 
                 if rho0 is None:
                     rho0 = rho.detach().clone()
@@ -1369,6 +1603,35 @@ class NN_Trainer:
                     "w_geo_mean": self._finite_or_default(w_geo_mean),
                 }
                 history.append(row)
+
+                if cfg.MakeTimelaps and step % cfg.timelapse_frame_step == 0:
+                    cad_img = self._render_current_cad_frame_cached(
+                        seeds_list=seeds_list,
+                        decoders=decoders,
+                        pred_list=pred_list,
+                        render_cache=render_cache,
+                        thr=getattr(cfg, "vis_thr", cfg.TM_laps_Thr),
+                    )
+
+                    loss_dict = {
+                        "total": row["L_total"],
+                        "vol": row["loss_vol"],
+                        "rep": row["loss_rep"],
+                        "bnd": row["loss_bnd"],
+                        "strut": row["loss_strut"],
+                        "fem": row["loss_fem"],
+                    }
+
+                    recorder.add_frame(
+                        step=step,
+                        cad_img=cad_img,
+                        loss_dict=loss_dict,
+                        title_text=(
+                            f"vol={row['vol_frac']:.4f} | "
+                            f"W={row['w_geo_mean']:.4g} | "
+                            f"Δrho={drho:.2e} Δseed={dseed:.2e} grad_mean={g_mean:.2e} | "
+                        ),
+                    )
 
                 self._tb_log_step(
                     step=step,
@@ -1457,6 +1720,11 @@ class NN_Trainer:
             self.writer.flush()
             self.writer.close()
             self.writer = None
+
+        try:
+            recorder.build_video()
+        except Exception as e:
+            print(f"Failed to build timelapse video: {e}")    
 
         return {
             "decoders": decoders,
