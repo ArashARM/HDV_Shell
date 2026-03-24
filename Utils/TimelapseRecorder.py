@@ -1,4 +1,5 @@
 import os
+import shutil   
 import cv2
 import numpy as np
 import matplotlib
@@ -83,7 +84,7 @@ class TimelapseRecorder:
         cv2.imwrite(frame_path, combined)
         self.frame_paths.append(frame_path)
 
-    def build_video(self):
+    def build_video(self,delete_frames=True):
         if not self.frame_paths:
             raise RuntimeError("No frames recorded.")
 
@@ -110,3 +111,9 @@ class TimelapseRecorder:
 
         writer.release()
         print(f"Saved video to: {self.video_path}")
+        if delete_frames:
+            try:
+                shutil.rmtree(self.out_dir)
+                print(f"Deleted frames directory: {self.out_dir}")
+            except Exception as e:
+                print(f"Warning: could not delete frames directory: {e}")
