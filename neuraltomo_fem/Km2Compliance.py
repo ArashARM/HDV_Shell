@@ -12,8 +12,7 @@ import subprocess
 # The code checks if MKL is available and sets the number of threads to 16 for optimal performance. The `useMKL` flag can be toggled to switch between using MKL and the default sparse solver. 
 # This is particularly useful for large-scale problems where the stiffness matrix can be
 # PyMKL is a Python wrapper for the Intel Math Kernel Library (MKL), which provides optimized routines for linear algebra operations.
-import mkl
-import pyMKL
+
 #scipy.sparse is a module in SciPy that provides functions for working with sparse matrices, which are matrices that contain a large number of zero elements.
 #csc_matrix is a specific type of sparse matrix format (Compressed Sparse Column) that is efficient for certain operations, such as matrix-vector products and solving linear systems.
 #eye is a function that creates an identity matrix, which is often used in numerical computations to add a small value to the diagonal of a matrix for regularization purposes.
@@ -21,8 +20,18 @@ from scipy.sparse import csc_matrix, eye
 #cholesky is a function that performs Cholesky decomposition, which is a numerical method for solving linear systems of equations, 
 # particularly those involving symmetric positive-definite matrices.
 from sksparse.cholmod import cholesky
-mkl.set_num_threads(16)
+
 useMKL = False
+try:
+    import mkl
+    import pyMKL
+    mkl.set_num_threads(16)
+    useMKL = True
+except ImportError:
+    torch.set_num_threads(8)
+    useMKL = False
+    
+    
 
 class Sk2Complicance(torch.autograd.Function):
     @staticmethod
