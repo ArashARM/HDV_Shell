@@ -498,6 +498,7 @@ class VoronoiDecoder(nn.Module):
         big_thr_raw: torch.Tensor | None = None,
         alpha_raw: torch.Tensor | None = None,
         eta_raw: torch.Tensor | None = None,
+        seed_gates: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         """
         Evaluate the Voronoi surface field at arbitrary UV query points.
@@ -544,10 +545,20 @@ class VoronoiDecoder(nn.Module):
             cross_face_mask = points_face_id[:, None] != seed_face_id[None, :]
             d = d + cross_face_mask.to(d.dtype) * 1e6
 
-        logits = -d / float(tau)
-        logits = logits - logits.max(dim=1, keepdim=True).values
-        logits = logits.clamp(-80.0, 0.0)
-        w_soft = F.softmax(logits, dim=1)
+        logits = -d / tau
+
+        if seed_gates is not None:
+            if seed_gates.ndim != 1 or seed_gates.shape[0] != S:
+                raise ValueError(
+                    f"seed_gates must have shape ({S},), got {tuple(seed_gates.shape)}"
+                )
+            gate_eps = 1e-8
+            gates = seed_gates.to(device=d.device, dtype=d.dtype).clamp_min(gate_eps)
+            logits = logits + torch.log(gates).unsqueeze(0)
+
+        logits = logits - logits.max(dim=-1, keepdim=True).values
+        logits = logits.clamp(min=-80.0, max=0.0)
+        w_soft = torch.softmax(logits, dim=-1)
 
         device = w_soft.device
         dtype = w_soft.dtype
@@ -648,23 +659,24 @@ class VoronoiDecoder(nn.Module):
 
     def forward(
         self,
-        points_uv: torch.Tensor,
-        Xu: torch.Tensor,
-        Xv: torch.Tensor,
-        tau: float,
-        seeds_raw: torch.Tensor,
-        w_raw: torch.Tensor,
-        h_raw: torch.Tensor | None,
-        theta: torch.Tensor | None = None,
-        a_raw: torch.Tensor | None = None,
-        points_face_id: torch.Tensor | None = None,
-        boundary_uv: torch.Tensor | None = None,
-        boundary_face_id: torch.Tensor | None = None,
-        gap_thr_raw: torch.Tensor | None = None,
-        big_thr_raw: torch.Tensor | None = None,
-        alpha_raw: torch.Tensor | None = None,
-        eta_raw: torch.Tensor | None = None,
-    ) -> dict[str, torch.Tensor]:
+        points_uv,
+        Xu,
+        Xv,
+        tau,
+        seeds_raw,
+        w_raw,
+        h_raw=None,
+        theta=None,
+        a_raw=None,
+        points_face_id=None,
+        boundary_uv=None,
+        boundary_face_id=None,
+        gap_thr_raw=None,
+        big_thr_raw=None,
+        alpha_raw=None,
+        eta_raw=None,
+        seed_gates=None,
+    ):
         return self.evaluate_at_uv(
             points_uv=points_uv,
             Xu=Xu,
@@ -682,4 +694,5 @@ class VoronoiDecoder(nn.Module):
             big_thr_raw=big_thr_raw,
             alpha_raw=alpha_raw,
             eta_raw=eta_raw,
+            seed_gates=seed_gates,
         )

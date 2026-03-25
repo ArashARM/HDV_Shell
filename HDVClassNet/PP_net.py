@@ -66,6 +66,8 @@ class PPNet(nn.Module):
 
         if self.use_gating:
             self.gate_head = nn.Linear(hidden, 1)
+            nn.init.zeros_(self.gate_head.weight)
+            nn.init.constant_(self.gate_head.bias, 2.0)
 
         if self.use_anisotropy:
             self.theta_head = nn.Linear(hidden, 1)

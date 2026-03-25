@@ -58,6 +58,12 @@ class TrainingConfig:
     patience: int = 300
     min_delta: float = 1e-4
 
+    use_gating: bool = True
+    lr_gate_head: float = 2e-4
+    gate_active_threshold: float = 0.5
+    gate_eps: float = 1e-8
+    gate_bias_init: float = 2.0
+
     eps: float = 1e-12
 
     use_boundary_weighted_volume: bool = True
@@ -284,6 +290,13 @@ class NN_Trainer:
             1.0 if row["optimizer_step_skipped"] else 0.0,
             step,
         )
+
+        self._tb_add_scalar("gate/active_count_total", row["active_count_total"], step)
+        self._tb_add_scalar("gate/active_count_mean", row["active_count_mean"], step)
+        self._tb_add_scalar("gate/active_frac_mean", row["active_frac_mean"], step)
+        self._tb_add_scalar("gate/min", row["gate_min"], step)
+        self._tb_add_scalar("gate/mean", row["gate_mean"], step)
+        self._tb_add_scalar("gate/max", row["gate_max"], step)
 
         fiber_norm = torch.linalg.norm(fiber_surface, dim=1)
         if fiber_norm.numel() > 0:
@@ -719,7 +732,7 @@ class NN_Trainer:
             n_seeds=seed_number,
             use_anisotropy=use_anisotropy,
             predict_height=(self.cfg.fixed_height is None),
-            use_gating=False,
+            use_gating=self.cfg.use_gating,
             freeze_w=freeze_w,
         ).to(device)
 
@@ -760,6 +773,8 @@ class NN_Trainer:
 
             if (self.cfg.fixed_height is None) and hasattr(ppnet, "h_head"):
                 param_groups.append({"params": ppnet.h_head.parameters(), "lr": cfg.lr_h_head})
+            if hasattr(ppnet, "gate_head"):
+                param_groups.append({"params": ppnet.gate_head.parameters(), "lr": cfg.lr_gate_head})
 
             if cfg.use_anisotropy:
                 if hasattr(ppnet, "theta_head"):
@@ -1028,6 +1043,7 @@ class NN_Trainer:
             big_thr_raw=pred.get("big_thr_raw", None),
             alpha_raw=pred.get("alpha_raw", None),
             eta_raw=pred.get("eta_raw", None),
+            seed_gates = pred.get("gate_probs", None),
         )
 
         return {
@@ -1093,16 +1109,151 @@ class NN_Trainer:
             mesh = pv.PolyData(xyz, np.array(faces).reshape(-1))
             plotter.add_mesh(mesh, color="lightblue", opacity=1.0)
 
-        seed_xyz = self._seed_points_xyz_all_faces(seeds_list, self.current_face_tensors)
-        if seed_xyz is not None and len(seed_xyz) > 0:
-            seed_cloud = pv.PolyData(seed_xyz)
-            plotter.add_mesh(seed_cloud, color="red", render_points_as_spheres=True, point_size=12)
+        seed_vis = self._seed_points_xyz_and_gates_all_faces(
+            seeds_list=seeds_list,
+            pred_list=pred_list,
+            face_tensors=self.current_face_tensors,
+        )
+
+        if seed_vis["xyz_active"] is not None and len(seed_vis["xyz_active"]) > 0:
+            seed_cloud_active = pv.PolyData(seed_vis["xyz_active"])
+            plotter.add_mesh(
+                seed_cloud_active,
+                color="red",
+                render_points_as_spheres=True,
+                point_size=12,
+            )
+
+        if seed_vis["xyz_inactive"] is not None and len(seed_vis["xyz_inactive"]) > 0:
+            seed_cloud_inactive = pv.PolyData(seed_vis["xyz_inactive"])
+            plotter.add_mesh(
+                seed_cloud_inactive,
+                color="gray",
+                render_points_as_spheres=True,
+                point_size=10,
+                opacity=0.45,
+            )
 
         plotter.view_isometric()
         plotter.show_axes()
         img = plotter.screenshot(return_img=True)
         plotter.close()
         return img
+    def _gate_activity_stats(
+    self,
+    gate_probs: torch.Tensor | None,
+    threshold: float,
+) -> dict[str, float]:
+        if gate_probs is None:
+            return {
+                "active_count": 0.0,
+                "active_frac": 0.0,
+                "gate_min": 0.0,
+                "gate_mean": 0.0,
+                "gate_max": 0.0,
+            }
+
+        g = gate_probs.detach()
+        active = (g > threshold)
+
+        return {
+            "active_count": float(active.sum().item()),
+            "active_frac": float(active.float().mean().item()),
+            "gate_min": float(g.min().item()),
+            "gate_mean": float(g.mean().item()),
+            "gate_max": float(g.max().item()),
+        }
+    
+    def _seed_points_xyz_and_gates_all_faces(self, seeds_list, pred_list, face_tensors):
+        xyz_active = []
+        xyz_inactive = []
+        gate_active = []
+        gate_inactive = []
+
+        thr = self.cfg.gate_active_threshold
+
+        for seeds, pred, ft in zip(seeds_list, pred_list, face_tensors):
+            xyz_i = self.generator.seeds_uv_to_xyz_nearest(
+                seeds,
+                ft["uv"],
+                ft["points_xyz"],
+            )
+
+            gates_i = pred.get("gate_probs", None)
+
+            if gates_i is None:
+                xyz_active.append(xyz_i)
+                continue
+
+            g = gates_i.detach().cpu()
+            active_mask = (g > thr).cpu().numpy()
+
+            xyz_i_active = xyz_i[active_mask]
+            xyz_i_inactive = xyz_i[~active_mask]
+
+            if len(xyz_i_active) > 0:
+                xyz_active.append(xyz_i_active)
+                gate_active.append(g[active_mask].numpy())
+
+            if len(xyz_i_inactive) > 0:
+                xyz_inactive.append(xyz_i_inactive)
+                gate_inactive.append(g[~active_mask].numpy())
+
+        import numpy as np
+
+        xyz_active = np.concatenate(xyz_active, axis=0) if len(xyz_active) > 0 else None
+        xyz_inactive = np.concatenate(xyz_inactive, axis=0) if len(xyz_inactive) > 0 else None
+        gate_active = np.concatenate(gate_active, axis=0) if len(gate_active) > 0 else None
+        gate_inactive = np.concatenate(gate_inactive, axis=0) if len(gate_inactive) > 0 else None
+
+        return {
+            "xyz_active": xyz_active,
+            "xyz_inactive": xyz_inactive,
+            "gate_active": gate_active,
+            "gate_inactive": gate_inactive,
+        }
+    
+    def visualize_best_seed_activity(self, result, points_xyz=None, faces_ijk=None):
+        best_seeds = result["best_seeds"]
+        best_pred = result["best_pred"]
+        face_tensors = result["face_tensors"]
+
+        seed_vis = self._seed_points_xyz_and_gates_all_faces(
+            seeds_list=best_seeds,
+            pred_list=best_pred,
+            face_tensors=face_tensors,
+        )
+
+        plotter = pv.Plotter()
+
+        if points_xyz is not None and faces_ijk is not None:
+            pv_faces_fixed = self.generator.faces_ijk_to_pv_faces(faces_ijk)
+            mesh = pv.PolyData(points_xyz.detach().cpu().numpy(), pv_faces_fixed)
+            plotter.add_mesh(mesh, color="white", opacity=0.25, show_edges=False)
+
+        if seed_vis["xyz_active"] is not None and len(seed_vis["xyz_active"]) > 0:
+            active_cloud = pv.PolyData(seed_vis["xyz_active"])
+            plotter.add_mesh(
+                active_cloud,
+                color="red",
+                render_points_as_spheres=True,
+                point_size=14,
+                label="Active seeds",
+            )
+
+        if seed_vis["xyz_inactive"] is not None and len(seed_vis["xyz_inactive"]) > 0:
+            inactive_cloud = pv.PolyData(seed_vis["xyz_inactive"])
+            plotter.add_mesh(
+                inactive_cloud,
+                color="gray",
+                render_points_as_spheres=True,
+                point_size=10,
+                opacity=0.4,
+                label="Vanished seeds",
+            )
+
+        plotter.add_legend()
+        plotter.show()
     
     def train(self, shape_path,face_tensors):
         cfg = self.cfg
@@ -1216,6 +1367,12 @@ class NN_Trainer:
             strut_void_terms = []
             w_geo_terms = []
             face_weights_this_step = []
+            active_count_total = 0.0
+            active_frac_sum = 0.0
+            gate_min_list = []
+            gate_mean_sum = 0.0
+            gate_max_list = []
+            gate_face_count = 0
 
             for ft, decoder, ppnet, uv_init_i, context_i, A_local, face_weight_i in zip(
                 face_tensors,
@@ -1243,7 +1400,17 @@ class NN_Trainer:
                     dtype=torch.long,
                     device=device,
                 )
-
+                if gates_i is not None:
+                    gate_stats_i = self._gate_activity_stats(
+                        gate_probs=gates_i,
+                        threshold=self.cfg.gate_active_threshold,
+                    )
+                    active_count_total += gate_stats_i["active_count"]
+                    active_frac_sum += gate_stats_i["active_frac"]
+                    gate_min_list.append(gate_stats_i["gate_min"])
+                    gate_mean_sum += gate_stats_i["gate_mean"]
+                    gate_max_list.append(gate_stats_i["gate_max"])
+                    gate_face_count += 1
                 boundary_uv_i = None
                 boundary_face_id_i = None
 
@@ -1269,6 +1436,7 @@ class NN_Trainer:
                     points_face_id=local_face_id,
                     boundary_uv=boundary_uv_i,
                     boundary_face_id=boundary_face_id_i,
+                    seed_gates = gates_i,
                 )
 
                 self._require_decoder_keys(
@@ -1330,7 +1498,7 @@ class NN_Trainer:
                     "seeds_raw": seeds_raw_i,
                     "w_raw": w_raw_i,
                     "h_raw": None if h_raw_i is None else h_raw_i,
-                    "gates": None if gates_i is None else gates_i,
+                    "gate_probs": None if gates_i is None else gates_i.detach().clone(),
                     "theta": None if theta_i is None else theta_i.detach().clone(),
                     "a_raw": None if a_raw_i is None else a_raw_i.detach().clone(),
                     "w_geo": w_geo_i.detach().clone(),
@@ -1369,6 +1537,18 @@ class NN_Trainer:
                     strut_edge_terms.append(loss_strut_edge_i)
                     strut_void_terms.append(loss_strut_void_i)
 
+            if gate_face_count > 0:
+                active_count_mean = active_count_total / gate_face_count
+                active_frac_mean = active_frac_sum / gate_face_count
+                gate_min_global = min(gate_min_list)
+                gate_mean_global = gate_mean_sum / gate_face_count
+                gate_max_global = max(gate_max_list)
+            else:
+                active_count_mean = 0.0
+                active_frac_mean = 0.0
+                gate_min_global = 0.0
+                gate_mean_global = 0.0
+                gate_max_global = 0.0
             rho = rho_acc / rho_wgt.clamp_min(cfg.eps)
             rho_boundary = rho_b_acc / rho_b_wgt.clamp_min(cfg.eps)
             rho_v_all = rho_v_acc / rho_v_wgt.clamp_min(cfg.eps)
@@ -1530,7 +1710,7 @@ class NN_Trainer:
                             "seeds_raw": p["seeds_raw"].detach().clone(),
                             "w_raw": p["w_raw"].detach().clone(),
                             "h_raw": None if p["h_raw"] is None else p["h_raw"].detach().clone(),
-                            "gates": None if p["gates"] is None else p["gates"].detach().clone(),
+                            "gate_probs": None if p["gate_probs"] is None else p["gate_probs"].detach().clone(),
                             "theta": None if p["theta"] is None else p["theta"].detach().clone(),
                             "a_raw": None if p["a_raw"] is None else p["a_raw"].detach().clone(),
                             "w_geo": p["w_geo"].detach().clone(),
@@ -1549,9 +1729,6 @@ class NN_Trainer:
                     steps_since_improve = 0
                 elif best_candidate_is_valid:
                     steps_since_improve += 1
-
-
-
                 if rho0 is None:
                     rho0 = rho.detach().clone()
                 if seeds0 is None:
@@ -1604,6 +1781,13 @@ class NN_Trainer:
                     "fem_failure_reason": fem_failure_reason,
                     "optimizer_step_skipped": not total_is_finite,
                     "w_geo_mean": self._finite_or_default(w_geo_mean),
+
+                    "active_count_total": active_count_total,
+                    "active_count_mean": active_count_mean,
+                    "active_frac_mean": active_frac_mean,
+                    "gate_min": gate_min_global,
+                    "gate_mean": gate_mean_global,
+                    "gate_max": gate_max_global,
                 }
                 history.append(row)
 
@@ -1653,7 +1837,9 @@ class NN_Trainer:
                 if step % cfg.log_every == 0 or step == cfg.num_steps - 1:
                     fem_status = "OK" if fem_is_valid else f"BAD({fem_failure_reason})"
                     print(
-                        f"[{step:05d}] "
+                        f"[{step:05d}] |"
+                        f"| active(total/mean)={active_count_total:.0f}/{active_count_mean:.2f} "
+                        f"| gate(min/mean/max)={gate_min_global:.3f}/{gate_mean_global:.3f}/{gate_max_global:.3f} | "
                         f"L_total={row['L_total']:.4e} | "
                         f"L_vol={row['loss_vol']:.3e} "
                         f"L_fem={row['loss_fem']:.3e} "
@@ -1692,7 +1878,7 @@ class NN_Trainer:
                         "seeds_raw": p["seeds_raw"].detach().clone(),
                         "w_raw": p["w_raw"].detach().clone(),
                         "h_raw": None if p["h_raw"] is None else p["h_raw"].detach().clone(),
-                        "gates": None if p["gates"] is None else p["gates"].detach().clone(),
+                        "gate_probs": None if p["gate_probs"] is None else p["gate_probs"].detach().clone(),
                         "w_geo": p["w_geo"].detach().clone(),
                     }
                     for p in pred_list
@@ -1929,6 +2115,7 @@ class NN_Trainer:
         big_thr_raw = pred.get("big_thr_raw", None)
         alpha_raw = pred.get("alpha_raw", None)
         eta_raw = pred.get("eta_raw", None)
+        gates_i = pred.get("gate_probs", None)
 
         # ------------------------------------------------------------
         # 6) Evaluate decoder on CAD-native dense query points
@@ -1950,6 +2137,7 @@ class NN_Trainer:
             big_thr_raw=big_thr_raw,
             alpha_raw=alpha_raw,
             eta_raw=eta_raw,
+            seed_gates =gates_i, 
         )
 
         self._require_decoder_keys(
