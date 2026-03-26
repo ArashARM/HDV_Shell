@@ -899,6 +899,7 @@ class CADTensorGenerator:
     def precompute_face_areas(points_xyz: torch.Tensor, faces_ijk: torch.Tensor) -> torch.Tensor:
         i, j, k = faces_ijk[:, 0], faces_ijk[:, 1], faces_ijk[:, 2]
         pi, pj, pk = points_xyz[i], points_xyz[j], points_xyz[k]
+        # magnitude of cross product of vectors returns the area of parallelogram made by that vectors
         areas = 0.5 * torch.linalg.norm(torch.cross(pj - pi, pk - pi, dim=1), dim=1)
         return areas
 
@@ -1415,6 +1416,7 @@ class CADTensorGenerator:
         tb = (t - 0.7) / 0.3
         return beta0 * (beta1 / beta0) ** tb
     @staticmethod
+    # 
     def vertex_area_lumped(N, faces_ijk, face_areas):
         """Lumped vertex area weights A_v (N,). Each triangle area distributed equally to its 3 vertices."""
         A_v = torch.zeros((N,), device=faces_ijk.device, dtype=face_areas.dtype)

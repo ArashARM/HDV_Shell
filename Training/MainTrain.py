@@ -83,7 +83,7 @@ class TrainingConfig:
     boundary_vol_weight: float = 0.20
 
     Offset_scale: float = 1.00
-    scheduler_milestones: tuple[int, ...] = (80, 160)
+    scheduler_milestones: tuple[float, ...] = (80, 160)
     scheduler_gamma: float = 0.5
 
     save_fem_debug_history: bool = True
@@ -486,6 +486,8 @@ class NN_Trainer:
 
         loss = lam_edge * loss_edge + lam_void * loss_void
         return loss, loss_edge, loss_void
+    
+
 
     @staticmethod
     def _scalar_tensor_is_finite(x: torch.Tensor) -> bool:
@@ -1733,23 +1735,33 @@ class NN_Trainer:
 
 
         plotter.show()
+
+
+
     def train(self, shape_path, face_tensors):
         cfg = self.cfg
+
+        # validate the input shape tensors before training
         self._validate_face_tensors(face_tensors)
 
+        # Assiging device and data type used during training process
         ref_uv = face_tensors[0]["uv"]
         device = ref_uv.device
         dtype = ref_uv.dtype
         mid_step = cfg.num_steps // 2
 
+        # Total number of points used for training
         all_global_idx = torch.cat([ft["global_vertex_idx"] for ft in face_tensors], dim=0)
         vertices_number = int(all_global_idx.max().item()) + 1
 
         # ------------------------------------------------------------
         # Build global vertex areas
         # ------------------------------------------------------------
+        # A 1D zeroes tensor (vector) with vertices_number 
         A_v = torch.zeros((vertices_number,), dtype=dtype, device=device)
+        # per-face vertex areas
         local_vertex_areas = []
+        # per-face total area
         local_face_weights = []
 
         for ft in face_tensors:
@@ -1767,7 +1779,10 @@ class NN_Trainer:
         # ------------------------------------------------------------
         # Build models / optimizer / scheduler
         # ------------------------------------------------------------
+        # Build seperate decoder and NN for each face and store it
         decoders, ppnets = self._build_face_models(face_tensors=face_tensors, device=device)
+
+        #randomize seed points on each face uniformly sampled
         uv_init_list = self._init_face_seeds(face_tensors)
 
         contexts = [
@@ -1775,13 +1790,21 @@ class NN_Trainer:
             for _ in face_tensors
         ]
 
+        # intializing the optimizer and set parameters to be trained - learining rate scheduling 
         opt = self._build_optimizer(ppnets)
-
+        raw_milestones = getattr(cfg, "scheduler_milestones", None)
+        if raw_milestones is None:
+            milestones = []
+        elif isinstance(raw_milestones, (int, float)):
+            milestones = [int(raw_milestones * cfg.num_steps)]
+        else:
+            milestones = [int(p * cfg.num_steps) for p in raw_milestones]
+        print(f"scheduler_milestones: {milestones}")
         scheduler = None
         if getattr(cfg, "scheduler_milestones", None):
             scheduler = torch.optim.lr_scheduler.MultiStepLR(
                 opt,
-                milestones=list(cfg.scheduler_milestones),
+                milestones=list(milestones),
                 gamma=cfg.scheduler_gamma,
             )
 
@@ -1808,6 +1831,7 @@ class NN_Trainer:
         # ------------------------------------------------------------
         # Loss normalizers
         # ------------------------------------------------------------
+        # Tracking average speed instead of instant speed
         norm_vol = RunningNorm()
         norm_rep = RunningNorm()
         norm_bnd = RunningNorm()
@@ -2183,16 +2207,20 @@ class NN_Trainer:
                 # ----------------------------------------------------
                 # Backprop
                 # ----------------------------------------------------
+                # Reset gradients and put to none instead of zero (save memory and time)
                 opt.zero_grad(set_to_none=True)
 
                 if total_is_finite:
+                    #Computes gradients
                     L_total.backward()
 
                     grad_clip_norm = getattr(cfg, "grad_clip_norm", None)
                     if grad_clip_norm is not None and grad_clip_norm > 0:
                         params = []
+                        #Collects all trainable parameters across all faces
                         for ppnet in ppnets:
                             params.extend([p for p in ppnet.parameters() if p.requires_grad])
+                        #If gradients are too large → scales them down
                         if params:
                             torch.nn.utils.clip_grad_norm_(params, max_norm=grad_clip_norm)
 
