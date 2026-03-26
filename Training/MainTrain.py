@@ -6,6 +6,9 @@ from datetime import datetime
 import torch
 from torch.utils.tensorboard import SummaryWriter
 from Utils.TimelapseRecorder import TimelapseRecorder
+from tqdm.auto import tqdm
+import numpy as np
+from scipy.interpolate import griddata
 
 import pyvista as pv
 try:
@@ -23,6 +26,9 @@ class TrainingConfig:
     seed_repulsion_sigma: float = 0.08
     boundary_margin: float = 0.05
     freeze_w: bool = False
+
+    gate_sharpen_gamma: float = 4.0
+
 
     w_min: float = 0.005
     w_max: float = 0.5
@@ -59,10 +65,17 @@ class TrainingConfig:
     min_delta: float = 1e-4
 
     use_gating: bool = True
-    lr_gate_head: float = 2e-4
+    lr_gate_head: float = 5e-5
     gate_active_threshold: float = 0.5
     gate_eps: float = 1e-8
     gate_bias_init: float = 2.0
+
+    lam_gate_count: float = 2.0
+    gate_target_count: float = 10.0
+    lam_gate_binary: float = 0.2
+    gate_binary_warmup_steps: int = 40
+    gate_warmup_steps: int = 20
+    
 
     eps: float = 1e-12
 
@@ -297,6 +310,10 @@ class NN_Trainer:
         self._tb_add_scalar("gate/min", row["gate_min"], step)
         self._tb_add_scalar("gate/mean", row["gate_mean"], step)
         self._tb_add_scalar("gate/max", row["gate_max"], step)
+        self._tb_add_scalar("Loss/Gate", row["loss_gate"], step)
+        self._tb_add_scalar("gate/lam_eff", row["lam_gate_eff"], step)
+        self._tb_add_scalar("Loss/GateBinary", row["loss_gate_binary"], step)
+        self._tb_add_scalar("gate/lam_binary_eff", row["lam_gate_binary_eff"], step)
 
         fiber_norm = torch.linalg.norm(fiber_surface, dim=1)
         if fiber_norm.numel() > 0:
@@ -365,6 +382,28 @@ class NN_Trainer:
         vol_loss = (vol_frac - target_volfrac) ** 2
         return vol_loss
 
+    @staticmethod
+    def gate_target_loss(
+        gates: torch.Tensor | None,
+        target_mean: float,
+    ):
+        if gates is None:
+            return None
+        target = torch.as_tensor(target_mean, device=gates.device, dtype=gates.dtype)
+        return (gates.mean() - target) ** 2
+    
+    @staticmethod
+    def gate_count_loss(gates: torch.Tensor | None, target_count: float):
+        if gates is None:
+            return None
+        target = torch.as_tensor(target_count, device=gates.device, dtype=gates.dtype)
+        return (gates.sum() - target) ** 2
+    @staticmethod
+    def gate_binary_loss(gates: torch.Tensor | None):
+        if gates is None:
+            return None
+        one = torch.ones((), device=gates.device, dtype=gates.dtype)
+        return (gates * (one - gates)).mean()
     @staticmethod
     def volume_loss_with_boundary_discount(
         rho: torch.Tensor,
@@ -907,8 +946,7 @@ class NN_Trainer:
         w = torch.stack(weights).to(dtype=v.dtype, device=v.device)
         return (v * w).sum() / w.sum().clamp_min(eps)
     def _make_density_image(self, face_tensors, rho_global, res=256):
-        import numpy as np
-        from scipy.interpolate import griddata
+
 
         uv_all = []
         rho_all = []
@@ -940,7 +978,6 @@ class NN_Trainer:
         density_img = np.nan_to_num(density_img, nan=0.0, posinf=1.0, neginf=0.0)
         density_img = np.clip(density_img, 0.0, 1.0)
         return density_img
-
     def build_timelapse_render_cache(
         self,
         face_tensors,
@@ -1024,7 +1061,6 @@ class NN_Trainer:
             })
 
         return cache
-    
     def evaluate_cached_face_fields(self, render_cache, decoder, pred):
         decoder_out = decoder.evaluate_at_uv(
             points_uv=render_cache["uv_dense"],
@@ -1060,8 +1096,7 @@ class NN_Trainer:
         render_cache,
         thr=0.5,
     ):
-        import pyvista as pv
-        import numpy as np
+
 
         plotter = pv.Plotter(off_screen=True, window_size=(900, 700))
         plotter.set_background("white")
@@ -1163,7 +1198,6 @@ class NN_Trainer:
             "gate_mean": float(g.mean().item()),
             "gate_max": float(g.max().item()),
         }
-    
     def _seed_points_xyz_and_gates_all_faces(self, seeds_list, pred_list, face_tensors):
         xyz_active = []
         xyz_inactive = []
@@ -1213,6 +1247,14 @@ class NN_Trainer:
             "gate_inactive": gate_inactive,
         }
     
+    @staticmethod
+    def sharpen_gate_probs(gates: torch.Tensor | None, gamma: float, eps: float = 1e-8):
+        if gates is None:
+            return None
+        g = gates.clamp(eps, 1.0 - eps)
+        a = g.pow(gamma)
+        b = (1.0 - g).pow(gamma)
+        return a / (a + b + eps)
     def visualize_best_seed_activity(self, result, points_xyz=None, faces_ijk=None):
         best_seeds = result["best_seeds"]
         best_pred = result["best_pred"]
@@ -1255,691 +1297,6 @@ class NN_Trainer:
         plotter.add_legend()
         plotter.show()
     
-    def train(self, shape_path,face_tensors):
-        cfg = self.cfg
-        self._validate_face_tensors(face_tensors)
-
-        ref_uv = face_tensors[0]["uv"]
-        device = ref_uv.device
-        dtype = ref_uv.dtype
-        mid_step = cfg.num_steps // 2
-
-        all_global_idx = torch.cat([ft["global_vertex_idx"] for ft in face_tensors], dim=0)
-        vertices_number = int(all_global_idx.max().item()) + 1
-
-        A_v = torch.zeros((vertices_number,), dtype=dtype, device=device)
-        local_vertex_areas = []
-        local_face_weights = []
-
-        for ft in face_tensors:
-            gidx = ft["global_vertex_idx"]
-            A_local = self.generator.vertex_area_lumped(
-                ft["uv"].shape[0],
-                ft["faces_ijk"],
-                ft["face_areas"],
-            ).to(device=device, dtype=dtype)
-
-            local_vertex_areas.append(A_local)
-            local_face_weights.append(A_local.sum().clamp_min(cfg.eps))
-            A_v[gidx] += A_local
-
-        decoders, ppnets = self._build_face_models(face_tensors=face_tensors, device=device)
-        uv_init_list = self._init_face_seeds(face_tensors)
-
-        contexts = [
-            torch.zeros(1, cfg.context_vector_size, device=device, dtype=dtype)
-            for _ in face_tensors
-        ]
-
-        opt = self._build_optimizer(ppnets)
-
-        if cfg.MakeTimelaps:
-            Case_name = shape_path.stem
-            recorder = TimelapseRecorder(out_dir="timelapse_frames", video_path=Case_name + "_timelapse.mp4",fps=8)
-
-        scheduler = None
-        if getattr(cfg, "scheduler_milestones", None):
-            scheduler = torch.optim.lr_scheduler.MultiStepLR(
-                opt,
-                milestones=list(cfg.scheduler_milestones),
-                gamma=cfg.scheduler_gamma,
-            )
-
-        norm_vol = RunningNorm()
-        norm_rep = RunningNorm()
-        norm_bnd = RunningNorm()
-        norm_strut = RunningNorm()
-        norm_fem = RunningNorm()
-
-        best_score = float("inf")
-        best_vol_frac = None
-        best_comp = None
-        best_w_geo = None
-        best_step = -1
-        best_rho = None
-        best_seeds = None
-        best_pred = None
-        steps_since_improve = 0
-
-        initial_shape_density = None
-        mid_shape_density = None
-        final_shape_density = None
-
-        seed_points_init = None
-        seed_points_mid = None
-        seed_points_final = None
-
-        rho0 = None
-        seeds0 = None
-        history = []
-
-        self.current_face_tensors = face_tensors
-
-        if cfg.MakeTimelaps:
-            render_cache = self.build_timelapse_render_cache(
-                face_tensors=face_tensors,
-                shape_or_path=str(shape_path),
-                grid_res_u=cfg.TM_laps_res_u,
-                grid_res_v=cfg.TM_laps_res_v,
-                uv_mask_tol=None,
-            )
-
-        for step in range(cfg.num_steps):
-            rho_acc = torch.zeros((vertices_number,), dtype=dtype, device=device)
-            rho_wgt = torch.zeros((vertices_number,), dtype=dtype, device=device)
-
-            rho_b_acc = torch.zeros((vertices_number,), dtype=dtype, device=device)
-            rho_b_wgt = torch.zeros((vertices_number,), dtype=dtype, device=device)
-
-            rho_v_acc = torch.zeros((vertices_number,), dtype=dtype, device=device)
-            rho_v_wgt = torch.zeros((vertices_number,), dtype=dtype, device=device)
-
-            fiber_acc = torch.zeros((vertices_number, 3), dtype=dtype, device=device)
-            fiber_wgt = torch.zeros((vertices_number,), dtype=dtype, device=device)
-
-            seeds_list = []
-            pred_list = []
-
-            rep_terms = []
-            bnd_terms = []
-            strut_terms = []
-            strut_edge_terms = []
-            strut_void_terms = []
-            w_geo_terms = []
-            face_weights_this_step = []
-            active_count_total = 0.0
-            active_frac_sum = 0.0
-            gate_min_list = []
-            gate_mean_sum = 0.0
-            gate_max_list = []
-            gate_face_count = 0
-
-            for ft, decoder, ppnet, uv_init_i, context_i, A_local, face_weight_i in zip(
-                face_tensors,
-                decoders,
-                ppnets,
-                uv_init_list,
-                contexts,
-                local_vertex_areas,
-                local_face_weights,
-            ):
-                pred_i = ppnet(context_i, uv_init_i, offset_scale=cfg.Offset_scale)
-
-                seeds_raw_i = pred_i["seeds_raw"][0]
-                w_raw_i = pred_i["w_raw"][0]
-                h_raw_i = None if cfg.fixed_height is not None else pred_i["h_raw"][0]
-
-                gates_i = pred_i.get("gate_probs", None)
-                gates_i = gates_i[0] if gates_i is not None else None
-
-                theta_i = pred_i["theta"][0] if (cfg.use_anisotropy and "theta" in pred_i) else None
-                a_raw_i = pred_i["a_raw"][0] if (cfg.use_anisotropy and "a_raw" in pred_i) else None
-
-                local_face_id = torch.zeros(
-                    ft["uv"].shape[0],
-                    dtype=torch.long,
-                    device=device,
-                )
-                if gates_i is not None:
-                    gate_stats_i = self._gate_activity_stats(
-                        gate_probs=gates_i,
-                        threshold=self.cfg.gate_active_threshold,
-                    )
-                    active_count_total += gate_stats_i["active_count"]
-                    active_frac_sum += gate_stats_i["active_frac"]
-                    gate_min_list.append(gate_stats_i["gate_min"])
-                    gate_mean_sum += gate_stats_i["gate_mean"]
-                    gate_max_list.append(gate_stats_i["gate_max"])
-                    gate_face_count += 1
-                boundary_uv_i = None
-                boundary_face_id_i = None
-
-                true_bidx_i = self._true_open_boundary_idx(ft)
-                if true_bidx_i.numel() > 0:
-                    boundary_uv_i = ft["uv"][true_bidx_i]
-                    boundary_face_id_i = torch.zeros(
-                        boundary_uv_i.shape[0],
-                        dtype=torch.long,
-                        device=device,
-                    )
-
-                decoder_out = decoder(
-                    points_uv=ft["uv"],
-                    Xu=ft["Xu"],
-                    Xv=ft["Xv"],
-                    tau=cfg.tau,
-                    seeds_raw=seeds_raw_i,
-                    w_raw=w_raw_i,
-                    h_raw=h_raw_i,
-                    theta=theta_i,
-                    a_raw=a_raw_i,
-                    points_face_id=local_face_id,
-                    boundary_uv=boundary_uv_i,
-                    boundary_face_id=boundary_face_id_i,
-                    seed_gates = gates_i,
-                )
-
-                self._require_decoder_keys(
-                    decoder_out,
-                    [
-                        "seeds",
-                        "rho",
-                        "fiber3d",
-                        "w_geo",
-                        "rho_v",
-                        "rho_b",
-                        "edge_field",
-                    ],
-                )
-
-                seeds_i = decoder_out["seeds"]
-                rho_i = decoder_out["rho"]
-                w_geo_i = decoder_out["w_geo"]
-                fiber3d_i = decoder_out["fiber3d"]
-                rho_v_i = decoder_out["rho_v"]
-                rho_b_i = decoder_out["rho_b"]
-                edge_field_i = decoder_out["edge_field"]
-
-                face_valid = True
-                for name, t in {
-                    "seeds_i": seeds_i,
-                    "rho_i": rho_i,
-                    "fiber3d_i": fiber3d_i,
-                    "rho_v_i": rho_v_i,
-                    "rho_b_i": rho_b_i,
-                    "edge_field_i": edge_field_i,
-                }.items():
-                    if not torch.isfinite(t).all():
-                        print(f"[step {step}] face {ft['face_id']} invalid tensor: {name}")
-                        face_valid = False
-                        break
-
-                if not face_valid:
-                    raise RuntimeError(f"Invalid decoder output on face {ft['face_id']} at step {step}")
-
-                gidx = ft["global_vertex_idx"]
-                w_local = A_local.clamp_min(cfg.eps)
-
-                rho_acc[gidx] += rho_i * w_local
-                rho_wgt[gidx] += w_local
-
-                rho_b_acc[gidx] += rho_b_i * w_local
-                rho_b_wgt[gidx] += w_local
-
-                rho_v_acc[gidx] += rho_v_i * w_local
-                rho_v_wgt[gidx] += w_local
-
-                fiber_acc[gidx] += fiber3d_i * w_local[:, None]
-                fiber_wgt[gidx] += w_local
-
-                seeds_list.append(seeds_i)
-                pred_list.append({
-                    "face_id": ft["face_id"],
-                    "seeds_raw": seeds_raw_i,
-                    "w_raw": w_raw_i,
-                    "h_raw": None if h_raw_i is None else h_raw_i,
-                    "gate_probs": None if gates_i is None else gates_i.detach().clone(),
-                    "theta": None if theta_i is None else theta_i.detach().clone(),
-                    "a_raw": None if a_raw_i is None else a_raw_i.detach().clone(),
-                    "w_geo": w_geo_i.detach().clone(),
-                })
-
-                rep_terms.append(
-                    self.seed_repulsion_term(
-                        seeds=seeds_i,
-                        gates=gates_i,
-                        sigma=cfg.seed_repulsion_sigma,
-                        eps=cfg.eps,
-                    )
-                )
-                bnd_terms.append(
-                    self.boundary_repulsion_term(
-                        seeds=seeds_i,
-                        boundary_uv=boundary_uv_i,
-                        gates=gates_i,
-                        margin=cfg.boundary_margin,
-                        eps=cfg.eps,
-                    )
-                )
-
-                w_geo_terms.append(w_geo_i.reshape(()))
-                face_weights_this_step.append(face_weight_i.reshape(()))
-
-                if cfg.lam_strut != 0.0:
-                    loss_strut_i, loss_strut_edge_i, loss_strut_void_i = self.strutness_loss_from_edge_field(
-                        rho=rho_v_i,
-                        edge_field=edge_field_i,
-                        lam_edge=cfg.lam_strut_edge,
-                        lam_void=cfg.lam_strut_void,
-                        eps=cfg.eps,
-                    )
-                    strut_terms.append(loss_strut_i)
-                    strut_edge_terms.append(loss_strut_edge_i)
-                    strut_void_terms.append(loss_strut_void_i)
-
-            if gate_face_count > 0:
-                active_count_mean = active_count_total / gate_face_count
-                active_frac_mean = active_frac_sum / gate_face_count
-                gate_min_global = min(gate_min_list)
-                gate_mean_global = gate_mean_sum / gate_face_count
-                gate_max_global = max(gate_max_list)
-            else:
-                active_count_mean = 0.0
-                active_frac_mean = 0.0
-                gate_min_global = 0.0
-                gate_mean_global = 0.0
-                gate_max_global = 0.0
-            rho = rho_acc / rho_wgt.clamp_min(cfg.eps)
-            rho_boundary = rho_b_acc / rho_b_wgt.clamp_min(cfg.eps)
-            rho_v_all = rho_v_acc / rho_v_wgt.clamp_min(cfg.eps)
-
-            fiber_surface = fiber_acc / fiber_wgt.clamp_min(cfg.eps)[:, None]
-            fiber_norm = fiber_surface.norm(dim=1, keepdim=True).clamp_min(cfg.eps)
-            fiber_surface = fiber_surface / fiber_norm
-
-            loss_rep = self._safe_weighted_mean(
-                rep_terms, face_weights_this_step, dtype, device, cfg.eps
-            )
-            loss_bnd = self._safe_weighted_mean(
-                bnd_terms, face_weights_this_step, dtype, device, cfg.eps
-            )
-            loss_strut = self._safe_weighted_mean(
-                strut_terms, face_weights_this_step, dtype, device, cfg.eps
-            )
-            loss_strut_edge = self._safe_weighted_mean(
-                strut_edge_terms, face_weights_this_step, dtype, device, cfg.eps
-            )
-            loss_strut_void = self._safe_weighted_mean(
-                strut_void_terms, face_weights_this_step, dtype, device, cfg.eps
-            )
-            w_geo_mean = self._safe_weighted_mean(
-                w_geo_terms, face_weights_this_step, dtype, device, cfg.eps
-            )
-
-            if cfg.use_boundary_weighted_volume:
-                loss_vol, vol_frac_eff = self.volume_loss_with_boundary_discount(
-                    rho=rho,
-                    A_v=A_v,
-                    rho_boundary=rho_boundary,
-                    target_volfrac=cfg.target_volfrac,
-                    boundary_weight=cfg.boundary_vol_weight,
-                    eps=cfg.eps,
-                )
-            else:
-                loss_vol = self.volume_loss_constant_height(
-                    rho=rho,
-                    A_v=A_v,
-                    target_volfrac=cfg.target_volfrac,
-                    eps=cfg.eps,
-                )
-                vol_frac_eff = (rho * A_v).sum() / (A_v.sum() + cfg.eps)
-
-            fem_out = {
-                "fem_total": torch.zeros((), dtype=dtype, device=device),
-                "comp": torch.zeros((), dtype=dtype, device=device),
-                "compliance_loss": torch.zeros((), dtype=dtype, device=device),
-                "fem_valid": True,
-                "failure_reason": None,
-            }
-
-            if cfg.lam_fem != 0.0:
-                fem_out = self.fem_loss(
-                    rho_surface=rho,
-                    fiber_surface=fiber_surface,
-                    comp_normalize_by=cfg.comp_normalize_by,
-                    density_floor=cfg.fem_density_floor,
-                    eps=cfg.eps,
-                    save_debug_history=getattr(cfg, "save_fem_debug_history", True),
-                )
-
-            loss_fem = fem_out["fem_total"]
-            loss_comp = fem_out["compliance_loss"]
-            comp_val = fem_out["comp"]
-            fem_is_valid = bool(fem_out["fem_valid"])
-            fem_failure_reason = fem_out["failure_reason"]
-
-            if cfg.normalize_losses:
-                n_vol = norm_vol.update(loss_vol.detach().item())
-                n_rep = norm_rep.update(loss_rep.detach().item())
-                n_bnd = norm_bnd.update(loss_bnd.detach().item())
-                n_strut = norm_strut.update(loss_strut.detach().item()) if cfg.lam_strut != 0.0 else 1.0
-                n_fem = norm_fem.update(loss_fem.detach().item()) if (cfg.lam_fem != 0.0 and fem_is_valid) else 1.0
-            else:
-                n_vol = n_rep = n_bnd = n_strut = n_fem = 1.0
-
-            L_total = (
-                cfg.lam_vol * (loss_vol / n_vol)
-                + cfg.lam_rep * (loss_rep / n_rep)
-                + cfg.lam_bnd * (loss_bnd / n_bnd)
-            )
-
-            if cfg.lam_strut != 0.0:
-                L_total = L_total + cfg.lam_strut * (loss_strut / n_strut)
-
-            if cfg.lam_fem != 0.0:
-                if fem_is_valid:
-                    L_total = L_total + cfg.lam_fem * (loss_fem / n_fem)
-                elif not cfg.skip_bad_fem_steps:
-                    L_total = L_total + cfg.lam_fem * loss_fem
-
-            L_total = L_total / len(face_tensors)
-            total_is_finite = self._scalar_tensor_is_finite(L_total)
-
-            opt.zero_grad(set_to_none=True)
-            if total_is_finite:
-                L_total.backward()
-                grad_clip_norm = getattr(cfg, "grad_clip_norm", None)
-                if grad_clip_norm is not None and grad_clip_norm > 0:
-                    params = []
-                    for ppnet in ppnets:
-                        params.extend([p for p in ppnet.parameters() if p.requires_grad])
-                    if len(params):
-                        torch.nn.utils.clip_grad_norm_(params, max_norm=grad_clip_norm)
-
-                for fi, ppnet in enumerate(ppnets):
-                    for pn, p in ppnet.named_parameters():
-                        if p.grad is not None:
-                            if not torch.isfinite(p.grad).all():
-                                raise RuntimeError(
-                                    f"Non-finite gradient before opt.step(): face={fi}, param={pn}"
-                                )
-
-                opt.step()
-
-                for fi, ppnet in enumerate(ppnets):
-                    for pn, p in ppnet.named_parameters():
-                        if not torch.isfinite(p).all():
-                            raise RuntimeError(
-                                f"Non-finite parameter after opt.step(): face={fi}, param={pn}"
-                            )
-
-                if scheduler is not None:
-                    scheduler.step()
-            else:
-                print(f"[step {step}] L_total is non-finite, optimizer step skipped.")
-
-            with torch.no_grad():
-                vol_frac = (rho * A_v).sum() / (A_v.sum() + cfg.eps)
-                vol_dev = torch.abs(vol_frac - cfg.target_volfrac)
-                vol_dev_eff = torch.abs(vol_frac_eff - cfg.target_volfrac)
-
-                score = float(L_total.detach().item()) if total_is_finite else float("inf")
-                best_candidate_is_valid = (cfg.lam_fem == 0.0) or fem_is_valid
-
-                prev_best_step = best_step
-                improvement_gap = (step - prev_best_step) if prev_best_step >= 0 else None
-
-                if step == 0:
-                    initial_shape_density = rho.detach().clone()
-                    seed_points_init = self._seed_points_xyz_all_faces(seeds_list, face_tensors)
-
-                if step == mid_step:
-                    mid_shape_density = rho.detach().clone()
-                    seed_points_mid = self._seed_points_xyz_all_faces(seeds_list, face_tensors)
-                if best_candidate_is_valid and score < (best_score - cfg.min_delta):
-                    best_score = score
-                    best_step = step
-                    best_vol_frac = float(vol_frac_eff.detach().item())
-                    best_comp = float(comp_val.detach().item())
-                    best_w_geo = float(w_geo_mean.detach().item())
-                    best_rho = rho.detach().clone()
-                    best_seeds = [s.detach().clone() for s in seeds_list]
-                    best_pred = [
-                        {
-                            "face_id": p["face_id"],
-                            "seeds_raw": p["seeds_raw"].detach().clone(),
-                            "w_raw": p["w_raw"].detach().clone(),
-                            "h_raw": None if p["h_raw"] is None else p["h_raw"].detach().clone(),
-                            "gate_probs": None if p["gate_probs"] is None else p["gate_probs"].detach().clone(),
-                            "theta": None if p["theta"] is None else p["theta"].detach().clone(),
-                            "a_raw": None if p["a_raw"] is None else p["a_raw"].detach().clone(),
-                            "w_geo": p["w_geo"].detach().clone(),
-                        }
-                        for p in pred_list
-                    ]
-
-                    if improvement_gap is None or improvement_gap > 50:
-                        print(
-                            f"New best_step={best_step} | "
-                            f"best_score={best_score:.6f} | "
-                            f"vol_eff={best_vol_frac:.6f} | "
-                            f"comp={best_comp:.6e} | "
-                            f"w={best_w_geo:.6e}"
-                        )
-                    steps_since_improve = 0
-                elif best_candidate_is_valid:
-                    steps_since_improve += 1
-                if rho0 is None:
-                    rho0 = rho.detach().clone()
-                if seeds0 is None:
-                    seeds0 = [s.detach().clone() for s in seeds_list]
-
-                drho = float((rho - rho0).abs().mean().item())
-                dseed_terms = [float((s - s0).abs().mean().item()) for s, s0 in zip(seeds_list, seeds0)]
-                dseed = sum(dseed_terms) / max(len(dseed_terms), 1)
-
-                rho_min = float(rho.min().item())
-                rho_mean = float(rho.mean().item())
-                rho_max = float(rho.max().item())
-
-                g_mean = 0.0
-                g_count = 0
-                for ppnet in ppnets:
-                    for p in ppnet.parameters():
-                        if p.grad is not None:
-                            g_mean += float(p.grad.detach().abs().mean().item())
-                            g_count += 1
-                g_mean = g_mean / max(g_count, 1)
-
-                row = {
-                    "step": step,
-                    "L_total": self._finite_or_default(L_total),
-                    "loss_vol": self._finite_or_default(loss_vol),
-                    "loss_rep": self._finite_or_default(loss_rep),
-                    "loss_bnd": self._finite_or_default(loss_bnd),
-                    "loss_strut": self._finite_or_default(loss_strut),
-                    "loss_strut_edge": self._finite_or_default(loss_strut_edge),
-                    "loss_strut_void": self._finite_or_default(loss_strut_void),
-                    "loss_fem": self._finite_or_default(loss_fem),
-                    "loss_comp": self._finite_or_default(loss_comp),
-                    "comp": self._finite_or_default(comp_val),
-                    "vol_frac": float(vol_frac.detach().item()),
-                    "vol_frac_eff": float(vol_frac_eff.detach().item()),
-                    "vol_dev": float(vol_dev.detach().item()),
-                    "vol_dev_eff": float(vol_dev_eff.detach().item()),
-                    "rho_min": rho_min,
-                    "rho_mean": rho_mean,
-                    "rho_max": rho_max,
-                    "rho_boundary_mean": float(rho_boundary.mean().detach().item()),
-                    "rho_v_mean": float(rho_v_all.mean().detach().item()),
-                    "drho": drho,
-                    "dseed": dseed,
-                    "grad_mean": g_mean,
-                    "best_score": best_score,
-                    "best_step": best_step,
-                    "fem_valid": fem_is_valid,
-                    "fem_failure_reason": fem_failure_reason,
-                    "optimizer_step_skipped": not total_is_finite,
-                    "w_geo_mean": self._finite_or_default(w_geo_mean),
-
-                    "active_count_total": active_count_total,
-                    "active_count_mean": active_count_mean,
-                    "active_frac_mean": active_frac_mean,
-                    "gate_min": gate_min_global,
-                    "gate_mean": gate_mean_global,
-                    "gate_max": gate_max_global,
-                }
-                history.append(row)
-
-                if cfg.MakeTimelaps and step % cfg.timelapse_frame_step == 0:
-                    cad_img = self._render_current_cad_frame_cached(
-                        seeds_list=seeds_list,
-                        decoders=decoders,
-                        pred_list=pred_list,
-                        render_cache=render_cache,
-                        thr=getattr(cfg, "vis_thr", cfg.TM_laps_Thr),
-                    )
-
-                    loss_dict = {
-                        "total": row["L_total"],
-                        "vol": row["loss_vol"],
-                        "rep": row["loss_rep"],
-                        "bnd": row["loss_bnd"],
-                        "strut": row["loss_strut"],
-                        "fem": row["loss_fem"],
-                    }
-
-                    recorder.add_frame(
-                        step=step,
-                        cad_img=cad_img,
-                        loss_dict=loss_dict,
-                        title_text=(
-                            f"vol={row['vol_frac']:.4f} | "
-                            f"W={row['w_geo_mean']:.4g} | "
-                            f"Δrho={drho:.2e} Δseed={dseed:.2e} grad_mean={g_mean:.2e} | "
-                        ),
-                    )
-
-                self._tb_log_step(
-                    step=step,
-                    row=row,
-                    rho=rho,
-                    rho_boundary=rho_boundary,
-                    rho_v_all=rho_v_all,
-                    fiber_surface=fiber_surface,
-                    seeds_list=seeds_list,
-                    pred_list=pred_list,
-                )
-
-                if (not fem_is_valid) and cfg.skip_bad_fem_steps:
-                    self._print_fem_failure(step)
-
-                if step % cfg.log_every == 0 or step == cfg.num_steps - 1:
-                    fem_status = "OK" if fem_is_valid else f"BAD({fem_failure_reason})"
-                    print(
-                        f"[{step:05d}] |"
-                        f"| active(total/mean)={active_count_total:.0f}/{active_count_mean:.2f} "
-                        f"| gate(min/mean/max)={gate_min_global:.3f}/{gate_mean_global:.3f}/{gate_max_global:.3f} | "
-                        f"L_total={row['L_total']:.4e} | "
-                        f"L_vol={row['loss_vol']:.3e} "
-                        f"L_fem={row['loss_fem']:.3e} "
-                        f"L_strut={row['loss_strut']:.3e} "
-                        f"L_rep={row['loss_rep']:.3e} "
-                        f"L_bnd={row['loss_bnd']:.3e} | "
-                        f"vol={row['vol_frac']:.3f} "
-                        f"vol_eff={row['vol_frac_eff']:.3f} "
-                        f"(/{cfg.target_volfrac:.3f}) "
-                        f"comp={row['comp']:.3e} "
-                        f"w={row['w_geo_mean']:.3e} | "
-                        f"Lse={row['loss_strut_edge']:.3e} "
-                        f"Lsv={row['loss_strut_void']:.3e} "
-                        f"rho(min/mean/max)={rho_min:.3f}/{rho_mean:.3f}/{rho_max:.3f} | "
-                        f"rho_b={row['rho_boundary_mean']:.3f} "
-                        f"rho_v={row['rho_v_mean']:.3f} | "
-                        f"Δrho={drho:.2e} Δseed={dseed:.2e} grad_mean={g_mean:.2e} | "
-                        f"fem={fem_status} | "
-                        f"best={best_score:.4e}@{best_step}"
-                    )
-
-                if step >= cfg.early_stop_start and steps_since_improve >= cfg.patience:
-                    print(
-                        f"Early stopping at step {step} | "
-                        f"best_step={best_step} | best_score={best_score:.6f}"
-                    )
-                    break
-
-        if best_rho is None:
-            with torch.no_grad():
-                best_rho = rho.detach().clone()
-                best_seeds = [s.detach().clone() for s in seeds_list]
-                best_pred = [
-                    {
-                        "face_id": p["face_id"],
-                        "seeds_raw": p["seeds_raw"].detach().clone(),
-                        "w_raw": p["w_raw"].detach().clone(),
-                        "h_raw": None if p["h_raw"] is None else p["h_raw"].detach().clone(),
-                        "gate_probs": None if p["gate_probs"] is None else p["gate_probs"].detach().clone(),
-                        "w_geo": p["w_geo"].detach().clone(),
-                    }
-                    for p in pred_list
-                ]
-                best_step = step
-                best_score = float("inf") if not self._scalar_tensor_is_finite(L_total) else float(L_total.detach().item())
-                if best_vol_frac is None:
-                    best_vol_frac = float(vol_frac_eff.detach().item())
-                if best_comp is None:
-                    best_comp = float(comp_val.detach().item())
-                if best_w_geo is None:
-                    best_w_geo = float(w_geo_mean.detach().item())
-
-        with torch.no_grad():
-            final_shape_density = best_rho.clone()
-            seed_points_final = self._seed_points_xyz_all_faces(best_seeds, face_tensors)
-
-            if mid_shape_density is None:
-                mid_shape_density = final_shape_density.clone()
-                seed_points_mid = seed_points_final
-
-        print(
-            f"FINAL RETURNED: best_step={best_step}, best_score={best_score:.6f} | "
-            f"vol_eff={best_vol_frac:.3e}, comp={best_comp:.3e}, w_geo={best_w_geo:.3e}"
-        )
-
-        if self.writer is not None:
-            self.writer.flush()
-            self.writer.close()
-            self.writer = None
-
-        if cfg.MakeTimelaps:
-            try:
-                recorder.build_video()
-            except Exception as e:
-                print(f"Failed to build timelapse video: {e}")    
-
-        return {
-            "decoders": decoders,
-            "ppnets": ppnets,
-            "optimizer": opt,
-            "history": history,
-            "best_score": best_score,
-            "best_step": best_step,
-            "best_rho": best_rho,
-            "best_seeds": best_seeds,
-            "best_pred": best_pred,
-            "Initial_shape_density": initial_shape_density,
-            "Mid_shape_density": mid_shape_density,
-            "Final_shape_density": final_shape_density,
-            "seed_points_init": seed_points_init,
-            "seed_points_mid": seed_points_mid,
-            "seed_points_final": seed_points_final,
-            "A_v": A_v,
-            "uv_init_list": uv_init_list,
-            "face_tensors": face_tensors,
-            "fem_debug_history": self.fem_debug_history,
-            "last_fem_debug": self.last_fem_debug,
-            "tensorboard_log_dir": self.tensorboard_log_dir,
-            "shape_path": face_tensors[0].get("shape_path", None),
-        }
 
     # ------------------------------------------------------------------
     # Visualization
@@ -2376,3 +1733,776 @@ class NN_Trainer:
 
 
         plotter.show()
+    def train(self, shape_path, face_tensors):
+        cfg = self.cfg
+        self._validate_face_tensors(face_tensors)
+
+        ref_uv = face_tensors[0]["uv"]
+        device = ref_uv.device
+        dtype = ref_uv.dtype
+        mid_step = cfg.num_steps // 2
+
+        all_global_idx = torch.cat([ft["global_vertex_idx"] for ft in face_tensors], dim=0)
+        vertices_number = int(all_global_idx.max().item()) + 1
+
+        # ------------------------------------------------------------
+        # Build global vertex areas
+        # ------------------------------------------------------------
+        A_v = torch.zeros((vertices_number,), dtype=dtype, device=device)
+        local_vertex_areas = []
+        local_face_weights = []
+
+        for ft in face_tensors:
+            gidx = ft["global_vertex_idx"]
+            A_local = self.generator.vertex_area_lumped(
+                ft["uv"].shape[0],
+                ft["faces_ijk"],
+                ft["face_areas"],
+            ).to(device=device, dtype=dtype)
+
+            local_vertex_areas.append(A_local)
+            local_face_weights.append(A_local.sum().clamp_min(cfg.eps))
+            A_v[gidx] += A_local
+
+        # ------------------------------------------------------------
+        # Build models / optimizer / scheduler
+        # ------------------------------------------------------------
+        decoders, ppnets = self._build_face_models(face_tensors=face_tensors, device=device)
+        uv_init_list = self._init_face_seeds(face_tensors)
+
+        contexts = [
+            torch.zeros(1, cfg.context_vector_size, device=device, dtype=dtype)
+            for _ in face_tensors
+        ]
+
+        opt = self._build_optimizer(ppnets)
+
+        scheduler = None
+        if getattr(cfg, "scheduler_milestones", None):
+            scheduler = torch.optim.lr_scheduler.MultiStepLR(
+                opt,
+                milestones=list(cfg.scheduler_milestones),
+                gamma=cfg.scheduler_gamma,
+            )
+
+        # ------------------------------------------------------------
+        # Optional timelapse setup
+        # ------------------------------------------------------------
+        recorder = None
+        render_cache = None
+        if cfg.MakeTimelaps:
+            case_name = shape_path.stem
+            recorder = TimelapseRecorder(
+                out_dir="timelapse_frames",
+                video_path=case_name + "_timelapse.mp4",
+                fps=8,
+            )
+            render_cache = self.build_timelapse_render_cache(
+                face_tensors=face_tensors,
+                shape_or_path=str(shape_path),
+                grid_res_u=cfg.TM_laps_res_u,
+                grid_res_v=cfg.TM_laps_res_v,
+                uv_mask_tol=None,
+            )
+
+        # ------------------------------------------------------------
+        # Loss normalizers
+        # ------------------------------------------------------------
+        norm_vol = RunningNorm()
+        norm_rep = RunningNorm()
+        norm_bnd = RunningNorm()
+        norm_strut = RunningNorm()
+        norm_fem = RunningNorm()
+
+        # ------------------------------------------------------------
+        # Best-state tracking
+        # ------------------------------------------------------------
+        best_score = float("inf")
+        best_vol_frac = None
+        best_comp = None
+        best_w_geo = None
+        best_step = -1
+        best_rho = None
+        best_seeds = None
+        best_pred = None
+        steps_since_improve = 0
+
+        initial_shape_density = None
+        mid_shape_density = None
+        final_shape_density = None
+
+        seed_points_init = None
+        seed_points_mid = None
+        seed_points_final = None
+
+        rho0 = None
+        seeds0 = None
+        history = []
+
+        self.current_face_tensors = face_tensors
+
+        # ------------------------------------------------------------
+        # Training loop
+        # ------------------------------------------------------------
+        with tqdm(
+            range(cfg.num_steps),
+            desc="Training",
+            leave=True,
+            dynamic_ncols=True,
+        ) as pbar:
+            for step in pbar:
+                rho_acc = torch.zeros((vertices_number,), dtype=dtype, device=device)
+                rho_wgt = torch.zeros((vertices_number,), dtype=dtype, device=device)
+
+                rho_b_acc = torch.zeros((vertices_number,), dtype=dtype, device=device)
+                rho_b_wgt = torch.zeros((vertices_number,), dtype=dtype, device=device)
+
+                rho_v_acc = torch.zeros((vertices_number,), dtype=dtype, device=device)
+                rho_v_wgt = torch.zeros((vertices_number,), dtype=dtype, device=device)
+
+                fiber_acc = torch.zeros((vertices_number, 3), dtype=dtype, device=device)
+                fiber_wgt = torch.zeros((vertices_number,), dtype=dtype, device=device)
+
+                seeds_list = []
+                pred_list = []
+
+                rep_terms = []
+                bnd_terms = []
+                strut_terms = []
+                strut_edge_terms = []
+                strut_void_terms = []
+                w_geo_terms = []
+                gate_terms = []
+                gate_binary_terms = []
+                face_weights_this_step = []
+
+                active_count_total = 0.0
+                active_frac_sum = 0.0
+                gate_min_list = []
+                gate_mean_sum = 0.0
+                gate_max_list = []
+                gate_face_count = 0
+
+                # ----------------------------------------------------
+                # Per-face forward pass
+                # ----------------------------------------------------
+                for ft, decoder, ppnet, uv_init_i, context_i, A_local, face_weight_i in zip(
+                    face_tensors,
+                    decoders,
+                    ppnets,
+                    uv_init_list,
+                    contexts,
+                    local_vertex_areas,
+                    local_face_weights,
+                ):
+                    pred_i = ppnet(context_i, uv_init_i, offset_scale=cfg.Offset_scale)
+
+                    seeds_raw_i = pred_i["seeds_raw"][0]
+                    w_raw_i = pred_i["w_raw"][0]
+                    h_raw_i = None if cfg.fixed_height is not None else pred_i["h_raw"][0]
+
+                    gates_i = pred_i.get("gate_probs", None)
+                    gates_i = gates_i[0] if gates_i is not None else None
+
+                    gates_struct_i = self.sharpen_gate_probs(
+    gates_i,
+    gamma=cfg.gate_sharpen_gamma,
+    eps=cfg.gate_eps,
+)
+
+                    theta_i = pred_i["theta"][0] if (cfg.use_anisotropy and "theta" in pred_i) else None
+                    a_raw_i = pred_i["a_raw"][0] if (cfg.use_anisotropy and "a_raw" in pred_i) else None
+
+                    if gates_i is not None:
+                        gate_count_loss_i = self.gate_count_loss(
+                            gates=gates_i,
+                            target_count=cfg.gate_target_count,
+                        )
+                        gate_terms.append(gate_count_loss_i)
+                        gate_binary_loss_i = self.gate_binary_loss(gates_i)
+                        gate_binary_terms.append(gate_binary_loss_i)
+                        gate_stats_i = self._gate_activity_stats(
+                            gate_probs=gates_i,
+                            threshold=cfg.gate_active_threshold,
+                        )
+                        active_count_total += gate_stats_i["active_count"]
+                        active_frac_sum += gate_stats_i["active_frac"]
+                        gate_min_list.append(gate_stats_i["gate_min"])
+                        gate_mean_sum += gate_stats_i["gate_mean"]
+                        gate_max_list.append(gate_stats_i["gate_max"])
+                        gate_face_count += 1
+
+
+                    local_face_id = torch.zeros(ft["uv"].shape[0], dtype=torch.long, device=device)
+
+                    boundary_uv_i = None
+                    boundary_face_id_i = None
+                    true_bidx_i = self._true_open_boundary_idx(ft)
+                    if true_bidx_i.numel() > 0:
+                        boundary_uv_i = ft["uv"][true_bidx_i]
+                        boundary_face_id_i = torch.zeros(
+                            boundary_uv_i.shape[0],
+                            dtype=torch.long,
+                            device=device,
+                        )
+
+                    decoder_out = decoder(
+                        points_uv=ft["uv"],
+                        Xu=ft["Xu"],
+                        Xv=ft["Xv"],
+                        tau=cfg.tau,
+                        seeds_raw=seeds_raw_i,
+                        w_raw=w_raw_i,
+                        h_raw=h_raw_i,
+                        theta=theta_i,
+                        a_raw=a_raw_i,
+                        points_face_id=local_face_id,
+                        boundary_uv=boundary_uv_i,
+                        boundary_face_id=boundary_face_id_i,
+                        seed_gates=gates_struct_i,
+                    )
+
+                    self._require_decoder_keys(
+                        decoder_out,
+                        ["seeds", "rho", "fiber3d", "w_geo", "rho_v", "rho_b", "edge_field"],
+                    )
+
+                    seeds_i = decoder_out["seeds"]
+                    rho_i = decoder_out["rho"]
+                    w_geo_i = decoder_out["w_geo"]
+                    fiber3d_i = decoder_out["fiber3d"]
+                    rho_v_i = decoder_out["rho_v"]
+                    rho_b_i = decoder_out["rho_b"]
+                    edge_field_i = decoder_out["edge_field"]
+
+                    for name, t in {
+                        "seeds_i": seeds_i,
+                        "rho_i": rho_i,
+                        "fiber3d_i": fiber3d_i,
+                        "rho_v_i": rho_v_i,
+                        "rho_b_i": rho_b_i,
+                        "edge_field_i": edge_field_i,
+                    }.items():
+                        if not torch.isfinite(t).all():
+                            tqdm.write(f"[step {step}] face {ft['face_id']} invalid tensor: {name}")
+                            raise RuntimeError(
+                                f"Invalid decoder output on face {ft['face_id']} at step {step}"
+                            )
+
+                    gidx = ft["global_vertex_idx"]
+                    w_local = A_local.clamp_min(cfg.eps)
+
+                    rho_acc[gidx] += rho_i * w_local
+                    rho_wgt[gidx] += w_local
+
+                    rho_b_acc[gidx] += rho_b_i * w_local
+                    rho_b_wgt[gidx] += w_local
+
+                    rho_v_acc[gidx] += rho_v_i * w_local
+                    rho_v_wgt[gidx] += w_local
+
+                    fiber_acc[gidx] += fiber3d_i * w_local[:, None]
+                    fiber_wgt[gidx] += w_local
+
+                    seeds_list.append(seeds_i)
+                    pred_list.append({
+                        "face_id": ft["face_id"],
+                        "seeds_raw": seeds_raw_i,
+                        "w_raw": w_raw_i,
+                        "h_raw": None if h_raw_i is None else h_raw_i.detach().clone(),
+                        "gate_probs": None if gates_i is None else gates_i.detach().clone(),
+                        "theta": None if theta_i is None else theta_i.detach().clone(),
+                        "a_raw": None if a_raw_i is None else a_raw_i.detach().clone(),
+                        "w_geo": w_geo_i.detach().clone(),
+                    })
+
+                    rep_terms.append(
+                        self.seed_repulsion_term(
+                            seeds=seeds_i,
+                            gates=gates_struct_i,
+                            sigma=cfg.seed_repulsion_sigma,
+                            eps=cfg.eps,
+                        )
+                    )
+                    bnd_terms.append(
+                        self.boundary_repulsion_term(
+                            seeds=seeds_i,
+                            boundary_uv=boundary_uv_i,
+                            gates=gates_struct_i,
+                            margin=cfg.boundary_margin,
+                            eps=cfg.eps,
+                        )
+                    )
+
+                    w_geo_terms.append(w_geo_i.reshape(()))
+                    face_weights_this_step.append(face_weight_i.reshape(()))
+
+                    if cfg.lam_strut != 0.0:
+                        loss_strut_i, loss_strut_edge_i, loss_strut_void_i = self.strutness_loss_from_edge_field(
+                            rho=rho_v_i,
+                            edge_field=edge_field_i,
+                            lam_edge=cfg.lam_strut_edge,
+                            lam_void=cfg.lam_strut_void,
+                            eps=cfg.eps,
+                        )
+                        strut_terms.append(loss_strut_i)
+                        strut_edge_terms.append(loss_strut_edge_i)
+                        strut_void_terms.append(loss_strut_void_i)
+
+                # ----------------------------------------------------
+                # Aggregate face outputs
+                # ----------------------------------------------------
+                if gate_face_count > 0:
+                    active_count_mean = active_count_total / gate_face_count
+                    active_frac_mean = active_frac_sum / gate_face_count
+                    gate_min_global = min(gate_min_list)
+                    gate_mean_global = gate_mean_sum / gate_face_count
+                    gate_max_global = max(gate_max_list)
+                else:
+                    active_count_mean = 0.0
+                    active_frac_mean = 0.0
+                    gate_min_global = 0.0
+                    gate_mean_global = 0.0
+                    gate_max_global = 0.0
+
+                rho = rho_acc / rho_wgt.clamp_min(cfg.eps)
+                rho_boundary = rho_b_acc / rho_b_wgt.clamp_min(cfg.eps)
+                rho_v_all = rho_v_acc / rho_v_wgt.clamp_min(cfg.eps)
+
+                fiber_surface = fiber_acc / fiber_wgt.clamp_min(cfg.eps)[:, None]
+                fiber_norm = fiber_surface.norm(dim=1, keepdim=True).clamp_min(cfg.eps)
+                fiber_surface = fiber_surface / fiber_norm
+
+                loss_rep = self._safe_weighted_mean(rep_terms, face_weights_this_step, dtype, device, cfg.eps)
+                loss_bnd = self._safe_weighted_mean(bnd_terms, face_weights_this_step, dtype, device, cfg.eps)
+                loss_strut = self._safe_weighted_mean(strut_terms, face_weights_this_step, dtype, device, cfg.eps)
+                loss_strut_edge = self._safe_weighted_mean(strut_edge_terms, face_weights_this_step, dtype, device, cfg.eps)
+                loss_strut_void = self._safe_weighted_mean(strut_void_terms, face_weights_this_step, dtype, device, cfg.eps)
+                w_geo_mean = self._safe_weighted_mean(w_geo_terms, face_weights_this_step, dtype, device, cfg.eps)
+                loss_gate = self._safe_weighted_mean(gate_terms, face_weights_this_step, dtype, device, cfg.eps)
+                loss_gate_binary = self._safe_weighted_mean(gate_binary_terms, face_weights_this_step, dtype, device, cfg.eps)
+                # ----------------------------------------------------
+                # Volume loss
+                # ----------------------------------------------------
+                if cfg.use_boundary_weighted_volume:
+                    loss_vol, vol_frac_eff = self.volume_loss_with_boundary_discount(
+                        rho=rho,
+                        A_v=A_v,
+                        rho_boundary=rho_boundary,
+                        target_volfrac=cfg.target_volfrac,
+                        boundary_weight=cfg.boundary_vol_weight,
+                        eps=cfg.eps,
+                    )
+                else:
+                    loss_vol = self.volume_loss_constant_height(
+                        rho=rho,
+                        A_v=A_v,
+                        target_volfrac=cfg.target_volfrac,
+                        eps=cfg.eps,
+                    )
+                    vol_frac_eff = (rho * A_v).sum() / (A_v.sum() + cfg.eps)
+
+                # ----------------------------------------------------
+                # FEM loss
+                # ----------------------------------------------------
+                fem_out = {
+                    "fem_total": torch.zeros((), dtype=dtype, device=device),
+                    "comp": torch.zeros((), dtype=dtype, device=device),
+                    "compliance_loss": torch.zeros((), dtype=dtype, device=device),
+                    "fem_valid": True,
+                    "failure_reason": None,
+                }
+
+                if cfg.lam_fem != 0.0:
+                    fem_out = self.fem_loss(
+                        rho_surface=rho,
+                        fiber_surface=fiber_surface,
+                        comp_normalize_by=cfg.comp_normalize_by,
+                        density_floor=cfg.fem_density_floor,
+                        eps=cfg.eps,
+                        save_debug_history=getattr(cfg, "save_fem_debug_history", True),
+                    )
+
+                loss_fem = fem_out["fem_total"]
+                loss_comp = fem_out["compliance_loss"]
+                comp_val = fem_out["comp"]
+                fem_is_valid = bool(fem_out["fem_valid"])
+                fem_failure_reason = fem_out["failure_reason"]
+
+                # ----------------------------------------------------
+                # Normalize losses
+                # ----------------------------------------------------
+                if cfg.normalize_losses:
+                    n_vol = norm_vol.update(loss_vol.detach().item())
+                    n_rep = norm_rep.update(loss_rep.detach().item())
+                    n_bnd = norm_bnd.update(loss_bnd.detach().item())
+                    n_strut = norm_strut.update(loss_strut.detach().item()) if cfg.lam_strut != 0.0 else 1.0
+                    n_fem = norm_fem.update(loss_fem.detach().item()) if (cfg.lam_fem != 0.0 and fem_is_valid) else 1.0
+                else:
+                    n_vol = n_rep = n_bnd = n_strut = n_fem = 1.0
+
+                # ----------------------------------------------------
+                # Total loss
+                # ----------------------------------------------------
+                if cfg.gate_warmup_steps > 0:
+                    gate_warmup = min(float(step) / float(cfg.gate_warmup_steps), 1.0)
+                else:
+                    gate_warmup = 1.0
+
+                if cfg.gate_binary_warmup_steps > 0:
+                    gate_binary_warmup = min(float(step) / float(cfg.gate_binary_warmup_steps), 1.0)
+                else:
+                    gate_binary_warmup = 1.0
+
+                lam_gate_binary_eff = cfg.lam_gate_binary * gate_binary_warmup    
+
+                lam_gate_eff = cfg.lam_gate_count * gate_warmup
+                L_total = (
+                    cfg.lam_vol * (loss_vol / n_vol)
+                    + cfg.lam_rep * (loss_rep / n_rep)
+                    + cfg.lam_bnd * (loss_bnd / n_bnd)
+                )
+
+                if cfg.lam_strut != 0.0:
+                    L_total = L_total + cfg.lam_strut * (loss_strut / n_strut)
+
+                if cfg.use_gating and lam_gate_eff != 0.0:
+                    L_total = L_total + lam_gate_eff * loss_gate    
+                if cfg.use_gating and lam_gate_binary_eff != 0.0:
+                    L_total = L_total + lam_gate_binary_eff * loss_gate_binary
+
+                if cfg.lam_fem != 0.0:
+                    if fem_is_valid:
+                        L_total = L_total + cfg.lam_fem * (loss_fem / n_fem)
+                    elif not cfg.skip_bad_fem_steps:
+                        L_total = L_total + cfg.lam_fem * loss_fem
+
+                L_total = L_total / len(face_tensors)
+                total_is_finite = self._scalar_tensor_is_finite(L_total)
+
+                # ----------------------------------------------------
+                # Backprop
+                # ----------------------------------------------------
+                opt.zero_grad(set_to_none=True)
+
+                if total_is_finite:
+                    L_total.backward()
+
+                    grad_clip_norm = getattr(cfg, "grad_clip_norm", None)
+                    if grad_clip_norm is not None and grad_clip_norm > 0:
+                        params = []
+                        for ppnet in ppnets:
+                            params.extend([p for p in ppnet.parameters() if p.requires_grad])
+                        if params:
+                            torch.nn.utils.clip_grad_norm_(params, max_norm=grad_clip_norm)
+
+                    for fi, ppnet in enumerate(ppnets):
+                        for pn, p in ppnet.named_parameters():
+                            if p.grad is not None and not torch.isfinite(p.grad).all():
+                                raise RuntimeError(
+                                    f"Non-finite gradient before opt.step(): face={fi}, param={pn}"
+                                )
+
+                    opt.step()
+
+                    for fi, ppnet in enumerate(ppnets):
+                        for pn, p in ppnet.named_parameters():
+                            if not torch.isfinite(p).all():
+                                raise RuntimeError(
+                                    f"Non-finite parameter after opt.step(): face={fi}, param={pn}"
+                                )
+
+                    if scheduler is not None:
+                        scheduler.step()
+                else:
+                    tqdm.write(f"[step {step}] L_total is non-finite, optimizer step skipped.")
+
+                # ----------------------------------------------------
+                # Logging / tracking
+                # ----------------------------------------------------
+                with torch.no_grad():
+                    vol_frac = (rho * A_v).sum() / (A_v.sum() + cfg.eps)
+                    vol_dev = torch.abs(vol_frac - cfg.target_volfrac)
+                    vol_dev_eff = torch.abs(vol_frac_eff - cfg.target_volfrac)
+
+                    score = float(L_total.detach().item()) if total_is_finite else float("inf")
+                    best_candidate_is_valid = (cfg.lam_fem == 0.0) or fem_is_valid
+
+                    prev_best_step = best_step
+                    improvement_gap = (step - prev_best_step) if prev_best_step >= 0 else None
+
+                    if step == 0:
+                        initial_shape_density = rho.detach().clone()
+                        seed_points_init = self._seed_points_xyz_all_faces(seeds_list, face_tensors)
+
+                    if step == mid_step:
+                        mid_shape_density = rho.detach().clone()
+                        seed_points_mid = self._seed_points_xyz_all_faces(seeds_list, face_tensors)
+
+                    if best_candidate_is_valid and score < (best_score - cfg.min_delta):
+                        best_score = score
+                        best_step = step
+                        best_vol_frac = float(vol_frac_eff.detach().item())
+                        best_comp = float(comp_val.detach().item())
+                        best_w_geo = float(w_geo_mean.detach().item())
+                        best_rho = rho.detach().clone()
+                        best_seeds = [s.detach().clone() for s in seeds_list]
+                        best_pred = [
+                            {
+                                "face_id": p["face_id"],
+                                "seeds_raw": p["seeds_raw"].detach().clone(),
+                                "w_raw": p["w_raw"].detach().clone(),
+                                "h_raw": None if p["h_raw"] is None else p["h_raw"].detach().clone(),
+                                "gate_probs": None if p["gate_probs"] is None else p["gate_probs"].detach().clone(),
+                                "theta": None if p["theta"] is None else p["theta"].detach().clone(),
+                                "a_raw": None if p["a_raw"] is None else p["a_raw"].detach().clone(),
+                                "w_geo": p["w_geo"].detach().clone(),
+                            }
+                            for p in pred_list
+                        ]
+
+                        if improvement_gap is None or improvement_gap > 50:
+                            tqdm.write(
+                                f"New best_step={best_step} | "
+                                f"best_score={best_score:.6f} | "
+                                f"vol_eff={best_vol_frac:.6f} | "
+                                f"comp={best_comp:.6e} | "
+                                f"w={best_w_geo:.6e}"
+                            )
+                        steps_since_improve = 0
+                    elif best_candidate_is_valid:
+                        steps_since_improve += 1
+
+                    if rho0 is None:
+                        rho0 = rho.detach().clone()
+                    if seeds0 is None:
+                        seeds0 = [s.detach().clone() for s in seeds_list]
+
+                    drho = float((rho - rho0).abs().mean().item())
+                    dseed_terms = [float((s - s0).abs().mean().item()) for s, s0 in zip(seeds_list, seeds0)]
+                    dseed = sum(dseed_terms) / max(len(dseed_terms), 1)
+
+                    rho_min = float(rho.min().item())
+                    rho_mean = float(rho.mean().item())
+                    rho_max = float(rho.max().item())
+
+                    g_mean = 0.0
+                    g_count = 0
+                    for ppnet in ppnets:
+                        for p in ppnet.parameters():
+                            if p.grad is not None:
+                                g_mean += float(p.grad.detach().abs().mean().item())
+                                g_count += 1
+                    g_mean = g_mean / max(g_count, 1)
+
+                    row = {
+                        "step": step,
+                        "L_total": self._finite_or_default(L_total),
+                        "loss_vol": self._finite_or_default(loss_vol),
+                        "loss_rep": self._finite_or_default(loss_rep),
+                        "loss_bnd": self._finite_or_default(loss_bnd),
+                        "loss_strut": self._finite_or_default(loss_strut),
+                        "loss_strut_edge": self._finite_or_default(loss_strut_edge),
+                        "loss_strut_void": self._finite_or_default(loss_strut_void),
+                        "loss_fem": self._finite_or_default(loss_fem),
+                        "loss_comp": self._finite_or_default(loss_comp),
+                        "loss_gate": self._finite_or_default(loss_gate),
+                        "lam_gate_eff": lam_gate_eff,
+                        "loss_gate_binary": self._finite_or_default(loss_gate_binary),
+                        "lam_gate_binary_eff": lam_gate_binary_eff,
+                        "comp": self._finite_or_default(comp_val),
+                        "vol_frac": float(vol_frac.detach().item()),
+                        "vol_frac_eff": float(vol_frac_eff.detach().item()),
+                        "vol_dev": float(vol_dev.detach().item()),
+                        "vol_dev_eff": float(vol_dev_eff.detach().item()),
+                        "rho_min": rho_min,
+                        "rho_mean": rho_mean,
+                        "rho_max": rho_max,
+                        "rho_boundary_mean": float(rho_boundary.mean().detach().item()),
+                        "rho_v_mean": float(rho_v_all.mean().detach().item()),
+                        "drho": drho,
+                        "dseed": dseed,
+                        "grad_mean": g_mean,
+                        "best_score": best_score,
+                        "best_step": best_step,
+                        "fem_valid": fem_is_valid,
+                        "fem_failure_reason": fem_failure_reason,
+                        "optimizer_step_skipped": not total_is_finite,
+                        "w_geo_mean": self._finite_or_default(w_geo_mean),
+                        "active_count_total": active_count_total,
+                        "active_count_mean": active_count_mean,
+                        "active_frac_mean": active_frac_mean,
+                        "gate_min": gate_min_global,
+                        "gate_mean": gate_mean_global,
+                        "gate_max": gate_max_global,
+                    }
+                    history.append(row)
+
+                    pbar.set_postfix(
+                        loss=f"{row['L_total']:.3e}",
+                        vol=f"{row['vol_frac_eff']:.3f}",
+                        comp=f"{row['comp']:.2e}",
+                        best=f"{best_score:.2e}",
+                        act=f"{active_count_mean:.1f}",
+                        fem="OK" if fem_is_valid else "BAD",
+                        refresh=False,
+                    )
+
+                    if cfg.MakeTimelaps and step % cfg.timelapse_frame_step == 0:
+                        cad_img = self._render_current_cad_frame_cached(
+                            seeds_list=seeds_list,
+                            decoders=decoders,
+                            pred_list=pred_list,
+                            render_cache=render_cache,
+                            thr=getattr(cfg, "vis_thr", cfg.TM_laps_Thr),
+                        )
+
+                        loss_dict = {
+                            "total": row["L_total"],
+                            "vol": row["loss_vol"],
+                            "rep": row["loss_rep"],
+                            "bnd": row["loss_bnd"],
+                            "strut": row["loss_strut"],
+                            "fem": row["loss_fem"],
+                        }
+
+                        recorder.add_frame(
+                            step=step,
+                            cad_img=cad_img,
+                            loss_dict=loss_dict,
+                            title_text=(
+                                f"vol={row['vol_frac']:.4f} | "
+                                f"W={row['w_geo_mean']:.4g} | "
+                                f"Δrho={drho:.2e} Δseed={dseed:.2e} grad_mean={g_mean:.2e} | "
+                            ),
+                        )
+
+                    self._tb_log_step(
+                        step=step,
+                        row=row,
+                        rho=rho,
+                        rho_boundary=rho_boundary,
+                        rho_v_all=rho_v_all,
+                        fiber_surface=fiber_surface,
+                        seeds_list=seeds_list,
+                        pred_list=pred_list,
+                    )
+
+                    if (not fem_is_valid) and cfg.skip_bad_fem_steps:
+                        self._print_fem_failure(step)
+
+                    if step % cfg.log_every == 0 or step == cfg.num_steps - 1:
+                        fem_status = "OK" if fem_is_valid else f"BAD({fem_failure_reason})"
+                        tqdm.write(
+                            f"[{step:05d}] | "
+                            f"active(total/mean)={active_count_total:.0f}/{active_count_mean:.2f} | "
+                            f"gate(min/mean/max)={gate_min_global:.3f}/{gate_mean_global:.3f}/{gate_max_global:.3f} | "
+                            f"L_total={row['L_total']:.4e} | "
+                            f"L_vol={row['loss_vol']:.3e} "
+                            f"L_fem={row['loss_fem']:.3e} "
+                            f"L_strut={row['loss_strut']:.3e} "
+                            f"L_rep={row['loss_rep']:.3e} "
+                            f"L_bnd={row['loss_bnd']:.3e} "
+                            f"L_gate={row['loss_gate']:.3e} "
+                            f"L_gbin={row['loss_gate_binary']:.3e} | "
+                            f"vol={row['vol_frac']:.3f} "
+                            f"vol_eff={row['vol_frac_eff']:.3f} "
+                            f"(/{cfg.target_volfrac:.3f}) "
+                            f"comp={row['comp']:.3e} "
+                            f"w={row['w_geo_mean']:.3e} | "
+                            f"Lse={row['loss_strut_edge']:.3e} "
+                            f"Lsv={row['loss_strut_void']:.3e} "
+                            f"rho(min/mean/max)={rho_min:.3f}/{rho_mean:.3f}/{rho_max:.3f} | "
+                            f"rho_b={row['rho_boundary_mean']:.3f} "
+                            f"rho_v={row['rho_v_mean']:.3f} | "
+                            f"Δrho={drho:.2e} Δseed={dseed:.2e} grad_mean={g_mean:.2e} | "
+                            f"fem={fem_status} | "
+                            f"best={best_score:.4e}@{best_step}"
+                        )
+
+                    if step >= cfg.early_stop_start and steps_since_improve >= cfg.patience:
+                        tqdm.write(
+                            f"Early stopping at step {step} | "
+                            f"best_step={best_step} | best_score={best_score:.6f}"
+                        )
+                        break
+
+        # ------------------------------------------------------------
+        # Fallback best state
+        # ------------------------------------------------------------
+        if best_rho is None:
+            with torch.no_grad():
+                best_rho = rho.detach().clone()
+                best_seeds = [s.detach().clone() for s in seeds_list]
+                best_pred = [
+                    {
+                        "face_id": p["face_id"],
+                        "seeds_raw": p["seeds_raw"].detach().clone(),
+                        "w_raw": p["w_raw"].detach().clone(),
+                        "h_raw": None if p["h_raw"] is None else p["h_raw"].detach().clone(),
+                        "gate_probs": None if p["gate_probs"] is None else p["gate_probs"].detach().clone(),
+                        "w_geo": p["w_geo"].detach().clone(),
+                    }
+                    for p in pred_list
+                ]
+                best_step = step
+                best_score = float("inf") if not self._scalar_tensor_is_finite(L_total) else float(L_total.detach().item())
+
+                if best_vol_frac is None:
+                    best_vol_frac = float(vol_frac_eff.detach().item())
+                if best_comp is None:
+                    best_comp = float(comp_val.detach().item())
+                if best_w_geo is None:
+                    best_w_geo = float(w_geo_mean.detach().item())
+
+        # ------------------------------------------------------------
+        # Final outputs
+        # ------------------------------------------------------------
+        with torch.no_grad():
+            final_shape_density = best_rho.clone()
+            seed_points_final = self._seed_points_xyz_all_faces(best_seeds, face_tensors)
+
+            if mid_shape_density is None:
+                mid_shape_density = final_shape_density.clone()
+                seed_points_mid = seed_points_final
+
+        tqdm.write(
+            f"FINAL RETURNED: best_step={best_step}, best_score={best_score:.6f} | "
+            f"vol_eff={best_vol_frac:.3e}, comp={best_comp:.3e}, w_geo={best_w_geo:.3e}"
+        )
+
+        if self.writer is not None:
+            self.writer.flush()
+            self.writer.close()
+            self.writer = None
+
+        if cfg.MakeTimelaps:
+            try:
+                recorder.build_video()
+            except Exception as e:
+                tqdm.write(f"Failed to build timelapse video: {e}")
+
+        return {
+            "decoders": decoders,
+            "ppnets": ppnets,
+            "optimizer": opt,
+            "history": history,
+            "best_score": best_score,
+            "best_step": best_step,
+            "best_rho": best_rho,
+            "best_seeds": best_seeds,
+            "best_pred": best_pred,
+            "Initial_shape_density": initial_shape_density,
+            "Mid_shape_density": mid_shape_density,
+            "Final_shape_density": final_shape_density,
+            "seed_points_init": seed_points_init,
+            "seed_points_mid": seed_points_mid,
+            "seed_points_final": seed_points_final,
+            "A_v": A_v,
+            "uv_init_list": uv_init_list,
+            "face_tensors": face_tensors,
+            "fem_debug_history": self.fem_debug_history,
+            "last_fem_debug": self.last_fem_debug,
+            "tensorboard_log_dir": self.tensorboard_log_dir,
+            "shape_path": face_tensors[0].get("shape_path", None),
+        }

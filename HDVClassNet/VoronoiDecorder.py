@@ -69,7 +69,7 @@ class VoronoiDecoder(nn.Module):
         eta_default: float = 0.05,
 
         # boundary attachment field
-        use_boundary_attachment: bool = True,
+        use_boundary_attachment: bool = False,
         boundary_attach_width: float = 0.03,
         boundary_attach_beta: float = 0.01,
         boundary_attach_alpha: float = 0.35,
@@ -370,25 +370,16 @@ class VoronoiDecoder(nn.Module):
 
     def _bisector_band_density(
         self,
-        d: torch.Tensor,                 # (N,S)
-        w_soft: torch.Tensor,            # (N,S)
-        w_geo: torch.Tensor,             # scalar-like
+        d: torch.Tensor,
+        w_soft: torch.Tensor,
+        w_geo: torch.Tensor,
         beta: float | torch.Tensor,
         gap_thr: torch.Tensor | None = None,
         big_thr: torch.Tensor | None = None,
         alpha: torch.Tensor | None = None,
         eta: torch.Tensor | None = None,
+        seed_gates: torch.Tensor | None = None,
     ):
-        """
-        Smooth strut density centered on Voronoi bisectors.
-
-        Returns:
-            rho: (N,)
-            pair_strength: (N,S,S)
-            band_ij: (N,S,S)
-            pair_relevance: (N,S,S)
-            edge_field: (N,)
-        """
         N, S = d.shape
 
         d_i = d.unsqueeze(2)
@@ -407,6 +398,16 @@ class VoronoiDecoder(nn.Module):
 
         pair_relevance = (w_soft.unsqueeze(2) * w_soft.unsqueeze(1)) * tri
 
+        gate_pair = None
+        if seed_gates is not None:
+            if seed_gates.ndim != 1 or seed_gates.shape[0] != S:
+                raise ValueError(
+                    f"seed_gates must have shape ({S},), got {tuple(seed_gates.shape)}"
+                )
+            g = seed_gates.to(device=d.device, dtype=d.dtype).clamp_min(self.eps)
+            gate_pair = (g.unsqueeze(1) * g.unsqueeze(0)) * tri
+            pair_relevance = pair_relevance * gate_pair.unsqueeze(0)
+
         if (
             self.use_pair_gating
             and gap_thr is not None
@@ -423,10 +424,12 @@ class VoronoiDecoder(nn.Module):
         rho = 1.0 - torch.exp(-self.alpha_union * R)
         rho = rho.clamp(0.0, 1.0)
 
-        band_soft = band_ij.clamp(0.0, 1.0)
+        band_soft = band_ij
+        if gate_pair is not None:
+            band_soft = band_soft * gate_pair.unsqueeze(0)
+        band_soft = band_soft.clamp(0.0, 1.0)
 
         eye = torch.eye(S, dtype=torch.bool, device=band_soft.device).unsqueeze(0)
-
         one_minus = torch.where(
             eye,
             torch.ones_like(band_soft),
@@ -437,7 +440,6 @@ class VoronoiDecoder(nn.Module):
         edge_field = edge_field.clamp(0.0, 1.0)
 
         return rho, pair_strength, band_ij, pair_relevance, edge_field
-
     # -------------------- validation --------------------
 
     def _validate_inputs(
@@ -547,13 +549,16 @@ class VoronoiDecoder(nn.Module):
 
         logits = -d / tau
 
+        gates = None
         if seed_gates is not None:
             if seed_gates.ndim != 1 or seed_gates.shape[0] != S:
                 raise ValueError(
                     f"seed_gates must have shape ({S},), got {tuple(seed_gates.shape)}"
                 )
-            gate_eps = 1e-8
-            gates = seed_gates.to(device=d.device, dtype=d.dtype).clamp_min(gate_eps)
+            gates = seed_gates.to(device=d.device, dtype=d.dtype).clamp_min(1e-8)
+
+            # Relative competition gating:
+            # lower gate weakens the seed in Voronoi competition.
             logits = logits + torch.log(gates).unsqueeze(0)
 
         logits = logits - logits.max(dim=-1, keepdim=True).values
@@ -602,6 +607,7 @@ class VoronoiDecoder(nn.Module):
             big_thr=big_thr,
             alpha=alpha,
             eta=eta,
+            seed_gates=gates,
         )
 
         if self.use_boundary_attachment:
@@ -622,6 +628,8 @@ class VoronoiDecoder(nn.Module):
 
         rho = rho.clamp(0.0, 1.0)
 
+        # Fiber still comes from competition weights, then is suppressed by density.
+        # This is acceptable as long as rho_v / rho are now correctly gate-aware.
         t_uv_raw = self._blended_uv_fiber(w_soft, seeds)
 
         rho0, gamma = 0.5, 0.05
