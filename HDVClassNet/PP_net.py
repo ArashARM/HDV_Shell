@@ -17,7 +17,7 @@ class PPNet(nn.Module):
         self,
         context_dim,
         n_seeds,
-        use_anisotropy=False,
+        use_Metric_anisotropy=False,
         predict_height=False,
         use_gating=False,
         hidden=256,
@@ -29,7 +29,7 @@ class PPNet(nn.Module):
     ):
         super().__init__()
         self.n_seeds = n_seeds
-        self.use_anisotropy = use_anisotropy
+        self.use_Metric_anisotropy = use_Metric_anisotropy
         self.predict_height = predict_height
         self.use_gating = use_gating
 
@@ -69,7 +69,7 @@ class PPNet(nn.Module):
             nn.init.zeros_(self.gate_head.weight)
             nn.init.constant_(self.gate_head.bias, 2.0)
 
-        if self.use_anisotropy:
+        if self.use_Metric_anisotropy:
             self.theta_head = nn.Linear(hidden, 1)
             self.a_head = nn.Linear(hidden, 1)
 
@@ -174,7 +174,7 @@ class PPNet(nn.Module):
             out["gate_logits"] = gate_logits
             out["gate_probs"] = torch.sigmoid(gate_logits)
 
-        if self.use_anisotropy:
+        if self.use_Metric_anisotropy:
             theta = self.theta_head(h).squeeze(-1)
             a_raw = self.a_head(h).squeeze(-1)
             if not torch.isfinite(theta).all():

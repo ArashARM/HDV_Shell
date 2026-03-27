@@ -20,12 +20,32 @@ except Exception:
 @dataclass
 class TrainingConfig:
     seed_number: int = 15
-    use_anisotropy: bool = True
+    use_Metric_anisotropy: bool = True
     fixed_height: float | None = None
     target_volfrac: float = 0.5
     seed_repulsion_sigma: float = 0.08
     boundary_margin: float = 0.05
     freeze_w: bool = False
+    use_boundary_attachment: bool = True
+
+    boundary_attach_width: float = 0.03
+    boundary_attach_beta: float = 0.01
+    boundary_attach_alpha: float = 0.35
+
+    train_boundary_attach_width: bool = True
+    train_boundary_attach_alpha: bool = True
+    train_boundary_attach_beta: bool = False
+
+    boundary_attach_width_min: float = 0.005
+    boundary_attach_width_max: float = 0.10
+
+    boundary_attach_alpha_min: float = 0.05
+    boundary_attach_alpha_max: float = 1.00
+
+    boundary_attach_beta_min: float = 0.003
+    boundary_attach_beta_max: float = 0.05
+
+    lr_decoder_boundary: float = 5e-4
 
     gate_sharpen_gamma: float = 4.0
 
@@ -79,7 +99,7 @@ class TrainingConfig:
 
     eps: float = 1e-12
 
-    use_boundary_weighted_volume: bool = True
+    use_boundary_weighted_volume: bool = False
     boundary_vol_weight: float = 0.20
 
     Offset_scale: float = 1.00
@@ -748,7 +768,7 @@ class NN_Trainer:
         boundary_idx_ring1,
         u_periodic,
         v_periodic,
-        use_anisotropy,
+        use_Metric_anisotropy,
         context_vector_size,
         freeze_w,
     ):
@@ -762,16 +782,34 @@ class NN_Trainer:
             seed_face_id=seed_face_id,
             face_u_periodic=face_u_periodic,
             face_v_periodic=face_v_periodic,
-            use_anisotropy=use_anisotropy,
+            use_Metric_anisotropy=use_Metric_anisotropy,
             w_min=self.cfg.w_min,
             w_max=self.cfg.w_max,
             fixed_height=self.cfg.fixed_height,
+
+            use_boundary_attachment=self.cfg.use_boundary_attachment,
+            boundary_attach_width=self.cfg.boundary_attach_width,
+            boundary_attach_beta=self.cfg.boundary_attach_beta,
+            boundary_attach_alpha=self.cfg.boundary_attach_alpha,
+
+            train_boundary_attach_width=self.cfg.train_boundary_attach_width,
+            train_boundary_attach_alpha=self.cfg.train_boundary_attach_alpha,
+            train_boundary_attach_beta=self.cfg.train_boundary_attach_beta,
+
+            boundary_attach_width_min=self.cfg.boundary_attach_width_min,
+            boundary_attach_width_max=self.cfg.boundary_attach_width_max,
+
+            boundary_attach_alpha_min=self.cfg.boundary_attach_alpha_min,
+            boundary_attach_alpha_max=self.cfg.boundary_attach_alpha_max,
+
+            boundary_attach_beta_min=self.cfg.boundary_attach_beta_min,
+            boundary_attach_beta_max=self.cfg.boundary_attach_beta_max,
         ).to(device)
 
         ppnet = self.ppnet_cls(
             context_dim=context_vector_size,
             n_seeds=seed_number,
-            use_anisotropy=use_anisotropy,
+            use_Metric_anisotropy=use_Metric_anisotropy,
             predict_height=(self.cfg.fixed_height is None),
             use_gating=self.cfg.use_gating,
             freeze_w=freeze_w,
@@ -791,7 +829,7 @@ class NN_Trainer:
                 boundary_idx_ring1=ft["boundary_idx_ring1"],
                 u_periodic=ft.get("u_periodic", False),
                 v_periodic=ft.get("v_periodic", False),
-                use_anisotropy=cfg.use_anisotropy,
+                use_Metric_anisotropy=cfg.use_Metric_anisotropy,
                 context_vector_size=cfg.context_vector_size,
                 freeze_w=cfg.freeze_w,
             )
@@ -800,7 +838,7 @@ class NN_Trainer:
 
         return decoders, ppnets
 
-    def _build_optimizer(self, ppnets):
+    def _build_optimizer(self, ppnets,decoders):
         cfg = self.cfg
         param_groups = []
 
@@ -817,11 +855,20 @@ class NN_Trainer:
             if hasattr(ppnet, "gate_head"):
                 param_groups.append({"params": ppnet.gate_head.parameters(), "lr": cfg.lr_gate_head})
 
-            if cfg.use_anisotropy:
+            if cfg.use_Metric_anisotropy:
                 if hasattr(ppnet, "theta_head"):
                     param_groups.append({"params": ppnet.theta_head.parameters(), "lr": cfg.lr_mlp})
                 if hasattr(ppnet, "a_head"):
                     param_groups.append({"params": ppnet.a_head.parameters(), "lr": cfg.lr_mlp})
+
+        for decoder in decoders:
+            dec_params = [p for p in decoder.parameters() if p.requires_grad]
+            if dec_params:
+                param_groups.append({
+                    "params": dec_params,
+                    "lr": cfg.lr_decoder_boundary,
+                })
+           
 
         return torch.optim.Adam(param_groups)
 
@@ -1791,7 +1838,7 @@ class NN_Trainer:
         ]
 
         # intializing the optimizer and set parameters to be trained - learining rate scheduling 
-        opt = self._build_optimizer(ppnets)
+        opt = self._build_optimizer(ppnets,decoders)
         raw_milestones = getattr(cfg, "scheduler_milestones", None)
         if raw_milestones is None:
             milestones = []
@@ -1934,8 +1981,8 @@ class NN_Trainer:
     eps=cfg.gate_eps,
 )
 
-                    theta_i = pred_i["theta"][0] if (cfg.use_anisotropy and "theta" in pred_i) else None
-                    a_raw_i = pred_i["a_raw"][0] if (cfg.use_anisotropy and "a_raw" in pred_i) else None
+                    theta_i = pred_i["theta"][0] if (cfg.use_Metric_anisotropy and "theta" in pred_i) else None
+                    a_raw_i = pred_i["a_raw"][0] if (cfg.use_Metric_anisotropy and "a_raw" in pred_i) else None
 
                     if gates_i is not None:
                         gate_count_loss_i = self.gate_count_loss(
@@ -2125,6 +2172,7 @@ class NN_Trainer:
                         eps=cfg.eps,
                     )
                     vol_frac_eff = (rho * A_v).sum() / (A_v.sum() + cfg.eps)
+                    
 
                 # ----------------------------------------------------
                 # FEM loss
@@ -2217,19 +2265,21 @@ class NN_Trainer:
                     grad_clip_norm = getattr(cfg, "grad_clip_norm", None)
                     if grad_clip_norm is not None and grad_clip_norm > 0:
                         params = []
-                        #Collects all trainable parameters across all faces
                         for ppnet in ppnets:
                             params.extend([p for p in ppnet.parameters() if p.requires_grad])
-                        #If gradients are too large → scales them down
+                        for decoder in decoders:
+                            params.extend([p for p in decoder.parameters() if p.requires_grad])
+
                         if params:
                             torch.nn.utils.clip_grad_norm_(params, max_norm=grad_clip_norm)
 
-                    for fi, ppnet in enumerate(ppnets):
-                        for pn, p in ppnet.named_parameters():
+                    for fi, decoder in enumerate(decoders):
+                        for pn, p in decoder.named_parameters():
                             if p.grad is not None and not torch.isfinite(p.grad).all():
                                 raise RuntimeError(
-                                    f"Non-finite gradient before opt.step(): face={fi}, param={pn}"
+                                    f"Non-finite decoder gradient before opt.step(): face={fi}, param={pn}"
                                 )
+                                
 
                     opt.step()
 
