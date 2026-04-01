@@ -3,6 +3,7 @@ import math
 import os
 from datetime import datetime
 
+import cv2
 import torch
 from torch.utils.tensorboard import SummaryWriter
 from Utils.TimelapseRecorder import TimelapseRecorder
@@ -1238,6 +1239,47 @@ class NN_Trainer:
         return torch.cat(mins, dim=0)
 
     @staticmethod
+    def _estimate_uv_mask_tol(
+        uv_face: torch.Tensor,
+        u_periodic: bool = False,
+        v_periodic: bool = False,
+        fallback: float = 0.05,
+        scale: float = 2.5,
+        max_points: int = 2048,
+        chunk_size: int = 512,
+    ) -> float:
+        if uv_face.shape[0] < 2:
+            return float(fallback)
+
+        uv_cpu = uv_face.detach().to(device="cpu")
+        n = uv_cpu.shape[0]
+        if n > max_points:
+            sample_idx = torch.linspace(0, n - 1, max_points).round().long()
+            uv_cpu = uv_cpu[sample_idx]
+            n = uv_cpu.shape[0]
+
+        min_vals = []
+        for start in range(0, n, chunk_size):
+            q = uv_cpu[start:start + chunk_size]
+            diff = q.unsqueeze(1) - uv_cpu.unsqueeze(0)
+            if u_periodic:
+                du = diff[..., 0]
+                diff[..., 0] = du - torch.round(du)
+            if v_periodic:
+                dv = diff[..., 1]
+                diff[..., 1] = dv - torch.round(dv)
+
+            dist = torch.norm(diff, dim=-1)
+            rows = q.shape[0]
+            dist[torch.arange(rows), start:start + rows] = float("inf")
+            min_vals.append(dist.min(dim=1).values)
+
+        spacing = torch.cat(min_vals, dim=0).median()
+        if not torch.isfinite(spacing):
+            return float(fallback)
+        return float(max(scale * float(spacing.item()), 1e-6))
+
+    @staticmethod
     def _wrapped_grid_next(idx, size, periodic):
         nxt = idx + 1
         if periodic:
@@ -1299,28 +1341,11 @@ class NN_Trainer:
             uv_grid, _u_lin, _v_lin = self._build_face_uv_grid(ft, grid_res_u, grid_res_v)
 
             if uv_mask_tol is None:
-                if uv_face.shape[0] >= 2:
-                    d_self = torch.cdist(uv_face, uv_face)
-                    if u_periodic:
-                        du = uv_face[:, None, 0] - uv_face[None, :, 0]
-                        d_self = torch.sqrt(
-                            (du - torch.round(du)).pow(2)
-                            + (uv_face[:, None, 1] - uv_face[None, :, 1]).pow(2)
-                        )
-                    if v_periodic:
-                        dv = uv_face[:, None, 1] - uv_face[None, :, 1]
-                        du = uv_face[:, None, 0] - uv_face[None, :, 0]
-                        if u_periodic:
-                            du = du - torch.round(du)
-                        d_self = torch.sqrt(
-                            du.pow(2) + (dv - torch.round(dv)).pow(2)
-                        )
-                    big = torch.eye(uv_face.shape[0], device=device, dtype=d_self.dtype) * 1e6
-                    d_self = d_self + big
-                    spacing = d_self.min(dim=1).values.median()
-                    uv_mask_tol_i = float((2.5 * spacing).detach().item())
-                else:
-                    uv_mask_tol_i = 0.05
+                uv_mask_tol_i = self._estimate_uv_mask_tol(
+                    uv_face=uv_face,
+                    u_periodic=u_periodic,
+                    v_periodic=v_periodic,
+                )
             else:
                 uv_mask_tol_i = uv_mask_tol
 
@@ -1347,6 +1372,8 @@ class NN_Trainer:
             xyz_dense = geom["points_xyz"][valid_mask]
             Xu_dense = geom["Xu"][valid_mask]
             Xv_dense = geom["Xv"][valid_mask]
+            mask_dense_valid = torch.zeros_like(mask_dense_prefilter, dtype=torch.bool)
+            mask_dense_valid[mask_dense_prefilter] = valid_mask
 
             local_face_id = torch.zeros(
                 uv_dense.shape[0], dtype=torch.long, device=device
@@ -1371,6 +1398,7 @@ class NN_Trainer:
                 "boundary_uv": boundary_uv_i,
                 "boundary_face_id": boundary_face_id_i,
                 "mask_dense_prefilter": mask_dense_prefilter,
+                "mask_dense_valid": mask_dense_valid,
                 "grid_shape": (grid_res_u, grid_res_v),
             })
 
@@ -1403,7 +1431,7 @@ class NN_Trainer:
             "xyz_dense": render_cache["xyz_dense"],
             "rho_dense": decoder_out["rho"],
             "grid_shape": render_cache["grid_shape"],
-            "mask_dense_prefilter": render_cache["mask_dense_prefilter"],
+            "mask_dense_valid": render_cache["mask_dense_valid"],
         }
     def _render_current_cad_frame_cached(
         self,
@@ -1431,7 +1459,7 @@ class NN_Trainer:
             xyz = out["xyz_dense"].detach().cpu().numpy()
             rho_dense = out["rho_dense"].detach().cpu().numpy()
             Nu, Nv = out["grid_shape"]
-            mask = out["mask_dense_prefilter"].cpu().numpy()
+            mask = out["mask_dense_valid"].cpu().numpy()
 
             full_indices = -np.ones(mask.shape[0], dtype=int)
             full_indices[mask] = np.arange(mask.sum())
@@ -1486,11 +1514,50 @@ class NN_Trainer:
                 opacity=0.45,
             )
 
-        plotter.view_isometric()
         plotter.show_axes()
-        img = plotter.screenshot(return_img=True)
+        plotter.reset_camera()
+
+        view_specs = [
+            ("xy", lambda pl: pl.view_xy()),
+            ("xz", lambda pl: pl.view_xz()),
+            ("yz", lambda pl: pl.view_yz()),
+        ]
+
+        upper_row_imgs = []
+        for _name, set_view in view_specs:
+            set_view(plotter)
+            plotter.reset_camera()
+            try:
+                plotter.camera.tight(view="xy", adjust_render_window=False)
+            except Exception:
+                pass
+            upper_row_imgs.append(plotter.screenshot(return_img=True))
+
+        plotter.view_isometric()
+        plotter.reset_camera()
+        try:
+            plotter.camera.tight(view="xy", adjust_render_window=False)
+        except Exception:
+            pass
+        main_view_img = plotter.screenshot(return_img=True)
+
         plotter.close()
-        return img
+
+        top_h = min(img.shape[0] for img in upper_row_imgs)
+        top_imgs = []
+        for img in upper_row_imgs:
+            h, w = img.shape[:2]
+            new_w = max(1, int(round(w * (top_h / h))))
+            top_imgs.append(img if h == top_h else cv2.resize(img, (new_w, top_h)))
+        top_row = np.hstack(top_imgs)
+
+        bottom_h, bottom_w = main_view_img.shape[:2]
+        target_bottom_w = top_row.shape[1]
+        if bottom_w != target_bottom_w:
+            target_bottom_h = max(1, int(round(bottom_h * (target_bottom_w / bottom_w))))
+            main_view_img = cv2.resize(main_view_img, (target_bottom_w, target_bottom_h))
+
+        return np.vstack([top_row, main_view_img])
     def _gate_activity_stats(
     self,
     gate_probs: torch.Tensor | None,
@@ -1704,29 +1771,11 @@ class NN_Trainer:
         #    Helps avoid querying huge empty regions on trimmed faces.
         # ------------------------------------------------------------
         if uv_mask_tol is None:
-            if uv_face.shape[0] >= 2:
-                d_self = torch.cdist(uv_face, uv_face)
-                if u_periodic:
-                    du = uv_face[:, None, 0] - uv_face[None, :, 0]
-                    d_self = d_self.clone()
-                    d_self = torch.sqrt(
-                        (du - torch.round(du)).pow(2)
-                        + (uv_face[:, None, 1] - uv_face[None, :, 1]).pow(2)
-                    )
-                if v_periodic:
-                    dv = uv_face[:, None, 1] - uv_face[None, :, 1]
-                    du = uv_face[:, None, 0] - uv_face[None, :, 0]
-                    if u_periodic:
-                        du = du - torch.round(du)
-                    d_self = torch.sqrt(
-                        du.pow(2) + (dv - torch.round(dv)).pow(2)
-                    )
-                big = torch.eye(uv_face.shape[0], device=device, dtype=d_self.dtype) * 1e6
-                d_self = d_self + big
-                spacing = d_self.min(dim=1).values.median()
-                uv_mask_tol = float((2.5 * spacing).detach().item())
-            else:
-                uv_mask_tol = 0.05
+            uv_mask_tol = self._estimate_uv_mask_tol(
+                uv_face=uv_face,
+                u_periodic=u_periodic,
+                v_periodic=v_periodic,
+            )
 
         dmin = self._periodic_uv_min_dist(
             uv_grid,
@@ -1766,6 +1815,8 @@ class NN_Trainer:
         xyz_dense = geom["points_xyz"][valid_mask]
         Xu_dense = geom["Xu"][valid_mask]
         Xv_dense = geom["Xv"][valid_mask]
+        mask_dense_valid = torch.zeros_like(mask_dense_prefilter, dtype=torch.bool)
+        mask_dense_valid[mask_dense_prefilter] = valid_mask
 
         # ------------------------------------------------------------
         # 4) Boundary data for decoder
@@ -1852,6 +1903,7 @@ class NN_Trainer:
             "fiber3d_dense": decoder_out["fiber3d"],
             "edge_field_dense": decoder_out["edge_field"],
             "mask_dense_prefilter": mask_dense_prefilter,
+            "mask_dense_valid": mask_dense_valid,
             "grid_shape": (grid_res_u, grid_res_v),
         }
    
@@ -2101,7 +2153,7 @@ class NN_Trainer:
             Nu, Nv = face_data["grid_shape"]
 
             # We need full grid mapping
-            mask = face_data["mask_dense_prefilter"].cpu().numpy()
+            mask = face_data["mask_dense_valid"].cpu().numpy()
 
             # Build full grid index map
             full_indices = -np.ones(mask.shape[0], dtype=int)
