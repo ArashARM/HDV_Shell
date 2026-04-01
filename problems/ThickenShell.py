@@ -6,7 +6,10 @@ import plotly.graph_objects as go
 import plotly.io as pio
 pio.renderers.default = "browser"
 import pyvista as pv
-pv.set_jupyter_backend("trame")
+try:
+    pv.set_jupyter_backend("trame")
+except Exception:
+    pass
 import torch
 
 from .problemBase import problemBase

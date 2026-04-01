@@ -16,6 +16,8 @@ try:
 except Exception:
     pass
 
+import matplotlib.pyplot as plt
+
 
 @dataclass
 class TrainingConfig:
@@ -27,14 +29,12 @@ class TrainingConfig:
     boundary_margin: float = 0.05
     freeze_w: bool = False
     use_boundary_attachment: bool = True
+    boundary_volume_assist: float = 0.10
 
+    # boundary defaults / fallback values used by decoder if PPNet does not predict them
     boundary_attach_width: float = 0.03
     boundary_attach_beta: float = 0.01
     boundary_attach_alpha: float = 0.35
-
-    train_boundary_attach_width: bool = True
-    train_boundary_attach_alpha: bool = True
-    train_boundary_attach_beta: bool = False
 
     boundary_attach_width_min: float = 0.005
     boundary_attach_width_max: float = 0.10
@@ -45,13 +45,25 @@ class TrainingConfig:
     boundary_attach_beta_min: float = 0.003
     boundary_attach_beta_max: float = 0.05
 
-    lr_decoder_boundary: float = 5e-4
+    # pair-gating bounds
+    gap_thr_min: float = 0.00
+    gap_thr_max: float = 0.50
+    big_thr_min: float = 0.00
+    big_thr_max: float = 0.60
+    alpha_min: float = 0.01
+    alpha_max: float = 0.20
+    eta_min: float = 0.01
+    eta_max: float = 0.20
+
+    gap_thr_default: float = 0.15
+    big_thr_default: float = 0.10
+    alpha_default: float = 0.05
+    eta_default: float = 0.05
 
     gate_sharpen_gamma: float = 4.0
 
-
     w_min: float = 0.005
-    w_max: float = 0.5
+    w_max: float = 0.5  # Deprecated: pairwise widths now use 0.8 * seed distance as the upper bound.
 
     lam_fem: float = 1.0
     lam_vol: float = 2.0
@@ -78,6 +90,8 @@ class TrainingConfig:
     lr_mlp: float = 2e-4
     lr_w_head: float = 2e-4
     lr_h_head: float = 2e-4
+    lr_pair_heads: float = 2e-4
+    lr_boundary_heads: float = 2e-4
 
     log_every: int = 50
     early_stop_start: int = 300
@@ -95,12 +109,17 @@ class TrainingConfig:
     lam_gate_binary: float = 0.2
     gate_binary_warmup_steps: int = 40
     gate_warmup_steps: int = 20
-    
+
+    # NEW: PPNet predicts these decoder controls
+    predict_pair_gating: bool = True
+    predict_boundary_width: bool = True
 
     eps: float = 1e-12
 
     use_boundary_weighted_volume: bool = False
     boundary_vol_weight: float = 0.20
+    effective_volume_power: float = 2.0
+    lam_vol_effective: float = 0.5
 
     Offset_scale: float = 1.00
     scheduler_milestones: tuple[float, ...] = (80, 160)
@@ -115,13 +134,12 @@ class TrainingConfig:
     tb_flush_secs: int = 10
     tb_log_histograms_every: int = 200
 
-    MakeTimelaps : bool = True
+    MakeTimelaps: bool = True
 
-    timelapse_frame_step: int =20
+    timelapse_frame_step: int = 20
     TM_laps_res_u: int = 100
     TM_laps_res_v: int = 100
-    TM_laps_Thr:float = 0.45
-
+    TM_laps_Thr: float = 0.45
 
 class RunningNorm:
     def __init__(self, momentum: float = 0.99, eps: float = 1e-12):
@@ -323,6 +341,18 @@ class NN_Trainer:
             1.0 if row["optimizer_step_skipped"] else 0.0,
             step,
         )
+        self._tb_add_scalar("Geometry/HMean", row["h_mean"], step)
+        self._tb_add_scalar("PairGating/GapThr", row["gap_thr_mean"], step)
+        self._tb_add_scalar("PairGating/BigThr", row["big_thr_mean"], step)
+        self._tb_add_scalar("PairGating/Alpha", row["alpha_mean"], step)
+        self._tb_add_scalar("PairGating/Eta", row["eta_mean"], step)
+
+        self._tb_add_scalar("Boundary/Width", row["boundary_width_mean"], step)
+        self._tb_add_scalar("Boundary/Alpha", row["boundary_alpha_mean"], step)
+        self._tb_add_scalar("Boundary/Beta", row["boundary_beta_mean"], step)
+
+        self._tb_add_scalar("Metric/ThetaMean", row["theta_mean"], step)
+        self._tb_add_scalar("Metric/AMean", row["a_metric_mean"], step)
 
         self._tb_add_scalar("gate/active_count_total", row["active_count_total"], step)
         self._tb_add_scalar("gate/active_count_mean", row["active_count_mean"], step)
@@ -358,9 +388,53 @@ class NN_Trainer:
             w_geo_vals = []
             for p in pred_list:
                 if "w_geo" in p and p["w_geo"] is not None:
-                    w_geo_vals.append(p["w_geo"].reshape(-1))
+                    w_geo_vals.append(self._pair_upper_values(p["w_geo"]))
             if len(w_geo_vals) > 0:
                 self._tb_add_histogram("Geometry/WGeo", torch.cat(w_geo_vals, dim=0), step)
+            
+            gap_thr_vals = []
+            big_thr_vals = []
+            alpha_vals = []
+            eta_vals = []
+            bw_vals = []
+            ba_vals = []
+            bb_vals = []
+            h_vals = []
+            theta_vals = []
+            a_vals = []
+
+            for p in pred_list:
+                if "gap_thr" in p and p["gap_thr"] is not None:
+                    gap_thr_vals.append(p["gap_thr"].reshape(-1))
+                if "big_thr" in p and p["big_thr"] is not None:
+                    big_thr_vals.append(p["big_thr"].reshape(-1))
+                if "alpha" in p and p["alpha"] is not None:
+                    alpha_vals.append(p["alpha"].reshape(-1))
+                if "eta" in p and p["eta"] is not None:
+                    eta_vals.append(p["eta"].reshape(-1))
+                if "boundary_width" in p and p["boundary_width"] is not None:
+                    bw_vals.append(p["boundary_width"].reshape(-1))
+                if "boundary_alpha" in p and p["boundary_alpha"] is not None:
+                    ba_vals.append(p["boundary_alpha"].reshape(-1))
+                if "boundary_beta" in p and p["boundary_beta"] is not None:
+                    bb_vals.append(p["boundary_beta"].reshape(-1))
+                if "h" in p and p["h"] is not None:
+                    h_vals.append(p["h"].reshape(-1))
+                if "theta" in p and p["theta"] is not None:
+                    theta_vals.append(p["theta"].reshape(-1))
+                if "a_metric" in p and p["a_metric"] is not None:
+                    a_vals.append(p["a_metric"].reshape(-1))
+
+            if gap_thr_vals: self._tb_add_histogram("PairGating/GapThrHist", torch.cat(gap_thr_vals, dim=0), step)
+            if big_thr_vals: self._tb_add_histogram("PairGating/BigThrHist", torch.cat(big_thr_vals, dim=0), step)
+            if alpha_vals: self._tb_add_histogram("PairGating/AlphaHist", torch.cat(alpha_vals, dim=0), step)
+            if eta_vals: self._tb_add_histogram("PairGating/EtaHist", torch.cat(eta_vals, dim=0), step)
+            if bw_vals: self._tb_add_histogram("Boundary/WidthHist", torch.cat(bw_vals, dim=0), step)
+            if ba_vals: self._tb_add_histogram("Boundary/AlphaHist", torch.cat(ba_vals, dim=0), step)
+            if bb_vals: self._tb_add_histogram("Boundary/BetaHist", torch.cat(bb_vals, dim=0), step)
+            if h_vals: self._tb_add_histogram("Geometry/HHist", torch.cat(h_vals, dim=0), step)
+            if theta_vals: self._tb_add_histogram("Metric/ThetaHist", torch.cat(theta_vals, dim=0), step)
+            if a_vals: self._tb_add_histogram("Metric/AHist", torch.cat(a_vals, dim=0), step)
 
         if self.last_fem_debug:
             dbg = self.last_fem_debug
@@ -401,6 +475,29 @@ class NN_Trainer:
         vol_frac = (rho * A_v).sum() / (A_v.sum() + eps)
         vol_loss = (vol_frac - target_volfrac) ** 2
         return vol_loss
+
+    @staticmethod
+    def powered_volume_fraction(
+        rho: torch.Tensor,
+        A_v: torch.Tensor,
+        power: float = 2.0,
+        eps: float = 1e-12,
+    ) -> torch.Tensor:
+        rho_eff = rho.clamp(0.0, 1.0).pow(power)
+        return (rho_eff * A_v).sum() / (A_v.sum() + eps)
+
+    @classmethod
+    def volume_loss_powered(
+        cls,
+        rho: torch.Tensor,
+        A_v: torch.Tensor,
+        target_volfrac: float,
+        power: float = 2.0,
+        eps: float = 1e-12,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        vol_frac_eff = cls.powered_volume_fraction(rho=rho, A_v=A_v, power=power, eps=eps)
+        loss = (vol_frac_eff - target_volfrac) ** 2
+        return loss, vol_frac_eff
 
     @staticmethod
     def gate_target_loss(
@@ -759,8 +856,7 @@ class NN_Trainer:
 
     # ------------------------------------------------------------------
     # Model / optimizer builders
-    # ------------------------------------------------------------------
-
+        # ------------------------------------------------------------------
     def _build_single_face_models(
         self,
         device,
@@ -784,7 +880,6 @@ class NN_Trainer:
             face_v_periodic=face_v_periodic,
             use_Metric_anisotropy=use_Metric_anisotropy,
             w_min=self.cfg.w_min,
-            w_max=self.cfg.w_max,
             fixed_height=self.cfg.fixed_height,
 
             use_boundary_attachment=self.cfg.use_boundary_attachment,
@@ -792,18 +887,26 @@ class NN_Trainer:
             boundary_attach_beta=self.cfg.boundary_attach_beta,
             boundary_attach_alpha=self.cfg.boundary_attach_alpha,
 
-            train_boundary_attach_width=self.cfg.train_boundary_attach_width,
-            train_boundary_attach_alpha=self.cfg.train_boundary_attach_alpha,
-            train_boundary_attach_beta=self.cfg.train_boundary_attach_beta,
-
             boundary_attach_width_min=self.cfg.boundary_attach_width_min,
             boundary_attach_width_max=self.cfg.boundary_attach_width_max,
-
             boundary_attach_alpha_min=self.cfg.boundary_attach_alpha_min,
             boundary_attach_alpha_max=self.cfg.boundary_attach_alpha_max,
-
             boundary_attach_beta_min=self.cfg.boundary_attach_beta_min,
             boundary_attach_beta_max=self.cfg.boundary_attach_beta_max,
+
+            use_pair_gating=self.cfg.predict_pair_gating,
+            gap_thr_min=self.cfg.gap_thr_min,
+            gap_thr_max=self.cfg.gap_thr_max,
+            big_thr_min=self.cfg.big_thr_min,
+            big_thr_max=self.cfg.big_thr_max,
+            alpha_min=self.cfg.alpha_min,
+            alpha_max=self.cfg.alpha_max,
+            eta_min=self.cfg.eta_min,
+            eta_max=self.cfg.eta_max,
+            gap_thr_default=self.cfg.gap_thr_default,
+            big_thr_default=self.cfg.big_thr_default,
+            alpha_default=self.cfg.alpha_default,
+            eta_default=self.cfg.eta_default,
         ).to(device)
 
         ppnet = self.ppnet_cls(
@@ -812,6 +915,8 @@ class NN_Trainer:
             use_Metric_anisotropy=use_Metric_anisotropy,
             predict_height=(self.cfg.fixed_height is None),
             use_gating=self.cfg.use_gating,
+            predict_pair_gating=self.cfg.predict_pair_gating,
+            predict_boundary_width=self.cfg.predict_boundary_width,
             freeze_w=freeze_w,
         ).to(device)
 
@@ -838,7 +943,7 @@ class NN_Trainer:
 
         return decoders, ppnets
 
-    def _build_optimizer(self, ppnets,decoders):
+    def _build_optimizer(self, ppnets, decoders):
         cfg = self.cfg
         param_groups = []
 
@@ -847,11 +952,14 @@ class NN_Trainer:
                 {"params": ppnet.seed_refine.parameters(), "lr": cfg.lr_seed_refine},
                 {"params": ppnet.delta_head.parameters(), "lr": cfg.lr_delta_head},
                 {"params": ppnet.mlp.parameters(), "lr": cfg.lr_mlp},
-                {"params": ppnet.w_head.parameters(), "lr": cfg.lr_w_head},
             ])
+
+            if hasattr(ppnet, "w_head"):
+                param_groups.append({"params": ppnet.w_head.parameters(), "lr": cfg.lr_w_head})
 
             if (self.cfg.fixed_height is None) and hasattr(ppnet, "h_head"):
                 param_groups.append({"params": ppnet.h_head.parameters(), "lr": cfg.lr_h_head})
+
             if hasattr(ppnet, "gate_head"):
                 param_groups.append({"params": ppnet.gate_head.parameters(), "lr": cfg.lr_gate_head})
 
@@ -861,17 +969,93 @@ class NN_Trainer:
                 if hasattr(ppnet, "a_head"):
                     param_groups.append({"params": ppnet.a_head.parameters(), "lr": cfg.lr_mlp})
 
-        for decoder in decoders:
-            dec_params = [p for p in decoder.parameters() if p.requires_grad]
-            if dec_params:
+            if cfg.predict_pair_gating:
+                for name in ["gap_thr_head", "big_thr_head", "alpha_head", "eta_head"]:
+                    if hasattr(ppnet, name):
+                        param_groups.append({
+                            "params": getattr(ppnet, name).parameters(),
+                            "lr": cfg.lr_pair_heads,
+                        })
+
+            if cfg.predict_boundary_width and hasattr(ppnet, "boundary_width_head"):
                 param_groups.append({
-                    "params": dec_params,
-                    "lr": cfg.lr_decoder_boundary,
+                    "params": ppnet.boundary_width_head.parameters(),
+                    "lr": cfg.lr_boundary_heads,
                 })
-           
 
         return torch.optim.Adam(param_groups)
 
+    @staticmethod
+    def _pair_upper_values(t: torch.Tensor) -> torch.Tensor:
+        if not isinstance(t, torch.Tensor):
+            raise TypeError("Expected tensor for pair reduction")
+        if t.ndim < 2:
+            return t.reshape(-1)
+
+        mask = torch.triu(
+            torch.ones(t.shape[-2], t.shape[-1], device=t.device, dtype=torch.bool),
+            diagonal=1,
+        )
+        vals = t[..., mask]
+        if vals.numel() == 0:
+            return t.reshape(-1)
+        return vals.reshape(-1)
+    
+    def _collect_decoder_param_logs(self, decoder, pred_i: dict, ref_tensor: torch.Tensor) -> dict:
+        out = {}
+
+        if "w_raw" in pred_i and pred_i["w_raw"] is not None:
+            w_geo = decoder.width(pred_i["w_raw"], seeds=pred_i["seeds_raw"])
+            out["w_geo"] = self._pair_upper_values(w_geo).mean().reshape(())
+
+        if "h_raw" in pred_i and pred_i["h_raw"] is not None:
+            out["h"] = decoder.height(pred_i["h_raw"], ref_tensor=ref_tensor).reshape(())
+
+        if "gap_thr_raw" in pred_i and pred_i["gap_thr_raw"] is not None:
+            out["gap_thr"] = decoder._map_raw_to_range(
+                pred_i["gap_thr_raw"], decoder.gap_thr_min, decoder.gap_thr_max, temp=1.0
+            ).reshape(())
+
+        if "big_thr_raw" in pred_i and pred_i["big_thr_raw"] is not None:
+            out["big_thr"] = decoder._map_raw_to_range(
+                pred_i["big_thr_raw"], decoder.big_thr_min, decoder.big_thr_max, temp=1.0
+            ).reshape(())
+
+        if "alpha_raw" in pred_i and pred_i["alpha_raw"] is not None:
+            out["alpha"] = decoder._map_raw_to_range(
+                pred_i["alpha_raw"], decoder.alpha_min, decoder.alpha_max, temp=1.0
+            ).reshape(())
+
+        if "eta_raw" in pred_i and pred_i["eta_raw"] is not None:
+            out["eta"] = decoder._map_raw_to_range(
+                pred_i["eta_raw"], decoder.eta_min, decoder.eta_max, temp=1.0
+            ).reshape(())
+
+        if "boundary_width_raw" in pred_i and pred_i["boundary_width_raw"] is not None:
+            out["boundary_width"] = decoder.boundary_width(
+                ref_tensor, pred_i["boundary_width_raw"]
+            ).reshape(())
+
+        if "boundary_alpha_raw" in pred_i and pred_i["boundary_alpha_raw"] is not None:
+            out["boundary_alpha"] = decoder.boundary_alpha(
+                ref_tensor, pred_i["boundary_alpha_raw"]
+            ).reshape(())
+
+        if "boundary_beta_raw" in pred_i and pred_i["boundary_beta_raw"] is not None:
+            out["boundary_beta"] = decoder.boundary_beta(
+                ref_tensor, pred_i["boundary_beta_raw"]
+            ).reshape(())
+
+        if "a_raw" in pred_i and pred_i["a_raw"] is not None:
+            a = 0.5 * (2.0 - 0.5) * torch.tanh(pred_i["a_raw"]) + 0.5 * (2.0 + 0.5)
+            out["a_metric"] = a.mean().reshape(())
+
+        if "theta" in pred_i and pred_i["theta"] is not None:
+            out["theta_mean"] = pred_i["theta"].mean().reshape(())
+
+        return out
+    
+    
     def _init_face_seeds(self, face_tensors):
         cfg = self.cfg
         uv_init_list = []
@@ -1128,7 +1312,10 @@ class NN_Trainer:
             big_thr_raw=pred.get("big_thr_raw", None),
             alpha_raw=pred.get("alpha_raw", None),
             eta_raw=pred.get("eta_raw", None),
-            seed_gates = pred.get("gate_probs", None),
+            boundary_width_raw=pred.get("boundary_width_raw", None),
+            boundary_alpha_raw=None,
+            boundary_beta_raw=None,
+            seed_gates=pred.get("gate_probs", None),
         )
 
         return {
@@ -1423,6 +1610,7 @@ class NN_Trainer:
         dtype = ft["uv"].dtype
 
         uv_face = ft["uv"]
+        
 
         # ------------------------------------------------------------
         # 1) Dense UV grid in normalized face UV coordinates
@@ -1522,6 +1710,9 @@ class NN_Trainer:
         alpha_raw = pred.get("alpha_raw", None)
         eta_raw = pred.get("eta_raw", None)
         gates_i = pred.get("gate_probs", None)
+        boundary_width_raw = pred.get("boundary_width_raw", None)
+        boundary_alpha_raw = pred.get("boundary_alpha_raw", None)
+        boundary_beta_raw = pred.get("boundary_beta_raw", None)
 
         # ------------------------------------------------------------
         # 6) Evaluate decoder on CAD-native dense query points
@@ -1543,7 +1734,10 @@ class NN_Trainer:
             big_thr_raw=big_thr_raw,
             alpha_raw=alpha_raw,
             eta_raw=eta_raw,
-            seed_gates =gates_i, 
+            boundary_width_raw=boundary_width_raw,
+            boundary_alpha_raw=None,
+            boundary_beta_raw=None,
+            seed_gates=gates_i,
         )
 
         self._require_decoder_keys(
@@ -1705,11 +1899,12 @@ class NN_Trainer:
         self,
         result,
         shape_or_path=None,
-        thr: float = 0.5,
+        thr: float | str | None = 0.5,
         grid_res_u: int = 120,
         grid_res_v: int = 120,
         uv_mask_tol: float | None = None,
         show_density: bool = True,
+        auto_target_volfrac: float | None = None,
     ):
         import pyvista as pv
         import numpy as np
@@ -1720,6 +1915,47 @@ class NN_Trainer:
             grid_res_u=grid_res_u,
             grid_res_v=grid_res_v,
             uv_mask_tol=uv_mask_tol,
+        )
+
+        # ------------------------------------------------------------
+        # Area-weighted global stats on dense CAD-native samples
+        # ------------------------------------------------------------
+        rho_all = []
+        area_w_all = []
+        for face_data in dense["per_face"]:
+            rho_i = face_data["rho_dense"]
+            Xu_i = face_data["Xu_dense"]
+            Xv_i = face_data["Xv_dense"]
+            area_w_i = torch.linalg.norm(torch.cross(Xu_i, Xv_i, dim=1), dim=1).clamp_min(self.cfg.eps)
+            rho_all.append(rho_i.detach().cpu().numpy())
+            area_w_all.append(area_w_i.detach().cpu().numpy())
+
+        rho_all = np.concatenate(rho_all, axis=0)
+        area_w_all = np.concatenate(area_w_all, axis=0)
+        area_w_sum = float(area_w_all.sum()) + float(self.cfg.eps)
+        volfrac_cont = float((rho_all * area_w_all).sum() / area_w_sum)
+
+        thr_used = thr
+        if thr is None or (isinstance(thr, str) and str(thr).lower() == "auto"):
+            target = self.cfg.target_volfrac if auto_target_volfrac is None else float(auto_target_volfrac)
+            target = float(np.clip(target, 0.0, 1.0))
+
+            # Weighted quantile so that area fraction above threshold ~= target.
+            q = 1.0 - target
+            order = np.argsort(rho_all)
+            rho_s = rho_all[order]
+            w_s = area_w_all[order]
+            cdf = np.cumsum(w_s) / (np.sum(w_s) + float(self.cfg.eps))
+            thr_used = float(np.interp(q, cdf, rho_s))
+        else:
+            thr_used = float(thr)
+
+        volfrac_thr = float(area_w_all[rho_all >= thr_used].sum() / area_w_sum)
+        print(
+            f"[smooth_surface] thr={thr_used:.4f} | "
+            f"volfrac_cont(rho)={volfrac_cont:.4f} | "
+            f"volfrac_thr(binary)={volfrac_thr:.4f} | "
+            f"target={self.cfg.target_volfrac:.4f}"
         )
 
         plotter = pv.Plotter()
@@ -1760,11 +1996,11 @@ class NN_Trainer:
                     i0, i1, i2, i3 = mapped
 
                     # triangle 1
-                    if rho[i0] >= thr and rho[i1] >= thr and rho[i2] >= thr:
+                    if rho[i0] >= thr_used and rho[i1] >= thr_used and rho[i2] >= thr_used:
                         faces.append([3, i0, i1, i2])
 
                     # triangle 2
-                    if rho[i2] >= thr and rho[i1] >= thr and rho[i3] >= thr:
+                    if rho[i2] >= thr_used and rho[i1] >= thr_used and rho[i3] >= thr_used:
                         faces.append([3, i2, i1, i3])
 
             if len(faces) == 0:
@@ -1779,11 +2015,284 @@ class NN_Trainer:
                 plotter.add_mesh(mesh, scalars="rho", cmap="viridis", clim=[0, 1])
             else:
                 plotter.add_mesh(mesh, color="lightblue")
-
-
         plotter.show()
+        return {
+            "thr_used": float(thr_used),
+            "volfrac_cont": float(volfrac_cont),
+            "volfrac_thr": float(volfrac_thr),
+            "dense": dense,
+        }
 
+    def visualize_boundary_attachment_debug(
+        self,
+        result: dict,
+        shape_or_path=None,
+        face_index: int = 0,
+        grid_res_u: int = 180,
+        grid_res_v: int = 180,
+        uv_mask_tol: float | None = None,
+    ):
+        """
+        Debug boundary attachment on a single face:
+        1) boundary samples in UV
+        2) dmin to boundary samples
+        3) decoder boundary field rho_b
+        """
+        import matplotlib.pyplot as plt
 
+        face_tensors = result["face_tensors"]
+        decoders = result["decoders"]
+        pred_list = result["best_pred"]
+
+        if not (0 <= face_index < len(face_tensors)):
+            raise IndexError(f"face_index out of range: {face_index} not in [0, {len(face_tensors)-1}]")
+
+        if shape_or_path is None:
+            shape_or_path = result.get("shape_path", None)
+        if shape_or_path is None:
+            raise ValueError("shape_or_path is required (pass explicitly or store in result['shape_path']).")
+
+        ft = face_tensors[face_index]
+        decoder = decoders[face_index]
+        face_id = ft["face_id"]
+
+        pred_by_face_id = {p["face_id"]: p for p in pred_list}
+        if face_id not in pred_by_face_id:
+            raise KeyError(f"Missing best_pred for face_id={face_id}")
+        pred = pred_by_face_id[face_id]
+
+        sampled = self.sample_face_field_for_visualization(
+            ft=ft,
+            decoder=decoder,
+            pred=pred,
+            shape_or_path=shape_or_path,
+            grid_res_u=grid_res_u,
+            grid_res_v=grid_res_v,
+            uv_mask_tol=uv_mask_tol,
+            use_boundary_attachment=True,
+        )
+
+        uv_dense = sampled["uv_dense"]
+        rho_b = sampled["rho_b_dense"]
+
+        bidx = self._true_open_boundary_idx(ft)
+        if bidx.numel() > 0:
+            boundary_uv = ft["uv"][bidx]
+            dmin = torch.cdist(uv_dense, boundary_uv).amin(dim=1)
+        else:
+            boundary_uv = None
+            dmin = torch.full(
+                (uv_dense.shape[0],),
+                float("nan"),
+                dtype=uv_dense.dtype,
+                device=uv_dense.device,
+            )
+
+        uv_np = uv_dense.detach().cpu().numpy()
+        rho_b_np = rho_b.detach().cpu().numpy()
+        dmin_np = dmin.detach().cpu().numpy()
+        bnd_np = None if boundary_uv is None else boundary_uv.detach().cpu().numpy()
+
+        fig, axes = plt.subplots(1, 3, figsize=(15, 4.8), constrained_layout=True)
+
+        axes[0].scatter(uv_np[:, 0], uv_np[:, 1], s=2, c="lightgray", alpha=0.7)
+        if bnd_np is not None and len(bnd_np) > 0:
+            axes[0].scatter(bnd_np[:, 0], bnd_np[:, 1], s=10, c="red")
+        axes[0].set_title(f"Face {face_id}: Boundary UV samples")
+        axes[0].set_xlabel("u")
+        axes[0].set_ylabel("v")
+        axes[0].set_aspect("equal")
+
+        sc1 = axes[1].scatter(uv_np[:, 0], uv_np[:, 1], c=dmin_np, s=3, cmap="viridis")
+        axes[1].set_title("dmin to boundary")
+        axes[1].set_xlabel("u")
+        axes[1].set_ylabel("v")
+        axes[1].set_aspect("equal")
+        fig.colorbar(sc1, ax=axes[1], fraction=0.046, pad=0.04)
+
+        sc2 = axes[2].scatter(uv_np[:, 0], uv_np[:, 1], c=rho_b_np, s=3, cmap="magma", vmin=0.0, vmax=1.0)
+        axes[2].set_title("rho_b (boundary field)")
+        axes[2].set_xlabel("u")
+        axes[2].set_ylabel("v")
+        axes[2].set_aspect("equal")
+        fig.colorbar(sc2, ax=axes[2], fraction=0.046, pad=0.04)
+
+        # Robust display across notebook/non-interactive backends.
+        shown = False
+        try:
+            from IPython.display import display
+            display(fig)
+            shown = True
+        except Exception:
+            shown = False
+
+        if not shown:
+            import os
+            os.makedirs("debug_plots", exist_ok=True)
+            out_path = os.path.join("debug_plots", f"boundary_debug_face_{face_id}.png")
+            fig.savefig(out_path, dpi=180, bbox_inches="tight")
+            print(f"Saved debug figure to: {out_path}")
+
+        plt.close(fig)
+
+        finite_dmin = torch.isfinite(dmin)
+        dmin_min = float(dmin[finite_dmin].min().item()) if bool(finite_dmin.any().item()) else float("nan")
+        dmin_mean = float(dmin[finite_dmin].mean().item()) if bool(finite_dmin.any().item()) else float("nan")
+        dmin_max = float(dmin[finite_dmin].max().item()) if bool(finite_dmin.any().item()) else float("nan")
+
+        print(
+            f"[Face {face_id}] "
+            f"boundary_pts={0 if boundary_uv is None else int(boundary_uv.shape[0])} | "
+            f"dmin(min/mean/max)=({dmin_min:.3e}/{dmin_mean:.3e}/{dmin_max:.3e}) | "
+            f"rho_b(min/mean/max)=({float(rho_b.min().item()):.3e}/{float(rho_b.mean().item()):.3e}/{float(rho_b.max().item()):.3e})"
+        )
+
+        return {
+            "face_id": face_id,
+            "uv_dense": uv_dense,
+            "boundary_uv": boundary_uv,
+            "dmin": dmin,
+            "rho_b": rho_b,
+            "sampled": sampled,
+        }
+
+    def report_threshold_sweep(
+        self,
+        result: dict,
+        shape_or_path=None,
+        thr_values=None,
+        target_volfrac: float | None = None,
+        volfrac_tol: float = 0.03,
+        min_boundary_coverage: float = 0.95,
+    ):
+        """
+        Sweep thresholds and report:
+        - binary volume fraction (area-weighted)
+        - boundary coverage (fraction of boundary samples classified solid)
+
+        Selection rule:
+        - among thresholds with boundary_coverage >= min_boundary_coverage and
+          abs(volfrac_thr - target) <= volfrac_tol, pick the smallest threshold.
+        - if none satisfies both, pick threshold with boundary coverage >= minimum
+          and closest volume to target.
+        - if still none, pick closest-volume threshold overall.
+        """
+        import numpy as np
+
+        if thr_values is None:
+            thr_values = np.linspace(0.05, 0.50, 19)
+        thr_values = [float(t) for t in thr_values]
+
+        dense = self.sample_result_field_dense_for_visualization(
+            result=result,
+            shape_or_path=shape_or_path,
+            grid_res_u=300,
+            grid_res_v=300,
+            uv_mask_tol=None,
+            use_best_pred=True,
+        )
+
+        face_tensors = result["face_tensors"]
+        eps = float(self.cfg.eps)
+
+        # global area-weighted continuous volume fraction
+        rho_all = []
+        area_all = []
+        for face_data in dense["per_face"]:
+            rho_i = face_data["rho_dense"]
+            Xu_i = face_data["Xu_dense"]
+            Xv_i = face_data["Xv_dense"]
+            area_i = torch.linalg.norm(torch.cross(Xu_i, Xv_i, dim=1), dim=1).clamp_min(self.cfg.eps)
+            rho_all.append(rho_i.detach().cpu().numpy())
+            area_all.append(area_i.detach().cpu().numpy())
+        rho_all = np.concatenate(rho_all, axis=0)
+        area_all = np.concatenate(area_all, axis=0)
+        area_sum = float(area_all.sum()) + eps
+        volfrac_cont = float((rho_all * area_all).sum() / area_sum)
+
+        target = self.cfg.target_volfrac if target_volfrac is None else float(target_volfrac)
+
+        rows = []
+        for thr in thr_values:
+            # area-weighted binary volume fraction
+            volfrac_thr = float(area_all[rho_all >= thr].sum() / area_sum)
+
+            # boundary coverage: nearest dense point to each boundary sample
+            bcov_faces = []
+            for ft, face_data in zip(face_tensors, dense["per_face"]):
+                bidx = self._true_open_boundary_idx(ft)
+                if bidx.numel() == 0:
+                    continue
+
+                boundary_uv = ft["uv"][bidx]
+                uv_dense = face_data["uv_dense"]
+                rho_dense = face_data["rho_dense"]
+
+                if uv_dense.numel() == 0:
+                    continue
+
+                d = torch.cdist(boundary_uv, uv_dense)
+                nn = d.argmin(dim=1)
+                cov = (rho_dense[nn] >= thr).float().mean()
+                bcov_faces.append(float(cov.detach().item()))
+
+            boundary_cov = float(np.mean(bcov_faces)) if len(bcov_faces) > 0 else float("nan")
+            vol_err = abs(volfrac_thr - target)
+
+            rows.append({
+                "thr": float(thr),
+                "volfrac_thr": volfrac_thr,
+                "vol_err": float(vol_err),
+                "boundary_cov": boundary_cov,
+            })
+
+        # Acceptable candidates
+        acceptable = [
+            r for r in rows
+            if (not np.isnan(r["boundary_cov"]))
+            and (r["boundary_cov"] >= min_boundary_coverage)
+            and (r["vol_err"] <= volfrac_tol)
+        ]
+
+        if len(acceptable) > 0:
+            best = min(acceptable, key=lambda r: r["thr"])
+            reason = "smallest thr meeting boundary+volume criteria"
+        else:
+            boundary_ok = [
+                r for r in rows
+                if (not np.isnan(r["boundary_cov"])) and (r["boundary_cov"] >= min_boundary_coverage)
+            ]
+            if len(boundary_ok) > 0:
+                best = min(boundary_ok, key=lambda r: (r["vol_err"], r["thr"]))
+                reason = "closest volume among boundary-acceptable thresholds"
+            else:
+                best = min(rows, key=lambda r: (r["vol_err"], r["thr"]))
+                reason = "closest volume overall (boundary criterion unmet)"
+
+        print(
+            f"[thr_sweep] target={target:.4f} | volfrac_cont={volfrac_cont:.4f} | "
+            f"min_boundary_cov={min_boundary_coverage:.3f} | vol_tol={volfrac_tol:.3f}"
+        )
+        print("thr\tvolfrac_thr\tvol_err\tboundary_cov")
+        for r in rows:
+            bc = r["boundary_cov"]
+            bc_s = "nan" if np.isnan(bc) else f"{bc:.4f}"
+            print(f"{r['thr']:.4f}\t{r['volfrac_thr']:.4f}\t{r['vol_err']:.4f}\t{bc_s}")
+        print(
+            f"[thr_sweep] selected_thr={best['thr']:.4f} | "
+            f"volfrac_thr={best['volfrac_thr']:.4f} | "
+            f"boundary_cov={best['boundary_cov']:.4f} | reason={reason}"
+        )
+
+        return {
+            "rows": rows,
+            "selected": best,
+            "reason": reason,
+            "target_volfrac": float(target),
+            "volfrac_cont": float(volfrac_cont),
+            "min_boundary_coverage": float(min_boundary_coverage),
+            "volfrac_tol": float(volfrac_tol),
+        }
 
     def train(self, shape_path, face_tensors):
         cfg = self.cfg
@@ -1791,7 +2300,7 @@ class NN_Trainer:
         # validate the input shape tensors before training
         self._validate_face_tensors(face_tensors)
 
-        # Assiging device and data type used during training process
+        # Assign device and data type used during training process
         ref_uv = face_tensors[0]["uv"]
         device = ref_uv.device
         dtype = ref_uv.dtype
@@ -1804,11 +2313,8 @@ class NN_Trainer:
         # ------------------------------------------------------------
         # Build global vertex areas
         # ------------------------------------------------------------
-        # A 1D zeroes tensor (vector) with vertices_number 
         A_v = torch.zeros((vertices_number,), dtype=dtype, device=device)
-        # per-face vertex areas
         local_vertex_areas = []
-        # per-face total area
         local_face_weights = []
 
         for ft in face_tensors:
@@ -1826,10 +2332,8 @@ class NN_Trainer:
         # ------------------------------------------------------------
         # Build models / optimizer / scheduler
         # ------------------------------------------------------------
-        # Build seperate decoder and NN for each face and store it
         decoders, ppnets = self._build_face_models(face_tensors=face_tensors, device=device)
 
-        #randomize seed points on each face uniformly sampled
         uv_init_list = self._init_face_seeds(face_tensors)
 
         contexts = [
@@ -1837,16 +2341,24 @@ class NN_Trainer:
             for _ in face_tensors
         ]
 
-        # intializing the optimizer and set parameters to be trained - learining rate scheduling 
-        opt = self._build_optimizer(ppnets,decoders)
+        opt = self._build_optimizer(ppnets, decoders)
+
         raw_milestones = getattr(cfg, "scheduler_milestones", None)
         if raw_milestones is None:
             milestones = []
-        elif isinstance(raw_milestones, (int, float)):
-            milestones = [int(raw_milestones * cfg.num_steps)]
         else:
-            milestones = [int(p * cfg.num_steps) for p in raw_milestones]
+            raw_seq = [raw_milestones] if isinstance(raw_milestones, (int, float)) else list(raw_milestones)
+            milestones = []
+            for m in raw_seq:
+                m = float(m)
+                # Support both fractional milestones (0..1] and absolute step indices (>1).
+                step_m = int(round(m * cfg.num_steps)) if m <= 1.0 else int(round(m))
+                if 0 < step_m < cfg.num_steps:
+                    milestones.append(step_m)
+            milestones = sorted(set(milestones))
+
         print(f"scheduler_milestones: {milestones}")
+
         scheduler = None
         if getattr(cfg, "scheduler_milestones", None):
             scheduler = torch.optim.lr_scheduler.MultiStepLR(
@@ -1878,7 +2390,6 @@ class NN_Trainer:
         # ------------------------------------------------------------
         # Loss normalizers
         # ------------------------------------------------------------
-        # Tracking average speed instead of instant speed
         norm_vol = RunningNorm()
         norm_rep = RunningNorm()
         norm_bnd = RunningNorm()
@@ -1943,6 +2454,20 @@ class NN_Trainer:
                 strut_edge_terms = []
                 strut_void_terms = []
                 w_geo_terms = []
+                h_terms = []
+
+                gap_thr_terms = []
+                big_thr_terms = []
+                alpha_terms = []
+                eta_terms = []
+
+                boundary_width_terms = []
+                boundary_alpha_terms = []
+                boundary_beta_terms = []
+
+                theta_mean_terms = []
+                a_metric_terms = []
+
                 gate_terms = []
                 gate_binary_terms = []
                 face_weights_this_step = []
@@ -1970,19 +2495,31 @@ class NN_Trainer:
 
                     seeds_raw_i = pred_i["seeds_raw"][0]
                     w_raw_i = pred_i["w_raw"][0]
-                    h_raw_i = None if cfg.fixed_height is not None else pred_i["h_raw"][0]
+
+                    h_raw_i = None
+                    if cfg.fixed_height is None and "h_raw" in pred_i:
+                        h_raw_i = pred_i["h_raw"][0]
 
                     gates_i = pred_i.get("gate_probs", None)
                     gates_i = gates_i[0] if gates_i is not None else None
 
                     gates_struct_i = self.sharpen_gate_probs(
-    gates_i,
-    gamma=cfg.gate_sharpen_gamma,
-    eps=cfg.gate_eps,
-)
+                        gates_i,
+                        gamma=cfg.gate_sharpen_gamma,
+                        eps=cfg.gate_eps,
+                    )
 
                     theta_i = pred_i["theta"][0] if (cfg.use_Metric_anisotropy and "theta" in pred_i) else None
                     a_raw_i = pred_i["a_raw"][0] if (cfg.use_Metric_anisotropy and "a_raw" in pred_i) else None
+
+                    gap_thr_raw_i = pred_i["gap_thr_raw"][0] if ("gap_thr_raw" in pred_i) else None
+                    big_thr_raw_i = pred_i["big_thr_raw"][0] if ("big_thr_raw" in pred_i) else None
+                    alpha_raw_i = pred_i["alpha_raw"][0] if ("alpha_raw" in pred_i) else None
+                    eta_raw_i = pred_i["eta_raw"][0] if ("eta_raw" in pred_i) else None
+
+                    boundary_width_raw_i = pred_i["boundary_width_raw"][0] if ("boundary_width_raw" in pred_i) else None
+                    boundary_alpha_raw_i = None
+                    boundary_beta_raw_i = None
 
                     if gates_i is not None:
                         gate_count_loss_i = self.gate_count_loss(
@@ -1990,8 +2527,10 @@ class NN_Trainer:
                             target_count=cfg.gate_target_count,
                         )
                         gate_terms.append(gate_count_loss_i)
+
                         gate_binary_loss_i = self.gate_binary_loss(gates_i)
                         gate_binary_terms.append(gate_binary_loss_i)
+
                         gate_stats_i = self._gate_activity_stats(
                             gate_probs=gates_i,
                             threshold=cfg.gate_active_threshold,
@@ -2002,7 +2541,6 @@ class NN_Trainer:
                         gate_mean_sum += gate_stats_i["gate_mean"]
                         gate_max_list.append(gate_stats_i["gate_max"])
                         gate_face_count += 1
-
 
                     local_face_id = torch.zeros(ft["uv"].shape[0], dtype=torch.long, device=device)
 
@@ -2030,12 +2568,34 @@ class NN_Trainer:
                         points_face_id=local_face_id,
                         boundary_uv=boundary_uv_i,
                         boundary_face_id=boundary_face_id_i,
+                        gap_thr_raw=gap_thr_raw_i,
+                        big_thr_raw=big_thr_raw_i,
+                        alpha_raw=alpha_raw_i,
+                        eta_raw=eta_raw_i,
+                        boundary_width_raw=boundary_width_raw_i,
+                        boundary_alpha_raw=boundary_alpha_raw_i,
+                        boundary_beta_raw=boundary_beta_raw_i,
                         seed_gates=gates_struct_i,
                     )
 
                     self._require_decoder_keys(
                         decoder_out,
-                        ["seeds", "rho", "fiber3d", "w_geo", "rho_v", "rho_b", "edge_field"],
+                        [
+                            "seeds",
+                            "rho",
+                            "fiber3d",
+                            "w_geo",
+                            "rho_v",
+                            "rho_b",
+                            "edge_field",
+                            "gap_thr",
+                            "big_thr",
+                            "alpha",
+                            "eta",
+                            "boundary_width",
+                            "boundary_alpha",
+                            "boundary_beta",
+                        ],
                     )
 
                     seeds_i = decoder_out["seeds"]
@@ -2045,6 +2605,17 @@ class NN_Trainer:
                     rho_v_i = decoder_out["rho_v"]
                     rho_b_i = decoder_out["rho_b"]
                     edge_field_i = decoder_out["edge_field"]
+
+                    gap_thr_i = decoder_out["gap_thr"]
+                    big_thr_i = decoder_out["big_thr"]
+                    alpha_i = decoder_out["alpha"]
+                    eta_i = decoder_out["eta"]
+
+                    boundary_width_i = decoder_out["boundary_width"]
+                    boundary_alpha_i = decoder_out["boundary_alpha"]
+                    boundary_beta_i = decoder_out["boundary_beta"]
+
+                    h_i = decoder_out["h"]
 
                     for name, t in {
                         "seeds_i": seeds_i,
@@ -2076,15 +2647,41 @@ class NN_Trainer:
                     fiber_wgt[gidx] += w_local
 
                     seeds_list.append(seeds_i)
+
                     pred_list.append({
                         "face_id": ft["face_id"],
-                        "seeds_raw": seeds_raw_i,
-                        "w_raw": w_raw_i,
+                        "seeds_raw": seeds_raw_i.detach().clone(),
+                        "w_raw": w_raw_i.detach().clone(),
                         "h_raw": None if h_raw_i is None else h_raw_i.detach().clone(),
                         "gate_probs": None if gates_i is None else gates_i.detach().clone(),
                         "theta": None if theta_i is None else theta_i.detach().clone(),
                         "a_raw": None if a_raw_i is None else a_raw_i.detach().clone(),
+
+                        "gap_thr_raw": None if gap_thr_raw_i is None else gap_thr_raw_i.detach().clone(),
+                        "big_thr_raw": None if big_thr_raw_i is None else big_thr_raw_i.detach().clone(),
+                        "alpha_raw": None if alpha_raw_i is None else alpha_raw_i.detach().clone(),
+                        "eta_raw": None if eta_raw_i is None else eta_raw_i.detach().clone(),
+
+                        "boundary_width": boundary_width_i.detach().clone() if isinstance(boundary_width_i, torch.Tensor) else boundary_width_i,
+                        "boundary_alpha": boundary_alpha_i.detach().clone() if isinstance(boundary_alpha_i, torch.Tensor) else boundary_alpha_i,
+                        "boundary_beta": boundary_beta_i.detach().clone() if isinstance(boundary_beta_i, torch.Tensor) else boundary_beta_i,
+
                         "w_geo": w_geo_i.detach().clone(),
+                        "h": h_i.detach().clone() if isinstance(h_i, torch.Tensor) else h_i,
+
+                        "gap_thr": gap_thr_i.detach().clone() if isinstance(gap_thr_i, torch.Tensor) else gap_thr_i,
+                        "big_thr": big_thr_i.detach().clone() if isinstance(big_thr_i, torch.Tensor) else big_thr_i,
+                        "alpha": alpha_i.detach().clone() if isinstance(alpha_i, torch.Tensor) else alpha_i,
+                        "eta": eta_i.detach().clone() if isinstance(eta_i, torch.Tensor) else eta_i,
+
+                        "boundary_width_raw": None if boundary_width_raw_i is None else boundary_width_raw_i.detach().clone(),
+                        "boundary_alpha_raw": None,
+                        "boundary_beta_raw": None,
+
+                        "theta_mean": None if theta_i is None else theta_i.mean().detach().clone(),
+                        "a_metric": None if a_raw_i is None else (
+                            0.5 * (2.0 - 0.5) * torch.tanh(a_raw_i) + 0.5 * (2.0 + 0.5)
+                        ).mean().detach().clone(),
                     })
 
                     rep_terms.append(
@@ -2095,6 +2692,7 @@ class NN_Trainer:
                             eps=cfg.eps,
                         )
                     )
+
                     bnd_terms.append(
                         self.boundary_repulsion_term(
                             seeds=seeds_i,
@@ -2105,7 +2703,31 @@ class NN_Trainer:
                         )
                     )
 
-                    w_geo_terms.append(w_geo_i.reshape(()))
+                    w_geo_terms.append(self._pair_upper_values(w_geo_i).mean().reshape(()))
+                    h_terms.append(h_i.reshape(()))
+
+                    if isinstance(gap_thr_i, torch.Tensor) and gap_thr_i.numel() > 0:
+                        gap_thr_terms.append(gap_thr_i.reshape(()))
+                    if isinstance(big_thr_i, torch.Tensor) and big_thr_i.numel() > 0:
+                        big_thr_terms.append(big_thr_i.reshape(()))
+                    if isinstance(alpha_i, torch.Tensor) and alpha_i.numel() > 0:
+                        alpha_terms.append(alpha_i.reshape(()))
+                    if isinstance(eta_i, torch.Tensor) and eta_i.numel() > 0:
+                        eta_terms.append(eta_i.reshape(()))
+
+                    if isinstance(boundary_width_i, torch.Tensor) and boundary_width_i.numel() > 0:
+                        boundary_width_terms.append(boundary_width_i.reshape(()))
+                    if isinstance(boundary_alpha_i, torch.Tensor) and boundary_alpha_i.numel() > 0:
+                        boundary_alpha_terms.append(boundary_alpha_i.reshape(()))
+                    if isinstance(boundary_beta_i, torch.Tensor) and boundary_beta_i.numel() > 0:
+                        boundary_beta_terms.append(boundary_beta_i.reshape(()))
+
+                    if theta_i is not None:
+                        theta_mean_terms.append(theta_i.mean().reshape(()))
+                    if a_raw_i is not None:
+                        a_metric_i = 0.5 * (2.0 - 0.5) * torch.tanh(a_raw_i) + 0.5 * (2.0 + 0.5)
+                        a_metric_terms.append(a_metric_i.mean().reshape(()))
+
                     face_weights_this_step.append(face_weight_i.reshape(()))
 
                     if cfg.lam_strut != 0.0:
@@ -2149,14 +2771,59 @@ class NN_Trainer:
                 loss_strut = self._safe_weighted_mean(strut_terms, face_weights_this_step, dtype, device, cfg.eps)
                 loss_strut_edge = self._safe_weighted_mean(strut_edge_terms, face_weights_this_step, dtype, device, cfg.eps)
                 loss_strut_void = self._safe_weighted_mean(strut_void_terms, face_weights_this_step, dtype, device, cfg.eps)
+
                 w_geo_mean = self._safe_weighted_mean(w_geo_terms, face_weights_this_step, dtype, device, cfg.eps)
+                h_mean = self._safe_weighted_mean(h_terms, face_weights_this_step, dtype, device, cfg.eps)
+
+                gap_thr_mean = self._safe_weighted_mean(gap_thr_terms, face_weights_this_step, dtype, device, cfg.eps)
+                big_thr_mean = self._safe_weighted_mean(big_thr_terms, face_weights_this_step, dtype, device, cfg.eps)
+                alpha_mean = self._safe_weighted_mean(alpha_terms, face_weights_this_step, dtype, device, cfg.eps)
+                eta_mean = self._safe_weighted_mean(eta_terms, face_weights_this_step, dtype, device, cfg.eps)
+
+                boundary_width_mean = self._safe_weighted_mean(boundary_width_terms, face_weights_this_step, dtype, device, cfg.eps)
+                boundary_alpha_mean = self._safe_weighted_mean(boundary_alpha_terms, face_weights_this_step, dtype, device, cfg.eps)
+                boundary_beta_mean = self._safe_weighted_mean(boundary_beta_terms, face_weights_this_step, dtype, device, cfg.eps)
+
+                theta_mean = self._safe_weighted_mean(theta_mean_terms, face_weights_this_step, dtype, device, cfg.eps)
+                a_metric_mean = self._safe_weighted_mean(a_metric_terms, face_weights_this_step, dtype, device, cfg.eps)
+
                 loss_gate = self._safe_weighted_mean(gate_terms, face_weights_this_step, dtype, device, cfg.eps)
                 loss_gate_binary = self._safe_weighted_mean(gate_binary_terms, face_weights_this_step, dtype, device, cfg.eps)
+
                 # ----------------------------------------------------
                 # Volume loss
                 # ----------------------------------------------------
+                vol_frac_total = (rho * A_v).sum() / (A_v.sum() + cfg.eps)
+                vol_frac_v = (rho_v_all * A_v).sum() / (A_v.sum() + cfg.eps)
+                loss_vol_v = self.volume_loss_constant_height(
+                    rho=rho_v_all,
+                    A_v=A_v,
+                    target_volfrac=cfg.target_volfrac,
+                    eps=cfg.eps,
+                )
+                loss_vol_total = self.volume_loss_constant_height(
+                    rho=rho,
+                    A_v=A_v,
+                    target_volfrac=cfg.target_volfrac,
+                    eps=cfg.eps,
+                )
+
+                loss_vol_eff_v, vol_frac_eff = self.volume_loss_powered(
+                    rho=rho_v_all,
+                    A_v=A_v,
+                    target_volfrac=cfg.target_volfrac,
+                    power=cfg.effective_volume_power,
+                    eps=cfg.eps,
+                )
+
+                loss_vol = (
+                    loss_vol_v
+                    + cfg.boundary_volume_assist * loss_vol_total
+                    + cfg.lam_vol_effective * loss_vol_eff_v
+                )
+
                 if cfg.use_boundary_weighted_volume:
-                    loss_vol, vol_frac_eff = self.volume_loss_with_boundary_discount(
+                    loss_vol_base, vol_frac_weighted = self.volume_loss_with_boundary_discount(
                         rho=rho,
                         A_v=A_v,
                         rho_boundary=rho_boundary,
@@ -2164,15 +2831,19 @@ class NN_Trainer:
                         boundary_weight=cfg.boundary_vol_weight,
                         eps=cfg.eps,
                     )
-                else:
-                    loss_vol = self.volume_loss_constant_height(
+                    loss_vol_eff_weighted, vol_frac_eff = self.volume_loss_powered(
                         rho=rho,
-                        A_v=A_v,
+                        A_v=(1.0 - rho_boundary + cfg.boundary_vol_weight * rho_boundary) * A_v,
                         target_volfrac=cfg.target_volfrac,
+                        power=cfg.effective_volume_power,
                         eps=cfg.eps,
                     )
-                    vol_frac_eff = (rho * A_v).sum() / (A_v.sum() + cfg.eps)
-                    
+                    loss_vol = loss_vol_base + cfg.lam_vol_effective * loss_vol_eff_weighted
+                    vol_frac_weighted_cont = vol_frac_weighted
+                else:
+                    vol_frac_weighted_cont = vol_frac_v
+
+
 
                 # ----------------------------------------------------
                 # FEM loss
@@ -2226,9 +2897,9 @@ class NN_Trainer:
                 else:
                     gate_binary_warmup = 1.0
 
-                lam_gate_binary_eff = cfg.lam_gate_binary * gate_binary_warmup    
-
+                lam_gate_binary_eff = cfg.lam_gate_binary * gate_binary_warmup
                 lam_gate_eff = cfg.lam_gate_count * gate_warmup
+
                 L_total = (
                     cfg.lam_vol * (loss_vol / n_vol)
                     + cfg.lam_rep * (loss_rep / n_rep)
@@ -2239,7 +2910,8 @@ class NN_Trainer:
                     L_total = L_total + cfg.lam_strut * (loss_strut / n_strut)
 
                 if cfg.use_gating and lam_gate_eff != 0.0:
-                    L_total = L_total + lam_gate_eff * loss_gate    
+                    L_total = L_total + lam_gate_eff * loss_gate
+
                 if cfg.use_gating and lam_gate_binary_eff != 0.0:
                     L_total = L_total + lam_gate_binary_eff * loss_gate_binary
 
@@ -2255,11 +2927,9 @@ class NN_Trainer:
                 # ----------------------------------------------------
                 # Backprop
                 # ----------------------------------------------------
-                # Reset gradients and put to none instead of zero (save memory and time)
                 opt.zero_grad(set_to_none=True)
 
                 if total_is_finite:
-                    #Computes gradients
                     L_total.backward()
 
                     grad_clip_norm = getattr(cfg, "grad_clip_norm", None)
@@ -2267,19 +2937,8 @@ class NN_Trainer:
                         params = []
                         for ppnet in ppnets:
                             params.extend([p for p in ppnet.parameters() if p.requires_grad])
-                        for decoder in decoders:
-                            params.extend([p for p in decoder.parameters() if p.requires_grad])
-
                         if params:
                             torch.nn.utils.clip_grad_norm_(params, max_norm=grad_clip_norm)
-
-                    for fi, decoder in enumerate(decoders):
-                        for pn, p in decoder.named_parameters():
-                            if p.grad is not None and not torch.isfinite(p.grad).all():
-                                raise RuntimeError(
-                                    f"Non-finite decoder gradient before opt.step(): face={fi}, param={pn}"
-                                )
-                                
 
                     opt.step()
 
@@ -2334,7 +2993,24 @@ class NN_Trainer:
                                 "gate_probs": None if p["gate_probs"] is None else p["gate_probs"].detach().clone(),
                                 "theta": None if p["theta"] is None else p["theta"].detach().clone(),
                                 "a_raw": None if p["a_raw"] is None else p["a_raw"].detach().clone(),
+                                "gap_thr_raw": None if p["gap_thr_raw"] is None else p["gap_thr_raw"].detach().clone(),
+                                "big_thr_raw": None if p["big_thr_raw"] is None else p["big_thr_raw"].detach().clone(),
+                                "alpha_raw": None if p["alpha_raw"] is None else p["alpha_raw"].detach().clone(),
+                                "eta_raw": None if p["eta_raw"] is None else p["eta_raw"].detach().clone(),
+                                "boundary_width_raw": None if p["boundary_width_raw"] is None else p["boundary_width_raw"].detach().clone(),
+                                "boundary_alpha_raw": None if p["boundary_alpha_raw"] is None else p["boundary_alpha_raw"].detach().clone(),
+                                "boundary_beta_raw": None if p["boundary_beta_raw"] is None else p["boundary_beta_raw"].detach().clone(),
                                 "w_geo": p["w_geo"].detach().clone(),
+                                "h": None if p["h"] is None else p["h"].detach().clone(),
+                                "gap_thr": None if p["gap_thr"] is None else p["gap_thr"].detach().clone(),
+                                "big_thr": None if p["big_thr"] is None else p["big_thr"].detach().clone(),
+                                "alpha": None if p["alpha"] is None else p["alpha"].detach().clone(),
+                                "eta": None if p["eta"] is None else p["eta"].detach().clone(),
+                                "boundary_width": None if p["boundary_width"] is None else p["boundary_width"].detach().clone(),
+                                "boundary_alpha": None if p["boundary_alpha"] is None else p["boundary_alpha"].detach().clone(),
+                                "boundary_beta": None if p["boundary_beta"] is None else p["boundary_beta"].detach().clone(),
+                                "theta_mean": None if p["theta_mean"] is None else p["theta_mean"].detach().clone(),
+                                "a_metric": None if p["a_metric"] is None else p["a_metric"].detach().clone(),
                             }
                             for p in pred_list
                         ]
@@ -2363,6 +3039,15 @@ class NN_Trainer:
                     rho_min = float(rho.min().item())
                     rho_mean = float(rho.mean().item())
                     rho_max = float(rho.max().item())
+
+                    rho_boundary_min = float(rho_boundary.min().item())
+                    rho_boundary_mean = float(rho_boundary.mean().item())
+                    rho_boundary_max = float(rho_boundary.max().item())
+
+                    rho_v_min = float(rho_v_all.min().item())
+                    rho_v_mean = float(rho_v_all.mean().item())
+                    rho_v_max = float(rho_v_all.max().item())
+
 
                     g_mean = 0.0
                     g_count = 0
@@ -2396,7 +3081,11 @@ class NN_Trainer:
                         "rho_min": rho_min,
                         "rho_mean": rho_mean,
                         "rho_max": rho_max,
-                        "rho_boundary_mean": float(rho_boundary.mean().detach().item()),
+                        "rho_boundary_min": rho_boundary_min,
+                        "rho_boundary_mean": rho_boundary_mean,
+                        "rho_boundary_max": rho_boundary_max,
+                        "rho_v_min": rho_v_min,
+                        "rho_v_max": rho_v_max,
                         "rho_v_mean": float(rho_v_all.mean().detach().item()),
                         "drho": drho,
                         "dseed": dseed,
@@ -2406,7 +3095,22 @@ class NN_Trainer:
                         "fem_valid": fem_is_valid,
                         "fem_failure_reason": fem_failure_reason,
                         "optimizer_step_skipped": not total_is_finite,
+
                         "w_geo_mean": self._finite_or_default(w_geo_mean),
+                        "h_mean": self._finite_or_default(h_mean),
+
+                        "gap_thr_mean": self._finite_or_default(gap_thr_mean),
+                        "big_thr_mean": self._finite_or_default(big_thr_mean),
+                        "alpha_mean": self._finite_or_default(alpha_mean),
+                        "eta_mean": self._finite_or_default(eta_mean),
+
+                        "boundary_width_mean": self._finite_or_default(boundary_width_mean),
+                        "boundary_alpha_mean": self._finite_or_default(boundary_alpha_mean),
+                        "boundary_beta_mean": self._finite_or_default(boundary_beta_mean),
+
+                        "theta_mean": self._finite_or_default(theta_mean),
+                        "a_metric_mean": self._finite_or_default(a_metric_mean),
+
                         "active_count_total": active_count_total,
                         "active_count_mean": active_count_mean,
                         "active_frac_mean": active_frac_mean,
@@ -2420,7 +3124,9 @@ class NN_Trainer:
                         loss=f"{row['L_total']:.3e}",
                         vol=f"{row['vol_frac_eff']:.3f}",
                         comp=f"{row['comp']:.2e}",
-                        best=f"{best_score:.2e}",
+                        w=f"{row['w_geo_mean']:.3e}",
+                        gap=f"{row['gap_thr_mean']:.3e}",
+                        bw=f"{row['boundary_width_mean']:.3e}",
                         act=f"{active_count_mean:.1f}",
                         fem="OK" if fem_is_valid else "BAD",
                         refresh=False,
@@ -2451,6 +3157,8 @@ class NN_Trainer:
                             title_text=(
                                 f"vol={row['vol_frac']:.4f} | "
                                 f"W={row['w_geo_mean']:.4g} | "
+                                f"gap={row['gap_thr_mean']:.4g} | "
+                                f"bw={row['boundary_width_mean']:.4g} | "
                                 f"Δrho={drho:.2e} Δseed={dseed:.2e} grad_mean={g_mean:.2e} | "
                             ),
                         )
@@ -2486,13 +3194,23 @@ class NN_Trainer:
                             f"vol={row['vol_frac']:.3f} "
                             f"vol_eff={row['vol_frac_eff']:.3f} "
                             f"(/{cfg.target_volfrac:.3f}) "
-                            f"comp={row['comp']:.3e} "
-                            f"w={row['w_geo_mean']:.3e} | "
+                            f"comp={row['comp']:.3e} | "
+                            f"w={row['w_geo_mean']:.3e} "
+                            f"h={row['h_mean']:.3e} | "
+                            f"gap={row['gap_thr_mean']:.3e} "
+                            f"big={row['big_thr_mean']:.3e} "
+                            f"alpha={row['alpha_mean']:.3e} "
+                            f"eta={row['eta_mean']:.3e} | "
+                            f"bw={row['boundary_width_mean']:.3e} "
+                            f"ba={row['boundary_alpha_mean']:.3e} "
+                            f"bb={row['boundary_beta_mean']:.3e} | "
+                            f"theta={row['theta_mean']:.3e} "
+                            f"a={row['a_metric_mean']:.3e} | "
                             f"Lse={row['loss_strut_edge']:.3e} "
-                            f"Lsv={row['loss_strut_void']:.3e} "
-                            f"rho(min/mean/max)={rho_min:.3f}/{rho_mean:.3f}/{rho_max:.3f} | "
-                            f"rho_b={row['rho_boundary_mean']:.3f} "
-                            f"rho_v={row['rho_v_mean']:.3f} | "
+                            f"Lsv={row['loss_strut_void']:.3e} | "
+                            f"rho(min/mean/max)={rho_min:.3f}/{rho_mean:.3f}/{rho_max:.3f} "
+                            f"rho_b(min/mean/max)={rho_boundary_min:.3f}/{rho_boundary_mean:.3f}/{rho_boundary_max:.3f} "
+                            f"rho_v(min/mean/max)={rho_v_min:.3f}/{rho_v_mean:.3f}/{rho_v_max:.3f} | "
                             f"Δrho={drho:.2e} Δseed={dseed:.2e} grad_mean={g_mean:.2e} | "
                             f"fem={fem_status} | "
                             f"best={best_score:.4e}@{best_step}"
@@ -2519,7 +3237,26 @@ class NN_Trainer:
                         "w_raw": p["w_raw"].detach().clone(),
                         "h_raw": None if p["h_raw"] is None else p["h_raw"].detach().clone(),
                         "gate_probs": None if p["gate_probs"] is None else p["gate_probs"].detach().clone(),
+                        "theta": None if p["theta"] is None else p["theta"].detach().clone(),
+                        "a_raw": None if p["a_raw"] is None else p["a_raw"].detach().clone(),
+                        "gap_thr_raw": None if p["gap_thr_raw"] is None else p["gap_thr_raw"].detach().clone(),
+                        "big_thr_raw": None if p["big_thr_raw"] is None else p["big_thr_raw"].detach().clone(),
+                        "alpha_raw": None if p["alpha_raw"] is None else p["alpha_raw"].detach().clone(),
+                        "eta_raw": None if p["eta_raw"] is None else p["eta_raw"].detach().clone(),
+                        "boundary_width_raw": None if p["boundary_width_raw"] is None else p["boundary_width_raw"].detach().clone(),
+                        "boundary_alpha_raw": None if p["boundary_alpha_raw"] is None else p["boundary_alpha_raw"].detach().clone(),
+                        "boundary_beta_raw": None if p["boundary_beta_raw"] is None else p["boundary_beta_raw"].detach().clone(),
                         "w_geo": p["w_geo"].detach().clone(),
+                        "h": None if p["h"] is None else p["h"].detach().clone(),
+                        "gap_thr": None if p["gap_thr"] is None else p["gap_thr"].detach().clone(),
+                        "big_thr": None if p["big_thr"] is None else p["big_thr"].detach().clone(),
+                        "alpha": None if p["alpha"] is None else p["alpha"].detach().clone(),
+                        "eta": None if p["eta"] is None else p["eta"].detach().clone(),
+                        "boundary_width": None if p["boundary_width"] is None else p["boundary_width"].detach().clone(),
+                        "boundary_alpha": None if p["boundary_alpha"] is None else p["boundary_alpha"].detach().clone(),
+                        "boundary_beta": None if p["boundary_beta"] is None else p["boundary_beta"].detach().clone(),
+                        "theta_mean": None if p["theta_mean"] is None else p["theta_mean"].detach().clone(),
+                        "a_metric": None if p["a_metric"] is None else p["a_metric"].detach().clone(),
                     }
                     for p in pred_list
                 ]
@@ -2582,5 +3319,5 @@ class NN_Trainer:
             "fem_debug_history": self.fem_debug_history,
             "last_fem_debug": self.last_fem_debug,
             "tensorboard_log_dir": self.tensorboard_log_dir,
-            "shape_path": face_tensors[0].get("shape_path", None),
+            "shape_path": shape_path,
         }

@@ -4,13 +4,25 @@ import torch.nn as nn
 
 class PPNet(nn.Module):
     """
-    PPNet: refines initial seed UVs and predicts global geometric width.
+    PPNet: predicts all learnable decoder controls.
 
-    Returns:
-      pred["seeds_raw"] : (B,S,2)
-      pred["w_raw"]     : (B,)
-      pred["theta"]     : (B,S)   if anisotropy enabled
-      pred["a_raw"]     : (B,S)   if anisotropy enabled
+    Returns possible keys:
+      pred["seeds_raw"]            : (B,S,2)
+      pred["w_raw"]                : (B,S,S)
+      pred["h_raw"]                : (B,)         if predict_height=True
+      pred["theta"]                : (B,S)        if anisotropy enabled
+      pred["a_raw"]                : (B,S)        if anisotropy enabled
+      pred["gate_logits"]          : (B,S)        if use_gating=True
+      pred["gate_probs"]           : (B,S)        if use_gating=True
+
+      pred["gap_thr_raw"]          : (B,)         if predict_pair_gating=True
+      pred["big_thr_raw"]          : (B,)         if predict_pair_gating=True
+      pred["alpha_raw"]            : (B,)         if predict_pair_gating=True
+      pred["eta_raw"]              : (B,)         if predict_pair_gating=True
+
+      pred["boundary_width_raw"]   : (B,)         if predict_boundary_params=True
+      pred["boundary_alpha_raw"]   : (B,)         if predict_boundary_params=True
+      pred["boundary_beta_raw"]    : (B,)         if predict_boundary_params=True
     """
 
     def __init__(
@@ -20,6 +32,8 @@ class PPNet(nn.Module):
         use_Metric_anisotropy=False,
         predict_height=False,
         use_gating=False,
+        predict_pair_gating=False,
+        predict_boundary_width=False,
         hidden=256,
         freeze_w=False,
         w_const=0.25,
@@ -32,6 +46,8 @@ class PPNet(nn.Module):
         self.use_Metric_anisotropy = use_Metric_anisotropy
         self.predict_height = predict_height
         self.use_gating = use_gating
+        self.predict_pair_gating = predict_pair_gating
+        self.predict_boundary_width = predict_boundary_width
 
         self.freeze_w = freeze_w
         self.w_const = w_const
@@ -58,11 +74,20 @@ class PPNet(nn.Module):
 
         self.delta_head = nn.Linear(hidden, 2)
 
-        # geometric width latent
+        # global heads
         self.w_head = nn.Linear(hidden, 1)
 
         if self.predict_height:
             self.h_head = nn.Linear(hidden, 1)
+
+        if self.predict_pair_gating:
+            self.gap_thr_head = nn.Linear(hidden, 1)
+            self.big_thr_head = nn.Linear(hidden, 1)
+            self.alpha_head = nn.Linear(hidden, 1)
+            self.eta_head = nn.Linear(hidden, 1)
+
+        if self.predict_boundary_width:
+            self.boundary_width_head = nn.Linear(hidden, 1)
 
         if self.use_gating:
             self.gate_head = nn.Linear(hidden, 1)
@@ -151,13 +176,15 @@ class PPNet(nn.Module):
 
         if self.freeze_w:
             out["w_raw"] = torch.full(
-                (B,),
+                (B, S, S),
                 self.w_const,
                 device=z.device,
                 dtype=z.dtype,
             )
         else:
-            out["w_raw"] = self.w_head(z).view(-1)
+            pair_h = 0.5 * (h.unsqueeze(2) + h.unsqueeze(1))
+            w_raw = self.w_head(pair_h).squeeze(-1)
+            out["w_raw"] = 0.5 * (w_raw + w_raw.transpose(1, 2))
 
         if not torch.isfinite(out["w_raw"]).all():
             raise RuntimeError("PPNet produced non-finite w_raw")
@@ -166,6 +193,21 @@ class PPNet(nn.Module):
             out["h_raw"] = self.h_head(z).view(-1)
             if not torch.isfinite(out["h_raw"]).all():
                 raise RuntimeError("PPNet produced non-finite h_raw")
+
+        if self.predict_pair_gating:
+            out["gap_thr_raw"] = self.gap_thr_head(z).view(-1)
+            out["big_thr_raw"] = self.big_thr_head(z).view(-1)
+            out["alpha_raw"] = self.alpha_head(z).view(-1)
+            out["eta_raw"] = self.eta_head(z).view(-1)
+
+            for k in ("gap_thr_raw", "big_thr_raw", "alpha_raw", "eta_raw"):
+                if not torch.isfinite(out[k]).all():
+                    raise RuntimeError(f"PPNet produced non-finite {k}")
+
+        if self.predict_boundary_width:
+            out["boundary_width_raw"] = self.boundary_width_head(z).view(-1)
+            if not torch.isfinite(out["boundary_width_raw"]).all():
+                raise RuntimeError("PPNet produced non-finite boundary_width_raw")
 
         if self.use_gating:
             gate_logits = self.gate_head(h).squeeze(-1)

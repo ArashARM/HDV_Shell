@@ -6,32 +6,20 @@ import torch.nn.functional as F
 
 class VoronoiDecoder(nn.Module):
     """
-    Functional Voronoi decoder with geometric strut thickness centered on Voronoi bisectors.
+    Fully functional Voronoi decoder.
 
-    Main idea:
-      - The decoder defines a continuous field in UV.
-      - `evaluate_at_uv(...)` evaluates that field at arbitrary UV query points.
-      - `forward(...)` is kept as a thin wrapper for compatibility.
+    This module contains no trainable parameters.
+    All learnable quantities are predicted externally by PPNet and passed in
+    through evaluate_at_uv(...) / forward(...).
 
-    For each pair (i,j):
-        Delta_ij = d_i - d_j
-        B_ij = sigmoid((w - |Delta_ij|_smooth) / beta)
-        P_ij = soft pair relevance
-        S_ij = P_ij * B_ij
-
-    Final density:
-        rho_v = 1 - exp(-alpha_union * sum_{i<j} S_ij)
-
-    Optional boundary attachment:
-        rho_b = sigmoid((t_b - d_b) / beta_b)
-        rho   = 1 - (1-rho_v)(1-a_b*rho_b)
-
-    Semi-trainable boundary means:
-      - boundary geometry (`boundary_uv`) stays fixed
-      - decoder can learn a few global boundary-effect scalars:
-          * boundary width    t_b
-          * boundary union    a_b
-          * optionally sharpness beta_b
+    PPNet-predicted learnable controls can include:
+      - seeds_raw
+      - w_raw
+      - h_raw
+      - theta, a_raw
+      - gap_thr_raw, big_thr_raw, alpha_raw, eta_raw
+      - boundary_width_raw, boundary_alpha_raw, boundary_beta_raw
+      - seed_gates
     """
 
     def __init__(
@@ -40,18 +28,28 @@ class VoronoiDecoder(nn.Module):
         eps: float = 1e-8,
         use_Metric_anisotropy: bool = True,
 
-        # geometric strut half-width bounds
+        # geometric strut half-width lower bound
         w_min: float = 0.005,
-        w_max: float = 0.5,
 
         # density transition sharpness
         beta: float = 0.02,
+        junction_beta_scale: float = 1.0,
+        junction_width_bonus: float = 0.15,
+
+        # effective-number boost for multi-seed zones
+        junction_keff_lambda: float = 0.050,
+        junction_keff_k0: float = 3.0,
+        junction_keff_s: float = 0.35,
+
+        # explicit triple-overlap junction term
+        junction_triple_lambda: float = 0.15,
+        junction_triple_power: float = 1.5,
 
         # raw parameter temperature for bounded maps
         raw_temp: float = 5.0,
 
         # union sharpness for combining pair bands
-        alpha_union: float = 8.0,
+        alpha_union: float = 12.0,
 
         # height controls
         h_min: float = 0.50,
@@ -75,6 +73,7 @@ class VoronoiDecoder(nn.Module):
         eta_min: float = 0.01,
         eta_max: float = 0.20,
 
+        # defaults used only when PPNet does not provide the corresponding raw values
         gap_thr_default: float = 0.15,
         big_thr_default: float = 0.10,
         alpha_default: float = 0.05,
@@ -82,23 +81,25 @@ class VoronoiDecoder(nn.Module):
 
         # boundary attachment field
         use_boundary_attachment: bool = False,
-        boundary_attach_width: float = 0.03,
-        boundary_attach_beta: float = 0.01,
+
+        # keep these on comparable scales
+        boundary_attach_width: float = 2e-5,
+        boundary_attach_beta: float = 1e-5,
         boundary_attach_alpha: float = 0.35,
 
-        # semi-trainable boundary controls
-        train_boundary_attach_width: bool = False,
-        train_boundary_attach_alpha: bool = False,
-        train_boundary_attach_beta: bool = False,
-
-        boundary_attach_width_min: float = 0.005,
-        boundary_attach_width_max: float = 0.10,
+        boundary_attach_width_min: float = 5e-6,
+        boundary_attach_width_max: float = 5e-5,
 
         boundary_attach_alpha_min: float = 0.05,
         boundary_attach_alpha_max: float = 1.00,
 
-        boundary_attach_beta_min: float = 0.003,
-        boundary_attach_beta_max: float = 0.05,
+        boundary_attach_beta_min: float = 1e-6,
+        boundary_attach_beta_max: float = 1e-4,
+
+        # robust boundary-distance evaluation
+        boundary_knn_k: int = 8,
+        boundary_softmin_tau: float = 2e-3,
+        boundary_spacing_blend: float = 0.5,
     ):
         super().__init__()
 
@@ -107,8 +108,17 @@ class VoronoiDecoder(nn.Module):
         self.use_Metric_anisotropy = bool(use_Metric_anisotropy)
 
         self.w_min = float(w_min)
-        self.w_max = float(w_max)
         self.beta = float(beta)
+        self.junction_beta_scale = float(junction_beta_scale)
+        self.junction_width_bonus = float(junction_width_bonus)
+
+        self.junction_keff_lambda = float(junction_keff_lambda)
+        self.junction_keff_k0 = float(junction_keff_k0)
+        self.junction_keff_s = float(junction_keff_s)
+
+        self.junction_triple_lambda = float(junction_triple_lambda)
+        self.junction_triple_power = float(junction_triple_power)
+
         self.raw_temp = float(raw_temp)
         self.alpha_union = float(alpha_union)
 
@@ -122,7 +132,6 @@ class VoronoiDecoder(nn.Module):
         self.gap_thr_max = float(gap_thr_max)
         self.big_thr_min = float(big_thr_min)
         self.big_thr_max = float(big_thr_max)
-
         self.alpha_min = float(alpha_min)
         self.alpha_max = float(alpha_max)
         self.eta_min = float(eta_min)
@@ -135,18 +144,39 @@ class VoronoiDecoder(nn.Module):
 
         self.use_boundary_attachment = bool(use_boundary_attachment)
 
-        self.train_boundary_attach_width = bool(train_boundary_attach_width)
-        self.train_boundary_attach_alpha = bool(train_boundary_attach_alpha)
-        self.train_boundary_attach_beta = bool(train_boundary_attach_beta)
-
         self.boundary_attach_width_min = float(boundary_attach_width_min)
         self.boundary_attach_width_max = float(boundary_attach_width_max)
-
         self.boundary_attach_alpha_min = float(boundary_attach_alpha_min)
         self.boundary_attach_alpha_max = float(boundary_attach_alpha_max)
-
         self.boundary_attach_beta_min = float(boundary_attach_beta_min)
         self.boundary_attach_beta_max = float(boundary_attach_beta_max)
+        self.boundary_knn_k = int(boundary_knn_k)
+        self.boundary_softmin_tau = float(boundary_softmin_tau)
+        self.boundary_spacing_blend = float(boundary_spacing_blend)
+
+        if not (self.boundary_attach_width_min < self.boundary_attach_width_max):
+            raise ValueError(
+                f"boundary_attach_width_min must be < boundary_attach_width_max, got "
+                f"{self.boundary_attach_width_min} and {self.boundary_attach_width_max}"
+            )
+        if not (self.boundary_attach_alpha_min < self.boundary_attach_alpha_max):
+            raise ValueError(
+                f"boundary_attach_alpha_min must be < boundary_attach_alpha_max, got "
+                f"{self.boundary_attach_alpha_min} and {self.boundary_attach_alpha_max}"
+            )
+        if not (self.boundary_attach_beta_min < self.boundary_attach_beta_max):
+            raise ValueError(
+                f"boundary_attach_beta_min must be < boundary_attach_beta_max, got "
+                f"{self.boundary_attach_beta_min} and {self.boundary_attach_beta_max}"
+            )
+        if self.boundary_knn_k < 1:
+            raise ValueError(f"boundary_knn_k must be >= 1, got {self.boundary_knn_k}")
+        if self.boundary_softmin_tau <= 0:
+            raise ValueError(f"boundary_softmin_tau must be > 0, got {self.boundary_softmin_tau}")
+        if self.boundary_spacing_blend < 0:
+            raise ValueError(f"boundary_spacing_blend must be >= 0, got {self.boundary_spacing_blend}")
+        if self.junction_triple_power <= 0:
+            raise ValueError(f"junction_triple_power must be > 0, got {self.junction_triple_power}")
 
         if boundary_solid_idx is None:
             boundary_solid_idx = torch.empty(0, dtype=torch.long)
@@ -162,64 +192,59 @@ class VoronoiDecoder(nn.Module):
         self.register_buffer("face_v_periodic", face_v_periodic.to(torch.bool))
         self.register_buffer("seed_face_id", seed_face_id.to(torch.long))
 
-        # -------------------- semi-trainable boundary params --------------------
-        # Keep boundary geometry fixed, but optionally learn:
-        #   - attachment width
-        #   - attachment union strength
-        #   - attachment sharpness
-        #
-        # We store raw unconstrained parameters and map them safely to ranges.
-
-        if self.train_boundary_attach_width:
-            raw = self._raw_from_bounded_value(
-                boundary_attach_width,
-                self.boundary_attach_width_min,
-                self.boundary_attach_width_max,
-                temp=1.0,
-            )
-            self.boundary_attach_width_raw = nn.Parameter(raw)
-        else:
-            self.register_buffer(
-                "boundary_attach_width_fixed",
-                torch.tensor(float(boundary_attach_width), dtype=torch.float32),
-            )
-
-        if self.train_boundary_attach_alpha:
-            raw = self._raw_from_bounded_value(
-                boundary_attach_alpha,
-                self.boundary_attach_alpha_min,
-                self.boundary_attach_alpha_max,
-                temp=1.0,
-            )
-            self.boundary_attach_alpha_raw = nn.Parameter(raw)
-        else:
-            self.register_buffer(
-                "boundary_attach_alpha_fixed",
-                torch.tensor(float(boundary_attach_alpha), dtype=torch.float32),
-            )
-
-        if self.train_boundary_attach_beta:
-            raw = self._raw_from_bounded_value(
-                boundary_attach_beta,
-                self.boundary_attach_beta_min,
-                self.boundary_attach_beta_max,
-                temp=1.0,
-            )
-            self.boundary_attach_beta_raw = nn.Parameter(raw)
-        else:
-            self.register_buffer(
-                "boundary_attach_beta_fixed",
-                torch.tensor(float(boundary_attach_beta), dtype=torch.float32),
-            )
+        self.register_buffer(
+            "boundary_attach_width_fixed",
+            torch.tensor(float(boundary_attach_width), dtype=torch.float32),
+        )
+        self.register_buffer(
+            "boundary_attach_alpha_fixed",
+            torch.tensor(float(boundary_attach_alpha), dtype=torch.float32),
+        )
+        self.register_buffer(
+            "boundary_attach_beta_fixed",
+            torch.tensor(float(boundary_attach_beta), dtype=torch.float32),
+        )
 
     # -------------------- parameter maps --------------------
 
     def seeds_uv(self, seeds_raw: torch.Tensor) -> torch.Tensor:
         return seeds_raw
 
-    def width(self, w_raw: torch.Tensor) -> torch.Tensor:
+    def _pairwise_seed_dist(self, seeds: torch.Tensor) -> torch.Tensor:
+        v = seeds.unsqueeze(0) - seeds.unsqueeze(1)
+        same_face = self.seed_face_id[:, None] == self.seed_face_id[None, :]
+
+        uper_face = self.face_u_periodic[self.seed_face_id]
+        vper_face = self.face_v_periodic[self.seed_face_id]
+
+        uper_pair = uper_face[:, None] & uper_face[None, :] & same_face
+        vper_pair = vper_face[:, None] & vper_face[None, :] & same_face
+
+        du = v[..., 0]
+        dv = v[..., 1]
+
+        du = du - torch.round(du) * uper_pair.to(du.dtype)
+        dv = dv - torch.round(dv) * vper_pair.to(dv.dtype)
+
+        v[..., 0] = du
+        v[..., 1] = dv
+        return torch.norm(v, dim=-1)
+
+    def width(self, w_raw: torch.Tensor, seeds: torch.Tensor | None = None) -> torch.Tensor:
         T = self.raw_temp
-        return self.w_min + (self.w_max - self.w_min) * torch.sigmoid(w_raw / T)
+        if w_raw.ndim != 2 or w_raw.shape[0] != w_raw.shape[1]:
+            raise ValueError(f"w_raw must be square (S,S), got {tuple(w_raw.shape)}")
+        if seeds is None:
+            raise ValueError("seeds must be provided when w_raw is pairwise")
+        if seeds.shape[0] != w_raw.shape[0]:
+            raise ValueError(
+                f"pairwise w_raw expects seeds with matching S, got {tuple(seeds.shape)} and {tuple(w_raw.shape)}"
+            )
+
+        pair_dist = self._pairwise_seed_dist(seeds).to(device=w_raw.device, dtype=w_raw.dtype)
+        w_max_pair = (0.8 * pair_dist).clamp_min(self.w_min + self.eps)
+        w_geo = self.w_min + (w_max_pair - self.w_min) * torch.sigmoid(w_raw / T)
+        return 0.5 * (w_geo + w_geo.transpose(0, 1))
 
     def height(
         self,
@@ -255,74 +280,73 @@ class VoronoiDecoder(nn.Module):
     ) -> torch.Tensor:
         return lo + (hi - lo) * torch.sigmoid(x_raw / temp)
 
-    def _raw_from_bounded_value(
+    def raw_from_bounded_value(
         self,
         value: float,
         lo: float,
         hi: float,
         temp: float = 1.0,
     ) -> torch.Tensor:
-        """
-        Inverse map initializer:
-            value ~= lo + (hi-lo) * sigmoid(raw / temp)
-        """
         denom = max(hi - lo, self.eps)
         x = (value - lo) / denom
         x = min(max(x, 1e-6), 1.0 - 1e-6)
         raw = temp * math.log(x / (1.0 - x))
         return torch.tensor(raw, dtype=torch.float32)
 
-    # -------------------- boundary trainable getters --------------------
+    # -------------------- boundary control getters --------------------
 
-    def boundary_width(self, ref_tensor: torch.Tensor) -> torch.Tensor:
-        if self.train_boundary_attach_width:
-            raw = self.boundary_attach_width_raw.to(
+    def boundary_width(
+        self,
+        ref_tensor: torch.Tensor,
+        boundary_width_raw: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if boundary_width_raw is None:
+            return self.boundary_attach_width_fixed.to(
                 device=ref_tensor.device,
                 dtype=ref_tensor.dtype,
             )
-            return self._map_raw_to_range(
-                raw,
-                self.boundary_attach_width_min,
-                self.boundary_attach_width_max,
-                temp=1.0,
-            )
-        return self.boundary_attach_width_fixed.to(
-            device=ref_tensor.device,
-            dtype=ref_tensor.dtype,
+        raw = boundary_width_raw.to(device=ref_tensor.device, dtype=ref_tensor.dtype)
+        return self._map_raw_to_range(
+            raw,
+            self.boundary_attach_width_min,
+            self.boundary_attach_width_max,
+            temp=1.0,
         )
 
-    def boundary_alpha(self, ref_tensor: torch.Tensor) -> torch.Tensor:
-        if self.train_boundary_attach_alpha:
-            raw = self.boundary_attach_alpha_raw.to(
+    def boundary_alpha(
+        self,
+        ref_tensor: torch.Tensor,
+        boundary_alpha_raw: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if boundary_alpha_raw is None:
+            return self.boundary_attach_alpha_fixed.to(
                 device=ref_tensor.device,
                 dtype=ref_tensor.dtype,
             )
-            return self._map_raw_to_range(
-                raw,
-                self.boundary_attach_alpha_min,
-                self.boundary_attach_alpha_max,
-                temp=1.0,
-            )
-        return self.boundary_attach_alpha_fixed.to(
-            device=ref_tensor.device,
-            dtype=ref_tensor.dtype,
+        raw = boundary_alpha_raw.to(device=ref_tensor.device, dtype=ref_tensor.dtype)
+        return self._map_raw_to_range(
+            raw,
+            self.boundary_attach_alpha_min,
+            self.boundary_attach_alpha_max,
+            temp=1.0,
         )
 
-    def boundary_beta(self, ref_tensor: torch.Tensor) -> torch.Tensor:
-        if self.train_boundary_attach_beta:
-            raw = self.boundary_attach_beta_raw.to(
+    def boundary_beta(
+        self,
+        ref_tensor: torch.Tensor,
+        boundary_beta_raw: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if boundary_beta_raw is None:
+            return self.boundary_attach_beta_fixed.to(
                 device=ref_tensor.device,
                 dtype=ref_tensor.dtype,
             )
-            return self._map_raw_to_range(
-                raw,
-                self.boundary_attach_beta_min,
-                self.boundary_attach_beta_max,
-                temp=1.0,
-            )
-        return self.boundary_attach_beta_fixed.to(
-            device=ref_tensor.device,
-            dtype=ref_tensor.dtype,
+        raw = boundary_beta_raw.to(device=ref_tensor.device, dtype=ref_tensor.dtype)
+        return self._map_raw_to_range(
+            raw,
+            self.boundary_attach_beta_min,
+            self.boundary_attach_beta_max,
+            temp=1.0,
         )
 
     # -------------------- anisotropic metric --------------------
@@ -347,7 +371,7 @@ class VoronoiDecoder(nn.Module):
         R = torch.stack(
             [torch.stack([c, -s], -1), torch.stack([s, c], -1)],
             -2,
-        )  # (S,2,2)
+        )
 
         D = torch.zeros((S, 2, 2), device=R.device, dtype=R.dtype)
         D[:, 0, 0] = a
@@ -382,7 +406,7 @@ class VoronoiDecoder(nn.Module):
         return diff
 
     def _pairwise_uv_dirs(self, seeds: torch.Tensor) -> torch.Tensor:
-        v = seeds.unsqueeze(0) - seeds.unsqueeze(1)  # (S,S,2)
+        v = seeds.unsqueeze(0) - seeds.unsqueeze(1)
         same_face = self.seed_face_id[:, None] == self.seed_face_id[None, :]
 
         uper_face = self.face_u_periodic[self.seed_face_id]
@@ -435,13 +459,10 @@ class VoronoiDecoder(nn.Module):
         boundary_uv: torch.Tensor | None,
         points_face_id: torch.Tensor | None = None,
         boundary_face_id: torch.Tensor | None = None,
+        boundary_width_raw: torch.Tensor | None = None,
+        boundary_beta_raw: torch.Tensor | None = None,
+        alpha_union: float = 8.0,
     ) -> torch.Tensor:
-        """
-        Smooth boundary attachment field rho_b in [0,1].
-
-        High near the shell boundary, decays smoothly away from it.
-        Boundary geometry is fixed, but width / sharpness may be trainable.
-        """
         if boundary_uv is None or boundary_uv.numel() == 0:
             return torch.zeros(
                 points_uv.shape[0],
@@ -449,23 +470,36 @@ class VoronoiDecoder(nn.Module):
                 dtype=points_uv.dtype,
             )
 
+        dmat = torch.cdist(points_uv, boundary_uv)
         if boundary_face_id is not None and points_face_id is not None:
             if boundary_face_id.dtype != torch.long:
                 boundary_face_id = boundary_face_id.to(torch.long)
             if points_face_id.dtype != torch.long:
                 points_face_id = points_face_id.to(torch.long)
 
-            dmat = torch.cdist(points_uv, boundary_uv)  # [Nv, Nb]
             cross_face = points_face_id[:, None] != boundary_face_id[None, :]
             dmat = dmat + cross_face.to(dmat.dtype) * 1e6
-            dmin = dmat.amin(dim=1)
-        else:
-            dmin = torch.cdist(points_uv, boundary_uv).amin(dim=1)
 
-        tb = self.boundary_width(points_uv)
-        bb = self.boundary_beta(points_uv)
+        k = min(self.boundary_knn_k, int(dmat.shape[1]))
+        d_knn = torch.topk(dmat, k=k, dim=1, largest=False).values
 
-        rho_b = torch.sigmoid((tb - dmin) / (bb + self.eps))
+        tau = torch.as_tensor(self.boundary_softmin_tau, device=dmat.device, dtype=dmat.dtype)
+        dmin = -tau * torch.logsumexp(-d_knn / (tau + self.eps), dim=1) + tau * math.log(k)
+
+        tb = self.boundary_width(points_uv, boundary_width_raw=boundary_width_raw)
+        bb = self.boundary_beta(points_uv, boundary_beta_raw=boundary_beta_raw)
+        if k > 1 and self.boundary_spacing_blend > 0.0 and boundary_uv.shape[0] > 1:
+            b2b = torch.cdist(boundary_uv, boundary_uv)
+            big = torch.eye(boundary_uv.shape[0], device=b2b.device, dtype=b2b.dtype) * 1e6
+            b2b = b2b + big
+            h_boundary = b2b.min(dim=1).values.median()
+            bb = bb + self.boundary_spacing_blend * h_boundary
+
+        rho_b_raw = torch.sigmoid((tb - dmin) / (bb + self.eps))
+        norm = torch.sigmoid(tb / (bb + self.eps))
+        rho_b_norm = (rho_b_raw / (norm + self.eps)).clamp(0.0, 1.0)
+
+        rho_b = 1.0 - torch.exp(-alpha_union * rho_b_norm)
         return rho_b.clamp(0.0, 1.0)
 
     def smooth_union(
@@ -474,11 +508,6 @@ class VoronoiDecoder(nn.Module):
         rho_b: torch.Tensor,
         alpha_b: float | torch.Tensor,
     ) -> torch.Tensor:
-        """
-        Smooth union of two density-like fields in [0,1].
-
-        rho = 1 - (1-rho_a)(1-alpha_b*rho_b)
-        """
         alpha_b = torch.as_tensor(alpha_b, device=rho_a.device, dtype=rho_a.dtype)
         rho = 1.0 - (1.0 - rho_a) * (1.0 - alpha_b * rho_b)
         return rho.clamp(0.0, 1.0)
@@ -493,9 +522,6 @@ class VoronoiDecoder(nn.Module):
         alpha: torch.Tensor,
         eta: torch.Tensor,
     ) -> torch.Tensor:
-        """
-        Returns pair gates g_ij in [0,1], shape (N,S,S), upper triangular only.
-        """
         N, S = w_soft.shape
 
         w_i = w_soft.unsqueeze(2)
@@ -514,6 +540,34 @@ class VoronoiDecoder(nn.Module):
         g_big = gi * gj
 
         return (g_gap * g_big) * tri
+
+    # -------------------- higher-order helpers --------------------
+
+    def _triple_junction_score(self, w_soft: torch.Tensor) -> torch.Tensor:
+        """
+        Returns a per-point scalar measuring simultaneous 3-seed overlap:
+            sum_{i<j<k} (w_i w_j w_k)^p
+        where p = junction_triple_power.
+        """
+        N, S = w_soft.shape
+        if S < 3:
+            return torch.zeros(N, device=w_soft.device, dtype=w_soft.dtype)
+
+        wi = w_soft.unsqueeze(2).unsqueeze(3)  # (N,S,1,1)
+        wj = w_soft.unsqueeze(1).unsqueeze(3)  # (N,1,S,1)
+        wk = w_soft.unsqueeze(1).unsqueeze(2)  # (N,1,1,S)
+
+        triple = wi * wj * wk  # (N,S,S,S)
+        if self.junction_triple_power != 1.0:
+            triple = triple.pow(self.junction_triple_power)
+
+        idx = torch.arange(S, device=w_soft.device)
+        mask = (
+            (idx.view(S, 1, 1) < idx.view(1, S, 1)) &
+            (idx.view(1, S, 1) < idx.view(1, 1, S))
+        ).to(w_soft.dtype)
+
+        return (triple * mask.unsqueeze(0)).sum(dim=(1, 2, 3))
 
     # -------------------- bisector band density --------------------
 
@@ -542,10 +596,36 @@ class VoronoiDecoder(nn.Module):
         delta = d_i - d_j
         abs_delta = torch.sqrt(delta * delta + self.eps)
 
-        beta_t = torch.as_tensor(beta, device=d.device, dtype=d.dtype)
-        band_ij = torch.sigmoid((w_geo - abs_delta) / (beta_t + self.eps)) * tri
+        ambiguity = (1.0 - w_soft.pow(2).sum(dim=1)).clamp(0.0, 1.0)
 
-        pair_relevance = (w_soft.unsqueeze(2) * w_soft.unsqueeze(1)) * tri
+        beta_t = torch.as_tensor(beta, device=d.device, dtype=d.dtype)
+        beta_eff = beta_t * (
+            1.0 + self.junction_beta_scale * ambiguity.unsqueeze(1).unsqueeze(2)
+        )
+        w_geo_eff = w_geo * (
+            1.0 + self.junction_width_bonus * ambiguity.unsqueeze(1).unsqueeze(2)
+        )
+
+        band_raw = torch.sigmoid((w_geo_eff - abs_delta) / (beta_eff + self.eps))
+        band_peak = torch.sigmoid(w_geo_eff / (beta_eff + self.eps))
+        band_ij = (band_raw / (band_peak + self.eps)).clamp(0.0, 1.0) * tri
+
+        # pair selectivity based on actual seed participation
+        pair_prod = w_soft.unsqueeze(2) * w_soft.unsqueeze(1)
+
+        # effective number of active seeds
+        sum_w2 = w_soft.pow(2).sum(dim=1).clamp_min(self.eps)
+        k_eff = 1.0 / sum_w2
+        junction_mult = 1.0 + self.junction_keff_lambda * torch.sigmoid(
+            (k_eff - self.junction_keff_k0) / (self.junction_keff_s + self.eps)
+        )
+
+        pair_relevance = (
+            ambiguity.unsqueeze(1).unsqueeze(2)
+            * pair_prod
+            * junction_mult.unsqueeze(1).unsqueeze(2)
+            * tri
+        )
 
         gate_pair = None
         if seed_gates is not None:
@@ -568,10 +648,11 @@ class VoronoiDecoder(nn.Module):
             pair_relevance = pair_relevance * gates
 
         pair_strength = pair_relevance * band_ij
-        R = pair_strength.sum(dim=(1, 2))
+        R_pair = pair_strength.sum(dim=(1, 2))
 
-        rho = 1.0 - torch.exp(-self.alpha_union * R)
-        rho = rho.clamp(0.0, 1.0)
+        # explicit higher-order junction support
+        R_junction = self._triple_junction_score(w_soft)
+        R = R_pair + self.junction_triple_lambda * R_junction
 
         band_soft = band_ij
         if gate_pair is not None:
@@ -584,6 +665,9 @@ class VoronoiDecoder(nn.Module):
             torch.ones_like(band_soft),
             1.0 - band_soft,
         )
+
+        rho = 1.0 - torch.exp(-self.alpha_union * R)
+        rho = rho.clamp(0.0, 1.0)
 
         edge_field = 1.0 - one_minus.prod(dim=2).prod(dim=1)
         edge_field = edge_field.clamp(0.0, 1.0)
@@ -599,29 +683,28 @@ class VoronoiDecoder(nn.Module):
         Xv: torch.Tensor,
         tau: float,
         seeds_raw: torch.Tensor,
+        w_raw: torch.Tensor,
         theta: torch.Tensor | None,
         a_raw: torch.Tensor | None,
     ) -> None:
         if points_uv.ndim != 2 or points_uv.shape[1] != 2:
             raise ValueError(f"points_uv must be (N,2), got {tuple(points_uv.shape)}")
-
         if Xu.ndim != 2 or Xu.shape[1] != 3:
             raise ValueError(f"Xu must be (N,3), got {tuple(Xu.shape)}")
-
         if Xv.ndim != 2 or Xv.shape[1] != 3:
             raise ValueError(f"Xv must be (N,3), got {tuple(Xv.shape)}")
-
         if Xu.shape[0] != points_uv.shape[0] or Xv.shape[0] != points_uv.shape[0]:
             raise ValueError("points_uv, Xu, and Xv must have the same first dimension")
-
         if seeds_raw.shape != (self.n_seeds, 2):
             raise ValueError(
                 f"seeds_raw must be (S,2) with S={self.n_seeds}, got {tuple(seeds_raw.shape)}"
             )
-
+        if w_raw.shape != (self.n_seeds, self.n_seeds):
+            raise ValueError(
+                f"w_raw must be (S,S) with S={self.n_seeds}, got {tuple(w_raw.shape)}"
+            )
         if not (tau > 0.0):
             raise ValueError(f"tau must be > 0, got {tau}")
-
         if self.use_Metric_anisotropy:
             if theta is None or a_raw is None:
                 raise ValueError("use_Metric_anisotropy=True requires theta and a_raw.")
@@ -650,23 +733,18 @@ class VoronoiDecoder(nn.Module):
         big_thr_raw: torch.Tensor | None = None,
         alpha_raw: torch.Tensor | None = None,
         eta_raw: torch.Tensor | None = None,
+        boundary_width_raw: torch.Tensor | None = None,
+        boundary_alpha_raw: torch.Tensor | None = None,
+        boundary_beta_raw: torch.Tensor | None = None,
         seed_gates: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
-        """
-        Evaluate the Voronoi surface field at arbitrary UV query points.
-
-        Inputs:
-            points_uv : (N,2)
-            Xu, Xv    : (N,3) local surface derivatives at query points
-
-        Returns dictionary with named outputs.
-        """
         self._validate_inputs(
             points_uv=points_uv,
             Xu=Xu,
             Xv=Xv,
             tau=tau,
             seeds_raw=seeds_raw,
+            w_raw=w_raw,
             theta=theta,
             a_raw=a_raw,
         )
@@ -680,17 +758,12 @@ class VoronoiDecoder(nn.Module):
             I = torch.eye(2, device=points_uv.device, dtype=points_uv.dtype)
             M = I.unsqueeze(0).expand(S, 2, 2)
 
-        # All point-to-seed UV difference vectors: (N,S,2)
         diff = points_uv.unsqueeze(1) - seeds.unsqueeze(0)
-
-        # Apply periodic wrapping where needed
         diff = self._wrap_duv_points_to_seeds(diff, points_face_id)
 
-        # Anisotropic squared distances
         d2 = torch.einsum("nsi,sij,nsj->ns", diff, M, diff)
         d = torch.sqrt(d2.clamp_min(self.eps))
 
-        # Restrict point-seed competition to same face if requested
         if points_face_id is not None:
             if points_face_id.dtype != torch.long:
                 points_face_id = points_face_id.to(torch.long)
@@ -712,9 +785,6 @@ class VoronoiDecoder(nn.Module):
                     f"seed_gates must have shape ({S},), got {tuple(seed_gates.shape)}"
                 )
             gates = seed_gates.to(device=d.device, dtype=d.dtype).clamp_min(1e-8)
-
-            # Relative competition gating:
-            # lower gate weakens the seed in Voronoi competition
             logits = logits + torch.log(gates).unsqueeze(0)
 
         logits = logits - logits.max(dim=-1, keepdim=True).values
@@ -752,7 +822,7 @@ class VoronoiDecoder(nn.Module):
                 eta_raw, self.eta_min, self.eta_max, temp=1.0
             )
 
-        w_geo = self.width(w_raw)
+        w_geo = self.width(w_raw, seeds=seeds)
 
         rho_v, pair_strength, band_ij, pair_relevance, edge_field = self._bisector_band_density(
             d=d,
@@ -772,8 +842,13 @@ class VoronoiDecoder(nn.Module):
                 boundary_uv=boundary_uv,
                 points_face_id=points_face_id,
                 boundary_face_id=boundary_face_id,
+                boundary_width_raw=boundary_width_raw,
+                boundary_beta_raw=boundary_beta_raw,
             )
-            alpha_b = self.boundary_alpha(points_uv)
+            alpha_b = self.boundary_alpha(
+                points_uv,
+                boundary_alpha_raw=boundary_alpha_raw,
+            )
             rho = self.smooth_union(
                 rho_a=rho_v,
                 rho_b=rho_b,
@@ -786,7 +861,6 @@ class VoronoiDecoder(nn.Module):
 
         rho = rho.clamp(0.0, 1.0)
 
-        # Fiber still comes from competition weights, then is suppressed by density
         t_uv_raw = self._blended_uv_fiber(w_soft, seeds)
 
         rho0, gamma = 0.5, 0.05
@@ -794,7 +868,6 @@ class VoronoiDecoder(nn.Module):
         t_uv = t_uv_raw * m
 
         fiber3d = self.map_to_3d(t_uv, Xu=Xu, Xv=Xv)
-
         h = self.height(h_raw, ref_tensor=points_uv)
 
         return {
@@ -819,11 +892,17 @@ class VoronoiDecoder(nn.Module):
             "alpha": alpha,
             "eta": eta,
             "boundary_alpha": alpha_b,
-            "boundary_width": self.boundary_width(points_uv) if self.use_boundary_attachment else torch.zeros((), device=points_uv.device, dtype=points_uv.dtype),
-            "boundary_beta": self.boundary_beta(points_uv) if self.use_boundary_attachment else torch.zeros((), device=points_uv.device, dtype=points_uv.dtype),
+            "boundary_width": (
+                self.boundary_width(points_uv, boundary_width_raw)
+                if self.use_boundary_attachment
+                else torch.zeros((), device=points_uv.device, dtype=points_uv.dtype)
+            ),
+            "boundary_beta": (
+                self.boundary_beta(points_uv, boundary_beta_raw)
+                if self.use_boundary_attachment
+                else torch.zeros((), device=points_uv.device, dtype=points_uv.dtype)
+            ),
         }
-
-    # -------------------- compatibility wrapper --------------------
 
     def forward(
         self,
@@ -843,6 +922,9 @@ class VoronoiDecoder(nn.Module):
         big_thr_raw=None,
         alpha_raw=None,
         eta_raw=None,
+        boundary_width_raw=None,
+        boundary_alpha_raw=None,
+        boundary_beta_raw=None,
         seed_gates=None,
     ):
         return self.evaluate_at_uv(
@@ -862,5 +944,8 @@ class VoronoiDecoder(nn.Module):
             big_thr_raw=big_thr_raw,
             alpha_raw=alpha_raw,
             eta_raw=eta_raw,
+            boundary_width_raw=boundary_width_raw,
+            boundary_alpha_raw=boundary_alpha_raw,
+            boundary_beta_raw=boundary_beta_raw,
             seed_gates=seed_gates,
         )
