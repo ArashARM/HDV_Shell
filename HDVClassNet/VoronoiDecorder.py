@@ -861,6 +861,17 @@ class VoronoiDecoder(nn.Module):
 
         rho = rho.clamp(0.0, 1.0)
 
+        # smooth near-binary remap with positive floor
+        eps_rho = 1e-3
+        rho0_solid = 0.55
+        gamma_solid = 0.02
+
+        rho_s = eps_rho + (1.0 - eps_rho) * torch.sigmoid(
+            (rho - rho0_solid) / gamma_solid
+        )
+
+
+
         t_uv_raw = self._blended_uv_fiber(w_soft, seeds)
 
         rho0, gamma = 0.5, 0.05
@@ -876,6 +887,7 @@ class VoronoiDecoder(nn.Module):
             "M": M,
             "seeds": seeds,
             "rho": rho,
+            "rho_s": rho_s,
             "rho_v": rho_v,
             "rho_b": rho_b,
             "t_uv_raw": t_uv_raw,

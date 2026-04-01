@@ -1,6 +1,7 @@
 import numpy as np
 import pandas as pd
 import torch
+import tempfile
 
 from OCC.Core.STEPControl import STEPControl_Reader
 from OCC.Core.IGESControl import IGESControl_Reader
@@ -10,7 +11,7 @@ from OCC.Core.TopAbs import TopAbs_FACE, TopAbs_IN, TopAbs_ON
 from OCC.Core.TopoDS import topods
 from OCC.Core.BRepAdaptor import BRepAdaptor_Surface
 from OCC.Core.GeomAbs import GeomAbs_Plane, GeomAbs_Cylinder, GeomAbs_Cone
-from OCC.Core.BRepTools import breptools
+from OCC.Core.BRepTools import breptools, breptools_Write
 from OCC.Core.BRep import BRep_Tool
 from OCC.Core.BRepMesh import BRepMesh_IncrementalMesh
 from OCC.Core.TopLoc import TopLoc_Location
@@ -21,6 +22,13 @@ from OCC.Core.BRepClass import BRepClass_FaceClassifier
 from OCC.Core.BRepBndLib import brepbndlib
 from OCC.Core.Bnd import Bnd_Box
 from scipy.spatial import Delaunay
+
+try:
+    import gmsh
+    print("gmesh was loaded successfully!")
+except Exception:
+    gmsh = None
+    print("gmesh cannot be solved.X")
 
 class CADTensorGenerator:
     """
@@ -37,6 +45,9 @@ class CADTensorGenerator:
         n_u: int = 80,
         n_v: int = 40,
         device: str = "cpu",
+        freeform_mesher: str = "auto",
+        gmsh_size_scale: float = 1.0,
+        gmsh_algorithm: int = 6,
     ):
         self.deflection = float(deflection)
         self.angle = float(angle)
@@ -45,6 +56,9 @@ class CADTensorGenerator:
         self.n_u = int(n_u)
         self.n_v = int(n_v)
         self.device = device
+        self.freeform_mesher = str(freeform_mesher).lower()
+        self.gmsh_size_scale = float(gmsh_size_scale)
+        self.gmsh_algorithm = int(gmsh_algorithm)
 
     # =========================================================================
     # 1) Load + face helpers
@@ -108,6 +122,10 @@ class CADTensorGenerator:
         umin, umax, vmin, vmax = breptools.UVBounds(face)
         surf = BRep_Tool.Surface(face)
         return (float(umin), float(umax), float(vmin), float(vmax)), surf
+
+    @classmethod
+    def gmsh_is_available(cls):
+        return gmsh is not None
 
     # =========================================================================
     # 2) Ensure OCC triangulation exists
@@ -222,6 +240,108 @@ class CADTensorGenerator:
                 F.append([a - 1, b - 1, c - 1])
 
         return np.asarray(V, float), np.asarray(UV, object), np.asarray(F, np.int64)
+
+    @classmethod
+    def estimate_face_target_size(cls, face, n_u: int, n_v: int, fallback_rel: float = 0.04):
+        (umin, umax, vmin, vmax), surf = cls.face_uv_bounds_and_surface(face)
+        umid = 0.5 * (float(umin) + float(umax))
+        vmid = 0.5 * (float(vmin) + float(vmax))
+
+        try:
+            efg = cls.metric_EFG_raw(surf, umid, vmid, tol=1e-9)
+        except Exception:
+            efg = None
+
+        if efg is not None:
+            _, _, E, _, G = efg
+            len_u = max(float(np.sqrt(max(E, 1e-30))) * max(float(umax - umin), 1e-30), 1e-12)
+            len_v = max(float(np.sqrt(max(G, 1e-30))) * max(float(vmax - vmin), 1e-30), 1e-12)
+            h_u = len_u / max(int(n_u), 2)
+            h_v = len_v / max(int(n_v), 2)
+            h = 0.5 * (h_u + h_v)
+            if np.isfinite(h) and h > 0.0:
+                return float(h)
+
+        bbox = cls.face_bounding_box(face)
+        dx = float(bbox["xmax"] - bbox["xmin"])
+        dy = float(bbox["ymax"] - bbox["ymin"])
+        dz = float(bbox["zmax"] - bbox["zmin"])
+        diag = max(float(np.sqrt(dx * dx + dy * dy + dz * dz)), 1e-9)
+        return float(max(diag * float(fallback_rel), 1e-6))
+
+    @classmethod
+    def triangulate_face_gmsh(
+        cls,
+        face,
+        n_u: int = 80,
+        n_v: int = 40,
+        size_scale: float = 1.0,
+        algorithm: int = 6,
+    ):
+        if gmsh is None:
+            return None
+
+        target_size = float(max(size_scale, 1e-6)) * cls.estimate_face_target_size(face, n_u=n_u, n_v=n_v)
+
+        with tempfile.NamedTemporaryFile(suffix=".brep") as tmp:
+            write_ok = None
+            if hasattr(breptools, "Write"):
+                write_ok = breptools.Write(face, tmp.name)
+            else:
+                write_ok = breptools_Write(face, tmp.name)
+            if not write_ok:
+                return None
+
+            gmsh.initialize()
+            try:
+                gmsh.option.setNumber("General.Terminal", 0)
+                gmsh.model.add("face_mesh")
+                gmsh.model.occ.importShapes(tmp.name)
+                gmsh.model.occ.synchronize()
+
+                gmsh.option.setNumber("Mesh.Algorithm", int(algorithm))
+                gmsh.option.setNumber("Mesh.ElementOrder", 1)
+                gmsh.option.setNumber("Mesh.MeshSizeMin", float(target_size))
+                gmsh.option.setNumber("Mesh.MeshSizeMax", float(target_size))
+                gmsh.option.setNumber("Mesh.MeshSizeFromCurvature", 0)
+                gmsh.option.setNumber("Mesh.MeshSizeFromPoints", 0)
+                gmsh.option.setNumber("Mesh.MeshSizeExtendFromBoundary", 0)
+
+                surfaces = gmsh.model.getEntities(2)
+                if len(surfaces) == 0:
+                    return None
+
+                gmsh.model.mesh.generate(2)
+
+                _, surf_tag = surfaces[0]
+                node_tags, node_coords, node_uv = gmsh.model.mesh.getNodes(
+                    2, surf_tag, includeBoundary=True, returnParametricCoord=True
+                )
+                if len(node_tags) == 0:
+                    return None
+
+                xyz = np.asarray(node_coords, dtype=float).reshape(-1, 3)
+                uv = np.asarray(node_uv, dtype=float).reshape(-1, 2)
+                tag_to_local = {int(tag): i for i, tag in enumerate(node_tags)}
+
+                elem_types, _, elem_node_tags = gmsh.model.mesh.getElements(2, surf_tag)
+                faces = []
+                for etype, conn in zip(elem_types, elem_node_tags):
+                    conn = np.asarray(conn, dtype=np.int64)
+                    if int(etype) != 2:
+                        continue
+                    tri = conn.reshape(-1, 3)
+                    for a, b, c in tri:
+                        if int(a) not in tag_to_local or int(b) not in tag_to_local or int(c) not in tag_to_local:
+                            continue
+                        faces.append([tag_to_local[int(a)], tag_to_local[int(b)], tag_to_local[int(c)]])
+
+                if len(faces) == 0:
+                    return None
+
+                return xyz, uv, np.asarray(faces, dtype=np.int64)
+            finally:
+                gmsh.finalize()
 
     # =========================================================================
     # 4) UV normalization + metric
@@ -376,12 +496,49 @@ class CADTensorGenerator:
         return np.asarray(V, float), np.asarray(UV, float), np.asarray(F, np.int64)
 
     @classmethod
-    def triangulate_face(cls, face, n_u=80, n_v=40, tol=1e-7):
-        if cls.is_manual_mesh_face(face):
+    def triangulate_face(
+        cls,
+        face,
+        n_u=80,
+        n_v=40,
+        tol=1e-7,
+        freeform_mesher: str = "auto",
+        gmsh_size_scale: float = 1.0,
+        gmsh_algorithm: int = 6,
+    ):
+        # if cls.is_manual_mesh_face(face):
+        #     tri = cls.triangulate_face_uv_grid(face, n_u=n_u, n_v=n_v, tol=tol)
+        #     if tri is not None:
+        #         return tri
+        mesher = str(freeform_mesher).lower()
+
+        if mesher in ("auto", "gmsh") and cls.gmsh_is_available():
+            tri = cls.triangulate_face_gmsh(
+                face,
+                n_u=n_u,
+                n_v=n_v,
+                size_scale=gmsh_size_scale,
+                algorithm=gmsh_algorithm,
+            )
+            if tri is not None:
+                print("Model is meshed using Gmsh tool")
+                return tri
+            if mesher == "gmsh":
+                raise RuntimeError("Gmsh meshing failed for free-form face.")
+
+        if mesher == "manual" and cls.is_manual_mesh_face(face):
             tri = cls.triangulate_face_uv_grid(face, n_u=n_u, n_v=n_v, tol=tol)
             if tri is not None:
+                print("Model is meshed using Manual tool")
                 return tri
-        return cls.triangulate_face_occ(face)
+            raise RuntimeError("Manual meshing failed for supported face.")
+
+        tri = cls.triangulate_face_occ(face)
+        if tri is not None:
+            print("Model is meshed using OpenCascade tool")
+            return tri
+
+        raise RuntimeError("OpenCascade meshing failed for face.")
 
 
     @staticmethod
@@ -688,7 +845,15 @@ class CADTensorGenerator:
             (umin, umax, vmin, vmax), surf = self.face_uv_bounds_and_surface(face)
             surface_u_periodic, surface_v_periodic, u_period, v_period = self.face_uv_periodicity(face)
 
-            tri = self.triangulate_face(face, n_u=self.n_u, n_v=self.n_v, tol=1e-7)
+            tri = self.triangulate_face(
+                face,
+                n_u=self.n_u,
+                n_v=self.n_v,
+                tol=1e-7,
+                freeform_mesher=self.freeform_mesher,
+                gmsh_size_scale=self.gmsh_size_scale,
+                gmsh_algorithm=self.gmsh_algorithm,
+            )
             if tri is None:
                 print(f"[warn] face {face_id}: no triangulation, skipped")
                 continue
@@ -1230,8 +1395,19 @@ class CADTensorGenerator:
           CAD file -> mesh_df/faces_df -> tensors
 
         mode:
-          - "mesh": original OCC/manual triangulation path
-          - "points_triangulated": area-weighted surface sampling + UV triangulation
+          - "mesh": face triangulation path; free-form faces can use gmsh if enabled
+          - "points_triangulated" / "Sampled_points": area-weighted surface sampling + UV triangulation
+
+        Visualization note:
+          - Downstream visualization uses the returned `points_xyz` and `pv_faces`,
+            so the displayed resolution follows the mesh built here.
+          - To increase resolution in mode="mesh":
+              * OCC path: decrease `deflection` and/or `angle`
+              * manual UV path: increase `n_u` and `n_v`
+              * Gmsh path: decrease `gmsh_size_scale`
+          - To increase resolution in mode="points_triangulated":
+              * increase `M_per_face`
+              * optionally decrease `triangulation_max_edge_rel`
         """
         if mode == "mesh":
             mesh_df, faces_df = self.export_face_mesh_metric(
@@ -1239,7 +1415,7 @@ class CADTensorGenerator:
                 visualize=visualize,
                 visualize_face_id=visualize_face_id,
             )
-        elif mode == "Sampled_points":
+        elif mode in ("Sampled_points", "points_triangulated"):
             if M_per_face is None:
                 raise ValueError("M_per_face must be provided when mode='points_triangulated'.")
             mesh_df, faces_df = self.export_face_mesh_metric_points_triangulated(

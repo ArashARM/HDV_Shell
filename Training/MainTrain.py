@@ -120,6 +120,9 @@ class TrainingConfig:
     boundary_vol_weight: float = 0.20
     effective_volume_power: float = 2.0
     lam_vol_effective: float = 0.5
+    lam_vol_sharp: float = 0.5
+    sharp_vol_start_frac: float = 0.6
+    sharp_vol_ramp_frac: float = 0.3
 
     Offset_scale: float = 1.00
     scheduler_milestones: tuple[float, ...] = (80, 160)
@@ -320,8 +323,11 @@ class NN_Trainer:
         self._tb_add_scalar("Physics/ComplianceRaw", row["comp"], step)
         self._tb_add_scalar("Physics/VolumeFraction", row["vol_frac"], step)
         self._tb_add_scalar("Physics/VolumeFractionEffective", row["vol_frac_eff"], step)
+        self._tb_add_scalar("Physics/VolumeFractionSharp", row["vol_frac_sharp"], step)
         self._tb_add_scalar("Physics/VolumeDeviation", row["vol_dev"], step)
         self._tb_add_scalar("Physics/VolumeDeviationEffective", row["vol_dev_eff"], step)
+        self._tb_add_scalar("Loss/VolumeSharp", row["loss_vol_sharp"], step)
+        self._tb_add_scalar("Train/SharpVolRamp", row["sharp_vol_ramp"], step)
         self._tb_add_scalar("Physics/RhoBoundaryMean", row["rho_boundary_mean"], step)
         self._tb_add_scalar("Physics/RhoVoronoiMean", row["rho_v_mean"], step)
         self._tb_add_scalar("Physics/WGeoMean", row["w_geo_mean"], step)
@@ -498,6 +504,18 @@ class NN_Trainer:
         vol_frac_eff = cls.powered_volume_fraction(rho=rho, A_v=A_v, power=power, eps=eps)
         loss = (vol_frac_eff - target_volfrac) ** 2
         return loss, vol_frac_eff
+
+    @staticmethod
+    def ramp_weight(step: int, total_steps: int, start_frac: float, ramp_frac: float) -> float:
+        if total_steps <= 0:
+            return 0.0
+        start_step = max(int(start_frac * total_steps), 0)
+        ramp_steps = max(int(ramp_frac * total_steps), 1)
+        if step <= start_step:
+            return 0.0
+        if step >= start_step + ramp_steps:
+            return 1.0
+        return float(step - start_step) / float(ramp_steps)
 
     @staticmethod
     def gate_target_loss(
@@ -1178,6 +1196,55 @@ class NN_Trainer:
         v = torch.stack(values)
         w = torch.stack(weights).to(dtype=v.dtype, device=v.device)
         return (v * w).sum() / w.sum().clamp_min(eps)
+
+    @staticmethod
+    def _build_face_uv_grid(ft, grid_res_u, grid_res_v):
+        uv_face = ft["uv"]
+        device = uv_face.device
+        dtype = uv_face.dtype
+        u = uv_face[:, 0]
+        v = uv_face[:, 1]
+
+        if bool(ft.get("u_periodic", False)):
+            u_lin = torch.linspace(0.0, 1.0, grid_res_u + 1, device=device, dtype=dtype)[:-1]
+        else:
+            u_lin = torch.linspace(u.min(), u.max(), grid_res_u, device=device, dtype=dtype)
+
+        if bool(ft.get("v_periodic", False)):
+            v_lin = torch.linspace(0.0, 1.0, grid_res_v + 1, device=device, dtype=dtype)[:-1]
+        else:
+            v_lin = torch.linspace(v.min(), v.max(), grid_res_v, device=device, dtype=dtype)
+
+        UU, VV = torch.meshgrid(u_lin, v_lin, indexing="ij")
+        uv_grid = torch.stack([UU.reshape(-1), VV.reshape(-1)], dim=1)
+        return uv_grid, u_lin, v_lin
+
+    @staticmethod
+    def _periodic_uv_min_dist(uv_query, uv_face, u_periodic=False, v_periodic=False, chunk_size=4096):
+        if uv_query.numel() == 0 or uv_face.numel() == 0:
+            return torch.empty((uv_query.shape[0],), device=uv_query.device, dtype=uv_query.dtype)
+
+        mins = []
+        for start in range(0, uv_query.shape[0], chunk_size):
+            q = uv_query[start:start + chunk_size]
+            diff = q.unsqueeze(1) - uv_face.unsqueeze(0)
+            if u_periodic:
+                du = diff[..., 0]
+                diff[..., 0] = du - torch.round(du)
+            if v_periodic:
+                dv = diff[..., 1]
+                diff[..., 1] = dv - torch.round(dv)
+            mins.append(torch.norm(diff, dim=-1).min(dim=1).values)
+        return torch.cat(mins, dim=0)
+
+    @staticmethod
+    def _wrapped_grid_next(idx, size, periodic):
+        nxt = idx + 1
+        if periodic:
+            return (idx + 1) % size
+        if nxt >= size:
+            return None
+        return nxt
     def _make_density_image(self, face_tensors, rho_global, res=256):
 
 
@@ -1226,18 +1293,28 @@ class NN_Trainer:
             device = ft["uv"].device
             dtype = ft["uv"].dtype
             uv_face = ft["uv"]
+            u_periodic = bool(ft.get("u_periodic", False))
+            v_periodic = bool(ft.get("v_periodic", False))
 
-            u = uv_face[:, 0]
-            v = uv_face[:, 1]
-
-            u_lin = torch.linspace(u.min(), u.max(), grid_res_u, device=device, dtype=dtype)
-            v_lin = torch.linspace(v.min(), v.max(), grid_res_v, device=device, dtype=dtype)
-            UU, VV = torch.meshgrid(u_lin, v_lin, indexing="ij")
-            uv_grid = torch.stack([UU.reshape(-1), VV.reshape(-1)], dim=1)
+            uv_grid, _u_lin, _v_lin = self._build_face_uv_grid(ft, grid_res_u, grid_res_v)
 
             if uv_mask_tol is None:
                 if uv_face.shape[0] >= 2:
                     d_self = torch.cdist(uv_face, uv_face)
+                    if u_periodic:
+                        du = uv_face[:, None, 0] - uv_face[None, :, 0]
+                        d_self = torch.sqrt(
+                            (du - torch.round(du)).pow(2)
+                            + (uv_face[:, None, 1] - uv_face[None, :, 1]).pow(2)
+                        )
+                    if v_periodic:
+                        dv = uv_face[:, None, 1] - uv_face[None, :, 1]
+                        du = uv_face[:, None, 0] - uv_face[None, :, 0]
+                        if u_periodic:
+                            du = du - torch.round(du)
+                        d_self = torch.sqrt(
+                            du.pow(2) + (dv - torch.round(dv)).pow(2)
+                        )
                     big = torch.eye(uv_face.shape[0], device=device, dtype=d_self.dtype) * 1e6
                     d_self = d_self + big
                     spacing = d_self.min(dim=1).values.median()
@@ -1247,8 +1324,12 @@ class NN_Trainer:
             else:
                 uv_mask_tol_i = uv_mask_tol
 
-            d_uv = torch.cdist(uv_grid, uv_face)
-            dmin = d_uv.min(dim=1).values
+            dmin = self._periodic_uv_min_dist(
+                uv_grid,
+                uv_face,
+                u_periodic=u_periodic,
+                v_periodic=v_periodic,
+            )
             mask_dense_prefilter = dmin <= uv_mask_tol_i
             uv_query = uv_grid[mask_dense_prefilter]
 
@@ -1610,19 +1691,13 @@ class NN_Trainer:
         dtype = ft["uv"].dtype
 
         uv_face = ft["uv"]
-        
+        u_periodic = bool(ft.get("u_periodic", False))
+        v_periodic = bool(ft.get("v_periodic", False))
 
         # ------------------------------------------------------------
         # 1) Dense UV grid in normalized face UV coordinates
         # ------------------------------------------------------------
-        u = uv_face[:, 0]
-        v = uv_face[:, 1]
-
-        u_lin = torch.linspace(u.min(), u.max(), grid_res_u, device=device, dtype=dtype)
-        v_lin = torch.linspace(v.min(), v.max(), grid_res_v, device=device, dtype=dtype)
-
-        UU, VV = torch.meshgrid(u_lin, v_lin, indexing="ij")
-        uv_grid = torch.stack([UU.reshape(-1), VV.reshape(-1)], dim=1)  # (Nu*Nv, 2)
+        uv_grid, _u_lin, _v_lin = self._build_face_uv_grid(ft, grid_res_u, grid_res_v)
 
         # ------------------------------------------------------------
         # 2) Optional UV-cloud prefilter
@@ -1631,6 +1706,21 @@ class NN_Trainer:
         if uv_mask_tol is None:
             if uv_face.shape[0] >= 2:
                 d_self = torch.cdist(uv_face, uv_face)
+                if u_periodic:
+                    du = uv_face[:, None, 0] - uv_face[None, :, 0]
+                    d_self = d_self.clone()
+                    d_self = torch.sqrt(
+                        (du - torch.round(du)).pow(2)
+                        + (uv_face[:, None, 1] - uv_face[None, :, 1]).pow(2)
+                    )
+                if v_periodic:
+                    dv = uv_face[:, None, 1] - uv_face[None, :, 1]
+                    du = uv_face[:, None, 0] - uv_face[None, :, 0]
+                    if u_periodic:
+                        du = du - torch.round(du)
+                    d_self = torch.sqrt(
+                        du.pow(2) + (dv - torch.round(dv)).pow(2)
+                    )
                 big = torch.eye(uv_face.shape[0], device=device, dtype=d_self.dtype) * 1e6
                 d_self = d_self + big
                 spacing = d_self.min(dim=1).values.median()
@@ -1638,8 +1728,12 @@ class NN_Trainer:
             else:
                 uv_mask_tol = 0.05
 
-        d_uv = torch.cdist(uv_grid, uv_face)
-        dmin = d_uv.min(dim=1).values
+        dmin = self._periodic_uv_min_dist(
+            uv_grid,
+            uv_face,
+            u_periodic=u_periodic,
+            v_periodic=v_periodic,
+        )
         mask_dense_prefilter = dmin <= uv_mask_tol
         uv_query = uv_grid[mask_dense_prefilter]
 
@@ -1746,6 +1840,7 @@ class NN_Trainer:
         )
 
         return {
+            "face_id": ft["face_id"],
             "uv_dense": uv_dense,
             "uv_raw_dense": uv_raw_dense,
             "xyz_dense": xyz_dense,
@@ -1842,6 +1937,22 @@ class NN_Trainer:
             "face_ranges": face_ranges,
             "per_face": per_face,
         }
+
+    @staticmethod
+    def _resolve_visualization_grid_resolution(
+        grid_res_u: int,
+        grid_res_v: int,
+        dense_factor: float = 1.0,
+        min_res: int = 8,
+        max_res: int = 1024,
+    ) -> tuple[int, int]:
+        dense_factor = float(max(dense_factor, 1e-3))
+        res_u = int(round(float(grid_res_u) * dense_factor))
+        res_v = int(round(float(grid_res_v) * dense_factor))
+        res_u = max(int(min_res), min(int(max_res), res_u))
+        res_v = max(int(min_res), min(int(max_res), res_v))
+        return res_u, res_v
+
     def visualize_result_final_smooth_points(
         self,
         result,
@@ -1850,10 +1961,20 @@ class NN_Trainer:
         grid_res_u: int = 120,
         grid_res_v: int = 120,
         uv_mask_tol: float | None = None,
+        dense_factor: float = 1.0,
     ):
         """
         Smooth point-cloud style threshold visualization from dense CAD-native decoder sampling.
+
+        `dense_factor` scales the internal UV sampling density used for visualization.
+        Larger values produce a denser point cloud and finer visual detail.
         """
+        grid_res_u, grid_res_v = self._resolve_visualization_grid_resolution(
+            grid_res_u=grid_res_u,
+            grid_res_v=grid_res_v,
+            dense_factor=dense_factor,
+        )
+
         dense = self.sample_result_field_dense_for_visualization(
             result=result,
             shape_or_path=shape_or_path,
@@ -1871,7 +1992,7 @@ class NN_Trainer:
 
         print(
             f"Smooth CAD-native visualization: kept {keep.sum()} / {keep.shape[0]} dense points "
-            f"with threshold {thr:.3f}"
+            f"with threshold {thr:.3f} on grid ({grid_res_u} x {grid_res_v})"
         )
 
 
@@ -1905,9 +2026,16 @@ class NN_Trainer:
         uv_mask_tol: float | None = None,
         show_density: bool = True,
         auto_target_volfrac: float | None = None,
+        dense_factor: float = 1.0,
     ):
         import pyvista as pv
         import numpy as np
+
+        grid_res_u, grid_res_v = self._resolve_visualization_grid_resolution(
+            grid_res_u=grid_res_u,
+            grid_res_v=grid_res_v,
+            dense_factor=dense_factor,
+        )
 
         dense = self.sample_result_field_dense_for_visualization(
             result=result,
@@ -1955,7 +2083,8 @@ class NN_Trainer:
             f"[smooth_surface] thr={thr_used:.4f} | "
             f"volfrac_cont(rho)={volfrac_cont:.4f} | "
             f"volfrac_thr(binary)={volfrac_thr:.4f} | "
-            f"target={self.cfg.target_volfrac:.4f}"
+            f"target={self.cfg.target_volfrac:.4f} | "
+            f"grid=({grid_res_u} x {grid_res_v})"
         )
 
         plotter = pv.Plotter()
@@ -1964,6 +2093,10 @@ class NN_Trainer:
             uv_dense = face_data["uv_dense"]
             xyz = face_data["xyz_dense"].detach().cpu().numpy()
             rho = face_data["rho_dense"].detach().cpu().numpy()
+            face_id = face_data["face_id"]
+            ft = next(ft_i for ft_i in result["face_tensors"] if ft_i["face_id"] == face_id)
+            u_periodic = bool(ft.get("u_periodic", False))
+            v_periodic = bool(ft.get("v_periodic", False))
 
             Nu, Nv = face_data["grid_shape"]
 
@@ -1979,13 +2112,22 @@ class NN_Trainer:
             def idx(i, j):
                 return i * Nv + j
 
-            for i in range(Nu - 1):
-                for j in range(Nv - 1):
+            max_i = Nu if u_periodic else (Nu - 1)
+            max_j = Nv if v_periodic else (Nv - 1)
+
+            for i in range(max_i):
+                i2g = self._wrapped_grid_next(i, Nu, u_periodic)
+                if i2g is None:
+                    continue
+                for j in range(max_j):
+                    j2g = self._wrapped_grid_next(j, Nv, v_periodic)
+                    if j2g is None:
+                        continue
                     ids = [
                         idx(i, j),
-                        idx(i, j + 1),
-                        idx(i + 1, j),
-                        idx(i + 1, j + 1),
+                        idx(i, j2g),
+                        idx(i2g, j),
+                        idx(i2g, j2g),
                     ]
 
                     mapped = [full_indices[k] for k in ids]
@@ -2031,6 +2173,7 @@ class NN_Trainer:
         grid_res_u: int = 180,
         grid_res_v: int = 180,
         uv_mask_tol: float | None = None,
+        dense_factor: float = 1.0,
     ):
         """
         Debug boundary attachment on a single face:
@@ -2039,6 +2182,12 @@ class NN_Trainer:
         3) decoder boundary field rho_b
         """
         import matplotlib.pyplot as plt
+
+        grid_res_u, grid_res_v = self._resolve_visualization_grid_resolution(
+            grid_res_u=grid_res_u,
+            grid_res_v=grid_res_v,
+            dense_factor=dense_factor,
+        )
 
         face_tensors = result["face_tensors"]
         decoders = result["decoders"]
@@ -2144,7 +2293,8 @@ class NN_Trainer:
             f"[Face {face_id}] "
             f"boundary_pts={0 if boundary_uv is None else int(boundary_uv.shape[0])} | "
             f"dmin(min/mean/max)=({dmin_min:.3e}/{dmin_mean:.3e}/{dmin_max:.3e}) | "
-            f"rho_b(min/mean/max)=({float(rho_b.min().item()):.3e}/{float(rho_b.mean().item()):.3e}/{float(rho_b.max().item()):.3e})"
+            f"rho_b(min/mean/max)=({float(rho_b.min().item()):.3e}/{float(rho_b.mean().item()):.3e}/{float(rho_b.max().item()):.3e}) | "
+            f"grid=({grid_res_u} x {grid_res_v})"
         )
 
         return {
@@ -2442,6 +2592,9 @@ class NN_Trainer:
                 rho_v_acc = torch.zeros((vertices_number,), dtype=dtype, device=device)
                 rho_v_wgt = torch.zeros((vertices_number,), dtype=dtype, device=device)
 
+                rho_s_acc = torch.zeros((vertices_number,), dtype=dtype, device=device)
+                rho_s_wgt = torch.zeros((vertices_number,), dtype=dtype, device=device)
+
                 fiber_acc = torch.zeros((vertices_number, 3), dtype=dtype, device=device)
                 fiber_wgt = torch.zeros((vertices_number,), dtype=dtype, device=device)
 
@@ -2583,6 +2736,7 @@ class NN_Trainer:
                         [
                             "seeds",
                             "rho",
+                            "rho_s",
                             "fiber3d",
                             "w_geo",
                             "rho_v",
@@ -2600,6 +2754,7 @@ class NN_Trainer:
 
                     seeds_i = decoder_out["seeds"]
                     rho_i = decoder_out["rho"]
+                    rho_s_i = decoder_out["rho_s"]
                     w_geo_i = decoder_out["w_geo"]
                     fiber3d_i = decoder_out["fiber3d"]
                     rho_v_i = decoder_out["rho_v"]
@@ -2620,6 +2775,7 @@ class NN_Trainer:
                     for name, t in {
                         "seeds_i": seeds_i,
                         "rho_i": rho_i,
+                        "rho_s_i": rho_s_i,
                         "fiber3d_i": fiber3d_i,
                         "rho_v_i": rho_v_i,
                         "rho_b_i": rho_b_i,
@@ -2642,6 +2798,9 @@ class NN_Trainer:
 
                     rho_v_acc[gidx] += rho_v_i * w_local
                     rho_v_wgt[gidx] += w_local
+
+                    rho_s_acc[gidx] += rho_s_i * w_local
+                    rho_s_wgt[gidx] += w_local
 
                     fiber_acc[gidx] += fiber3d_i * w_local[:, None]
                     fiber_wgt[gidx] += w_local
@@ -2761,6 +2920,7 @@ class NN_Trainer:
                 rho = rho_acc / rho_wgt.clamp_min(cfg.eps)
                 rho_boundary = rho_b_acc / rho_b_wgt.clamp_min(cfg.eps)
                 rho_v_all = rho_v_acc / rho_v_wgt.clamp_min(cfg.eps)
+                rho_s_all = rho_s_acc / rho_s_wgt.clamp_min(cfg.eps)
 
                 fiber_surface = fiber_acc / fiber_wgt.clamp_min(cfg.eps)[:, None]
                 fiber_norm = fiber_surface.norm(dim=1, keepdim=True).clamp_min(cfg.eps)
@@ -2815,11 +2975,24 @@ class NN_Trainer:
                     power=cfg.effective_volume_power,
                     eps=cfg.eps,
                 )
+                sharp_vol_ramp = self.ramp_weight(
+                    step=step,
+                    total_steps=cfg.num_steps,
+                    start_frac=cfg.sharp_vol_start_frac,
+                    ramp_frac=cfg.sharp_vol_ramp_frac,
+                )
+                loss_vol_sharp, vol_frac_sharp = self.volume_loss_constant_height(
+                    rho=rho_s_all,
+                    A_v=A_v,
+                    target_volfrac=cfg.target_volfrac,
+                    eps=cfg.eps,
+                ), (rho_s_all * A_v).sum() / (A_v.sum() + cfg.eps)
 
                 loss_vol = (
                     loss_vol_v
                     + cfg.boundary_volume_assist * loss_vol_total
                     + cfg.lam_vol_effective * loss_vol_eff_v
+                    + (cfg.lam_vol_sharp * sharp_vol_ramp) * loss_vol_sharp
                 )
 
                 if cfg.use_boundary_weighted_volume:
@@ -2838,7 +3011,18 @@ class NN_Trainer:
                         power=cfg.effective_volume_power,
                         eps=cfg.eps,
                     )
-                    loss_vol = loss_vol_base + cfg.lam_vol_effective * loss_vol_eff_weighted
+                    sharp_weights = (1.0 - rho_boundary + cfg.boundary_vol_weight * rho_boundary) * A_v
+                    loss_vol_sharp, vol_frac_sharp = self.volume_loss_constant_height(
+                        rho=rho_s_all,
+                        A_v=sharp_weights,
+                        target_volfrac=cfg.target_volfrac,
+                        eps=cfg.eps,
+                    ), (rho_s_all * sharp_weights).sum() / (sharp_weights.sum() + cfg.eps)
+                    loss_vol = (
+                        loss_vol_base
+                        + cfg.lam_vol_effective * loss_vol_eff_weighted
+                        + (cfg.lam_vol_sharp * sharp_vol_ramp) * loss_vol_sharp
+                    )
                     vol_frac_weighted_cont = vol_frac_weighted
                 else:
                     vol_frac_weighted_cont = vol_frac_v
@@ -3076,6 +3260,7 @@ class NN_Trainer:
                         "comp": self._finite_or_default(comp_val),
                         "vol_frac": float(vol_frac.detach().item()),
                         "vol_frac_eff": float(vol_frac_eff.detach().item()),
+                        "vol_frac_sharp": float(vol_frac_sharp.detach().item()),
                         "vol_dev": float(vol_dev.detach().item()),
                         "vol_dev_eff": float(vol_dev_eff.detach().item()),
                         "rho_min": rho_min,
@@ -3095,6 +3280,8 @@ class NN_Trainer:
                         "fem_valid": fem_is_valid,
                         "fem_failure_reason": fem_failure_reason,
                         "optimizer_step_skipped": not total_is_finite,
+                        "loss_vol_sharp": self._finite_or_default(loss_vol_sharp),
+                        "sharp_vol_ramp": float(sharp_vol_ramp),
 
                         "w_geo_mean": self._finite_or_default(w_geo_mean),
                         "h_mean": self._finite_or_default(h_mean),
