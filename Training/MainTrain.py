@@ -46,21 +46,6 @@ class TrainingConfig:
     boundary_attach_beta_min: float = 0.003
     boundary_attach_beta_max: float = 0.05
 
-    # pair-gating bounds
-    gap_thr_min: float = 0.00
-    gap_thr_max: float = 0.50
-    big_thr_min: float = 0.00
-    big_thr_max: float = 0.60
-    alpha_min: float = 0.01
-    alpha_max: float = 0.20
-    eta_min: float = 0.01
-    eta_max: float = 0.20
-
-    gap_thr_default: float = 0.15
-    big_thr_default: float = 0.10
-    alpha_default: float = 0.05
-    eta_default: float = 0.05
-
     gate_sharpen_gamma: float = 4.0
 
     w_min: float = 0.005
@@ -91,7 +76,6 @@ class TrainingConfig:
     lr_mlp: float = 2e-4
     lr_w_head: float = 2e-4
     lr_h_head: float = 2e-4
-    lr_pair_heads: float = 2e-4
     lr_boundary_heads: float = 2e-4
 
     log_every: int = 50
@@ -103,7 +87,14 @@ class TrainingConfig:
     lr_gate_head: float = 5e-5
     gate_active_threshold: float = 0.5
     gate_eps: float = 1e-8
-    gate_bias_init: float = 2.0
+    gate_bias_init: float = math.log(0.45 / 0.55)
+    Gating_binirize_sharpness: float = 20.0
+    Gating_binirize_limit: float = 0.45
+    use_hard_gate_mask: bool = False
+    hard_gate_start_frac: float = 0.90
+    hard_gate_allow_early_stability: bool = True
+    hard_gate_stability_patience: int = 200
+    hard_gate_min_frac_for_stability: float = 0.25
 
     lam_gate_count: float = 2.0
     gate_target_count: float = 10.0
@@ -111,8 +102,6 @@ class TrainingConfig:
     gate_binary_warmup_steps: int = 40
     gate_warmup_steps: int = 20
 
-    # NEW: PPNet predicts these decoder controls
-    predict_pair_gating: bool = True
     predict_boundary_width: bool = True
 
     eps: float = 1e-12
@@ -349,10 +338,6 @@ class NN_Trainer:
             step,
         )
         self._tb_add_scalar("Geometry/HMean", row["h_mean"], step)
-        self._tb_add_scalar("PairGating/GapThr", row["gap_thr_mean"], step)
-        self._tb_add_scalar("PairGating/BigThr", row["big_thr_mean"], step)
-        self._tb_add_scalar("PairGating/Alpha", row["alpha_mean"], step)
-        self._tb_add_scalar("PairGating/Eta", row["eta_mean"], step)
 
         self._tb_add_scalar("Boundary/Width", row["boundary_width_mean"], step)
         self._tb_add_scalar("Boundary/Alpha", row["boundary_alpha_mean"], step)
@@ -364,9 +349,16 @@ class NN_Trainer:
         self._tb_add_scalar("gate/active_count_total", row["active_count_total"], step)
         self._tb_add_scalar("gate/active_count_mean", row["active_count_mean"], step)
         self._tb_add_scalar("gate/active_frac_mean", row["active_frac_mean"], step)
-        self._tb_add_scalar("gate/min", row["gate_min"], step)
-        self._tb_add_scalar("gate/mean", row["gate_mean"], step)
-        self._tb_add_scalar("gate/max", row["gate_max"], step)
+        self._tb_add_scalar("gate/raw/min", row["gate_raw_min"], step)
+        self._tb_add_scalar("gate/raw/mean", row["gate_raw_mean"], step)
+        self._tb_add_scalar("gate/raw/max", row["gate_raw_max"], step)
+        self._tb_add_scalar("gate/sharp/min", row["gate_sharp_min"], step)
+        self._tb_add_scalar("gate/sharp/mean", row["gate_sharp_mean"], step)
+        self._tb_add_scalar("gate/sharp/max", row["gate_sharp_max"], step)
+        self._tb_add_scalar("gate/decoder/min", row["gate_decoder_min"], step)
+        self._tb_add_scalar("gate/decoder/mean", row["gate_decoder_mean"], step)
+        self._tb_add_scalar("gate/decoder/max", row["gate_decoder_max"], step)
+        self._tb_add_scalar("gate/hard_mask_on", row["hard_gate_mask_on"], step)
         self._tb_add_scalar("Loss/Gate", row["loss_gate"], step)
         self._tb_add_scalar("gate/lam_eff", row["lam_gate_eff"], step)
         self._tb_add_scalar("Loss/GateBinary", row["loss_gate_binary"], step)
@@ -399,10 +391,6 @@ class NN_Trainer:
             if len(w_geo_vals) > 0:
                 self._tb_add_histogram("Geometry/WGeo", torch.cat(w_geo_vals, dim=0), step)
             
-            gap_thr_vals = []
-            big_thr_vals = []
-            alpha_vals = []
-            eta_vals = []
             bw_vals = []
             ba_vals = []
             bb_vals = []
@@ -411,14 +399,6 @@ class NN_Trainer:
             a_vals = []
 
             for p in pred_list:
-                if "gap_thr" in p and p["gap_thr"] is not None:
-                    gap_thr_vals.append(p["gap_thr"].reshape(-1))
-                if "big_thr" in p and p["big_thr"] is not None:
-                    big_thr_vals.append(p["big_thr"].reshape(-1))
-                if "alpha" in p and p["alpha"] is not None:
-                    alpha_vals.append(p["alpha"].reshape(-1))
-                if "eta" in p and p["eta"] is not None:
-                    eta_vals.append(p["eta"].reshape(-1))
                 if "boundary_width" in p and p["boundary_width"] is not None:
                     bw_vals.append(p["boundary_width"].reshape(-1))
                 if "boundary_alpha" in p and p["boundary_alpha"] is not None:
@@ -432,16 +412,35 @@ class NN_Trainer:
                 if "a_metric" in p and p["a_metric"] is not None:
                     a_vals.append(p["a_metric"].reshape(-1))
 
-            if gap_thr_vals: self._tb_add_histogram("PairGating/GapThrHist", torch.cat(gap_thr_vals, dim=0), step)
-            if big_thr_vals: self._tb_add_histogram("PairGating/BigThrHist", torch.cat(big_thr_vals, dim=0), step)
-            if alpha_vals: self._tb_add_histogram("PairGating/AlphaHist", torch.cat(alpha_vals, dim=0), step)
-            if eta_vals: self._tb_add_histogram("PairGating/EtaHist", torch.cat(eta_vals, dim=0), step)
             if bw_vals: self._tb_add_histogram("Boundary/WidthHist", torch.cat(bw_vals, dim=0), step)
             if ba_vals: self._tb_add_histogram("Boundary/AlphaHist", torch.cat(ba_vals, dim=0), step)
             if bb_vals: self._tb_add_histogram("Boundary/BetaHist", torch.cat(bb_vals, dim=0), step)
             if h_vals: self._tb_add_histogram("Geometry/HHist", torch.cat(h_vals, dim=0), step)
             if theta_vals: self._tb_add_histogram("Metric/ThetaHist", torch.cat(theta_vals, dim=0), step)
             if a_vals: self._tb_add_histogram("Metric/AHist", torch.cat(a_vals, dim=0), step)
+
+            gate_logit_vals = []
+            gate_raw_vals = []
+            gate_sharp_vals = []
+            gate_decoder_vals = []
+            for p in pred_list:
+                if p.get("gate_logits") is not None:
+                    gate_logit_vals.append(p["gate_logits"].reshape(-1))
+                if p.get("gate_probs_raw") is not None:
+                    gate_raw_vals.append(p["gate_probs_raw"].reshape(-1))
+                if p.get("gate_probs_sharp") is not None:
+                    gate_sharp_vals.append(p["gate_probs_sharp"].reshape(-1))
+                if p.get("gate_probs_decoder") is not None:
+                    gate_decoder_vals.append(p["gate_probs_decoder"].reshape(-1))
+
+            if gate_logit_vals:
+                self._tb_add_histogram("gate/logits", torch.cat(gate_logit_vals, dim=0), step)
+            if gate_raw_vals:
+                self._tb_add_histogram("gate/raw", torch.cat(gate_raw_vals, dim=0), step)
+            if gate_sharp_vals:
+                self._tb_add_histogram("gate/sharp", torch.cat(gate_sharp_vals, dim=0), step)
+            if gate_decoder_vals:
+                self._tb_add_histogram("gate/decoder", torch.cat(gate_decoder_vals, dim=0), step)
 
         if self.last_fem_debug:
             dbg = self.last_fem_debug
@@ -912,20 +911,6 @@ class NN_Trainer:
             boundary_attach_alpha_max=self.cfg.boundary_attach_alpha_max,
             boundary_attach_beta_min=self.cfg.boundary_attach_beta_min,
             boundary_attach_beta_max=self.cfg.boundary_attach_beta_max,
-
-            use_pair_gating=self.cfg.predict_pair_gating,
-            gap_thr_min=self.cfg.gap_thr_min,
-            gap_thr_max=self.cfg.gap_thr_max,
-            big_thr_min=self.cfg.big_thr_min,
-            big_thr_max=self.cfg.big_thr_max,
-            alpha_min=self.cfg.alpha_min,
-            alpha_max=self.cfg.alpha_max,
-            eta_min=self.cfg.eta_min,
-            eta_max=self.cfg.eta_max,
-            gap_thr_default=self.cfg.gap_thr_default,
-            big_thr_default=self.cfg.big_thr_default,
-            alpha_default=self.cfg.alpha_default,
-            eta_default=self.cfg.eta_default,
         ).to(device)
 
         ppnet = self.ppnet_cls(
@@ -934,9 +919,9 @@ class NN_Trainer:
             use_Metric_anisotropy=use_Metric_anisotropy,
             predict_height=(self.cfg.fixed_height is None),
             use_gating=self.cfg.use_gating,
-            predict_pair_gating=self.cfg.predict_pair_gating,
             predict_boundary_width=self.cfg.predict_boundary_width,
             freeze_w=freeze_w,
+            gate_bias_init=self.cfg.gate_bias_init,
         ).to(device)
 
         return decoder, ppnet
@@ -988,14 +973,6 @@ class NN_Trainer:
                 if hasattr(ppnet, "a_head"):
                     param_groups.append({"params": ppnet.a_head.parameters(), "lr": cfg.lr_mlp})
 
-            if cfg.predict_pair_gating:
-                for name in ["gap_thr_head", "big_thr_head", "alpha_head", "eta_head"]:
-                    if hasattr(ppnet, name):
-                        param_groups.append({
-                            "params": getattr(ppnet, name).parameters(),
-                            "lr": cfg.lr_pair_heads,
-                        })
-
             if cfg.predict_boundary_width and hasattr(ppnet, "boundary_width_head"):
                 param_groups.append({
                     "params": ppnet.boundary_width_head.parameters(),
@@ -1029,26 +1006,6 @@ class NN_Trainer:
 
         if "h_raw" in pred_i and pred_i["h_raw"] is not None:
             out["h"] = decoder.height(pred_i["h_raw"], ref_tensor=ref_tensor).reshape(())
-
-        if "gap_thr_raw" in pred_i and pred_i["gap_thr_raw"] is not None:
-            out["gap_thr"] = decoder._map_raw_to_range(
-                pred_i["gap_thr_raw"], decoder.gap_thr_min, decoder.gap_thr_max, temp=1.0
-            ).reshape(())
-
-        if "big_thr_raw" in pred_i and pred_i["big_thr_raw"] is not None:
-            out["big_thr"] = decoder._map_raw_to_range(
-                pred_i["big_thr_raw"], decoder.big_thr_min, decoder.big_thr_max, temp=1.0
-            ).reshape(())
-
-        if "alpha_raw" in pred_i and pred_i["alpha_raw"] is not None:
-            out["alpha"] = decoder._map_raw_to_range(
-                pred_i["alpha_raw"], decoder.alpha_min, decoder.alpha_max, temp=1.0
-            ).reshape(())
-
-        if "eta_raw" in pred_i and pred_i["eta_raw"] is not None:
-            out["eta"] = decoder._map_raw_to_range(
-                pred_i["eta_raw"], decoder.eta_min, decoder.eta_max, temp=1.0
-            ).reshape(())
 
         if "boundary_width_raw" in pred_i and pred_i["boundary_width_raw"] is not None:
             out["boundary_width"] = decoder.boundary_width(
@@ -1417,10 +1374,6 @@ class NN_Trainer:
             points_face_id=render_cache["local_face_id"],
             boundary_uv=render_cache["boundary_uv"],
             boundary_face_id=render_cache["boundary_face_id"],
-            gap_thr_raw=pred.get("gap_thr_raw", None),
-            big_thr_raw=pred.get("big_thr_raw", None),
-            alpha_raw=pred.get("alpha_raw", None),
-            eta_raw=pred.get("eta_raw", None),
             boundary_width_raw=pred.get("boundary_width_raw", None),
             boundary_alpha_raw=None,
             boundary_beta_raw=None,
@@ -1582,13 +1535,67 @@ class NN_Trainer:
             "gate_mean": float(g.mean().item()),
             "gate_max": float(g.max().item()),
         }
+
+    @staticmethod
+    def _gate_stats(gates: torch.Tensor | None) -> dict[str, float]:
+        if gates is None:
+            return {
+                "min": 0.0,
+                "mean": 0.0,
+                "max": 0.0,
+            }
+
+        g = gates.detach()
+        return {
+            "min": float(g.min().item()),
+            "mean": float(g.mean().item()),
+            "max": float(g.max().item()),
+        }
+
+    def _use_hard_gate_mask(self, step: int, steps_since_improve: int) -> bool:
+        cfg = self.cfg
+        if not getattr(cfg, "use_hard_gate_mask", False):
+            return False
+
+        start_step = int(round(float(cfg.hard_gate_start_frac) * float(cfg.num_steps)))
+        if step >= start_step:
+            return True
+
+        if not getattr(cfg, "hard_gate_allow_early_stability", True):
+            return False
+
+        min_step = int(round(float(cfg.hard_gate_min_frac_for_stability) * float(cfg.num_steps)))
+        if step < min_step:
+            return False
+
+        return steps_since_improve >= int(cfg.hard_gate_stability_patience)
+
+    def _decoder_gate_values(
+        self,
+        gates_struct: torch.Tensor | None,
+        use_hard_gate_mask: bool,
+        threshold: float,
+    ) -> torch.Tensor | None:
+        if gates_struct is None:
+            return None
+
+        if not use_hard_gate_mask:
+            return gates_struct
+
+        active = (gates_struct >= threshold)
+        if not bool(active.any()):
+            active = torch.zeros_like(active, dtype=torch.bool)
+            active[torch.argmax(gates_struct)] = True
+
+        return active.to(dtype=gates_struct.dtype)
+
     def _seed_points_xyz_and_gates_all_faces(self, seeds_list, pred_list, face_tensors):
         xyz_active = []
         xyz_inactive = []
         gate_active = []
         gate_inactive = []
 
-        thr = self.cfg.gate_active_threshold
+        thr = self.cfg.Gating_binirize_limit
 
         for seeds, pred, ft in zip(seeds_list, pred_list, face_tensors):
             xyz_i = self.generator.seeds_uv_to_xyz_nearest(
@@ -1632,13 +1639,12 @@ class NN_Trainer:
         }
     
     @staticmethod
-    def sharpen_gate_probs(gates: torch.Tensor | None, gamma: float, eps: float = 1e-8):
+    def sharpen_gate_probs(gates: torch.Tensor | None, Gating_binirize_sharpness:float = 20.0,Gating_binirize_limit:float = 0.45,eps: float = 1e-8):
         if gates is None:
             return None
-        g = gates.clamp(eps, 1.0 - eps)
-        a = g.pow(gamma)
-        b = (1.0 - g).pow(gamma)
-        return a / (a + b + eps)
+        g_raw = gates.clamp(eps, 1.0 - eps)
+        g_soft = torch.sigmoid(Gating_binirize_sharpness* (g_raw - Gating_binirize_limit))
+        return g_soft
     def visualize_best_seed_activity(self, result, points_xyz=None, faces_ijk=None):
         best_seeds = result["best_seeds"]
         best_pred = result["best_pred"]
@@ -1850,10 +1856,6 @@ class NN_Trainer:
         theta = pred.get("theta", None)
         a_raw = pred.get("a_raw", None)
 
-        gap_thr_raw = pred.get("gap_thr_raw", None)
-        big_thr_raw = pred.get("big_thr_raw", None)
-        alpha_raw = pred.get("alpha_raw", None)
-        eta_raw = pred.get("eta_raw", None)
         gates_i = pred.get("gate_probs", None)
         boundary_width_raw = pred.get("boundary_width_raw", None)
         boundary_alpha_raw = pred.get("boundary_alpha_raw", None)
@@ -1875,10 +1877,6 @@ class NN_Trainer:
             points_face_id=local_face_id,
             boundary_uv=boundary_uv_i,
             boundary_face_id=boundary_face_id_i,
-            gap_thr_raw=gap_thr_raw,
-            big_thr_raw=big_thr_raw,
-            alpha_raw=alpha_raw,
-            eta_raw=eta_raw,
             boundary_width_raw=boundary_width_raw,
             boundary_alpha_raw=None,
             boundary_beta_raw=None,
@@ -2512,6 +2510,9 @@ class NN_Trainer:
         all_global_idx = torch.cat([ft["global_vertex_idx"] for ft in face_tensors], dim=0)
         vertices_number = int(all_global_idx.max().item()) + 1
 
+        Gating_binirize_sharpness = cfg.Gating_binirize_sharpness
+        Gating_binirize_limit = cfg.Gating_binirize_limit
+
         # ------------------------------------------------------------
         # Build global vertex areas
         # ------------------------------------------------------------
@@ -2635,6 +2636,10 @@ class NN_Trainer:
             dynamic_ncols=True,
         ) as pbar:
             for step in pbar:
+                use_hard_gate_mask_step = self._use_hard_gate_mask(
+                    step=step,
+                    steps_since_improve=steps_since_improve,
+                )
                 rho_acc = torch.zeros((vertices_number,), dtype=dtype, device=device)
                 rho_wgt = torch.zeros((vertices_number,), dtype=dtype, device=device)
 
@@ -2661,11 +2666,6 @@ class NN_Trainer:
                 w_geo_terms = []
                 h_terms = []
 
-                gap_thr_terms = []
-                big_thr_terms = []
-                alpha_terms = []
-                eta_terms = []
-
                 boundary_width_terms = []
                 boundary_alpha_terms = []
                 boundary_beta_terms = []
@@ -2679,9 +2679,15 @@ class NN_Trainer:
 
                 active_count_total = 0.0
                 active_frac_sum = 0.0
-                gate_min_list = []
-                gate_mean_sum = 0.0
-                gate_max_list = []
+                gate_raw_min_list = []
+                gate_raw_mean_sum = 0.0
+                gate_raw_max_list = []
+                gate_sharp_min_list = []
+                gate_sharp_mean_sum = 0.0
+                gate_sharp_max_list = []
+                gate_decoder_min_list = []
+                gate_decoder_mean_sum = 0.0
+                gate_decoder_max_list = []
                 gate_face_count = 0
 
                 # ----------------------------------------------------
@@ -2705,47 +2711,63 @@ class NN_Trainer:
                     if cfg.fixed_height is None and "h_raw" in pred_i:
                         h_raw_i = pred_i["h_raw"][0]
 
-                    gates_i = pred_i.get("gate_probs", None)
-                    gates_i = gates_i[0] if gates_i is not None else None
+                    gate_logits_i = pred_i.get("gate_logits", None)
+                    gate_logits_i = gate_logits_i[0] if gate_logits_i is not None else None
+
+                    gate_probs_raw_i = pred_i.get("gate_probs", None)
+                    gate_probs_raw_i = gate_probs_raw_i[0] if gate_probs_raw_i is not None else None
 
                     gates_struct_i = self.sharpen_gate_probs(
-                        gates_i,
-                        gamma=cfg.gate_sharpen_gamma,
+                        gate_probs_raw_i,
+                        Gating_binirize_sharpness=Gating_binirize_sharpness,
+                        Gating_binirize_limit = Gating_binirize_limit,
                         eps=cfg.gate_eps,
+                    )
+                    gates_decoder_i = self._decoder_gate_values(
+                        gates_struct=gates_struct_i,
+                        use_hard_gate_mask=use_hard_gate_mask_step,
+                        threshold=Gating_binirize_limit,
                     )
 
                     theta_i = pred_i["theta"][0] if (cfg.use_Metric_anisotropy and "theta" in pred_i) else None
                     a_raw_i = pred_i["a_raw"][0] if (cfg.use_Metric_anisotropy and "a_raw" in pred_i) else None
 
-                    gap_thr_raw_i = pred_i["gap_thr_raw"][0] if ("gap_thr_raw" in pred_i) else None
-                    big_thr_raw_i = pred_i["big_thr_raw"][0] if ("big_thr_raw" in pred_i) else None
-                    alpha_raw_i = pred_i["alpha_raw"][0] if ("alpha_raw" in pred_i) else None
-                    eta_raw_i = pred_i["eta_raw"][0] if ("eta_raw" in pred_i) else None
-
                     boundary_width_raw_i = pred_i["boundary_width_raw"][0] if ("boundary_width_raw" in pred_i) else None
                     boundary_alpha_raw_i = None
                     boundary_beta_raw_i = None
 
-                    if gates_i is not None:
+                    if gates_decoder_i is not None:
+                        gate_stats_i = self._gate_activity_stats(
+                            gate_probs=gates_decoder_i,
+                            threshold=Gating_binirize_limit,
+                        )
+                        gate_raw_stats_i = self._gate_stats(gate_probs_raw_i)
+                        gate_sharp_stats_i = self._gate_stats(gates_struct_i)
+                        gate_decoder_stats_i = self._gate_stats(gates_decoder_i)
+                        active_count_total += gate_stats_i["active_count"]
+                        active_frac_sum += gate_stats_i["active_frac"]
+                        gate_raw_min_list.append(gate_raw_stats_i["min"])
+                        gate_raw_mean_sum += gate_raw_stats_i["mean"]
+                        gate_raw_max_list.append(gate_raw_stats_i["max"])
+                        gate_sharp_min_list.append(gate_sharp_stats_i["min"])
+                        gate_sharp_mean_sum += gate_sharp_stats_i["mean"]
+                        gate_sharp_max_list.append(gate_sharp_stats_i["max"])
+                        gate_decoder_min_list.append(gate_decoder_stats_i["min"])
+                        gate_decoder_mean_sum += gate_decoder_stats_i["mean"]
+                        gate_decoder_max_list.append(gate_decoder_stats_i["max"])
+                        gate_face_count += 1
+
+                        #gate_count_loss_i = torch.zeros((), dtype=gate_probs_raw_i.dtype, device=gate_probs_raw_i.device)
                         gate_count_loss_i = self.gate_count_loss(
-                            gates=gates_i,
+                            gates=gate_probs_raw_i,
                             target_count=cfg.gate_target_count,
                         )
                         gate_terms.append(gate_count_loss_i)
 
-                        gate_binary_loss_i = self.gate_binary_loss(gates_i)
+                        gate_binary_loss_i = self.gate_binary_loss(gates_decoder_i)
                         gate_binary_terms.append(gate_binary_loss_i)
 
-                        gate_stats_i = self._gate_activity_stats(
-                            gate_probs=gates_i,
-                            threshold=cfg.gate_active_threshold,
-                        )
-                        active_count_total += gate_stats_i["active_count"]
-                        active_frac_sum += gate_stats_i["active_frac"]
-                        gate_min_list.append(gate_stats_i["gate_min"])
-                        gate_mean_sum += gate_stats_i["gate_mean"]
-                        gate_max_list.append(gate_stats_i["gate_max"])
-                        gate_face_count += 1
+
 
                     local_face_id = torch.zeros(ft["uv"].shape[0], dtype=torch.long, device=device)
 
@@ -2773,14 +2795,10 @@ class NN_Trainer:
                         points_face_id=local_face_id,
                         boundary_uv=boundary_uv_i,
                         boundary_face_id=boundary_face_id_i,
-                        gap_thr_raw=gap_thr_raw_i,
-                        big_thr_raw=big_thr_raw_i,
-                        alpha_raw=alpha_raw_i,
-                        eta_raw=eta_raw_i,
                         boundary_width_raw=boundary_width_raw_i,
                         boundary_alpha_raw=boundary_alpha_raw_i,
                         boundary_beta_raw=boundary_beta_raw_i,
-                        seed_gates=gates_struct_i,
+                        seed_gates=gates_decoder_i,
                     )
 
                     self._require_decoder_keys(
@@ -2794,10 +2812,6 @@ class NN_Trainer:
                             "rho_v",
                             "rho_b",
                             "edge_field",
-                            "gap_thr",
-                            "big_thr",
-                            "alpha",
-                            "eta",
                             "boundary_width",
                             "boundary_alpha",
                             "boundary_beta",
@@ -2812,11 +2826,6 @@ class NN_Trainer:
                     rho_v_i = decoder_out["rho_v"]
                     rho_b_i = decoder_out["rho_b"]
                     edge_field_i = decoder_out["edge_field"]
-
-                    gap_thr_i = decoder_out["gap_thr"]
-                    big_thr_i = decoder_out["big_thr"]
-                    alpha_i = decoder_out["alpha"]
-                    eta_i = decoder_out["eta"]
 
                     boundary_width_i = decoder_out["boundary_width"]
                     boundary_alpha_i = decoder_out["boundary_alpha"]
@@ -2864,14 +2873,13 @@ class NN_Trainer:
                         "seeds_raw": seeds_raw_i.detach().clone(),
                         "w_raw": w_raw_i.detach().clone(),
                         "h_raw": None if h_raw_i is None else h_raw_i.detach().clone(),
-                        "gate_probs": None if gates_i is None else gates_i.detach().clone(),
+                        "gate_logits": None if gate_logits_i is None else gate_logits_i.detach().clone(),
+                        "gate_probs_raw": None if gate_probs_raw_i is None else gate_probs_raw_i.detach().clone(),
+                        "gate_probs_sharp": None if gates_struct_i is None else gates_struct_i.detach().clone(),
+                        "gate_probs_decoder": None if gates_decoder_i is None else gates_decoder_i.detach().clone(),
+                        "gate_probs": None if gates_decoder_i is None else gates_decoder_i.detach().clone(),
                         "theta": None if theta_i is None else theta_i.detach().clone(),
                         "a_raw": None if a_raw_i is None else a_raw_i.detach().clone(),
-
-                        "gap_thr_raw": None if gap_thr_raw_i is None else gap_thr_raw_i.detach().clone(),
-                        "big_thr_raw": None if big_thr_raw_i is None else big_thr_raw_i.detach().clone(),
-                        "alpha_raw": None if alpha_raw_i is None else alpha_raw_i.detach().clone(),
-                        "eta_raw": None if eta_raw_i is None else eta_raw_i.detach().clone(),
 
                         "boundary_width": boundary_width_i.detach().clone() if isinstance(boundary_width_i, torch.Tensor) else boundary_width_i,
                         "boundary_alpha": boundary_alpha_i.detach().clone() if isinstance(boundary_alpha_i, torch.Tensor) else boundary_alpha_i,
@@ -2879,11 +2887,6 @@ class NN_Trainer:
 
                         "w_geo": w_geo_i.detach().clone(),
                         "h": h_i.detach().clone() if isinstance(h_i, torch.Tensor) else h_i,
-
-                        "gap_thr": gap_thr_i.detach().clone() if isinstance(gap_thr_i, torch.Tensor) else gap_thr_i,
-                        "big_thr": big_thr_i.detach().clone() if isinstance(big_thr_i, torch.Tensor) else big_thr_i,
-                        "alpha": alpha_i.detach().clone() if isinstance(alpha_i, torch.Tensor) else alpha_i,
-                        "eta": eta_i.detach().clone() if isinstance(eta_i, torch.Tensor) else eta_i,
 
                         "boundary_width_raw": None if boundary_width_raw_i is None else boundary_width_raw_i.detach().clone(),
                         "boundary_alpha_raw": None,
@@ -2898,7 +2901,7 @@ class NN_Trainer:
                     rep_terms.append(
                         self.seed_repulsion_term(
                             seeds=seeds_i,
-                            gates=gates_struct_i,
+                            gates=gates_decoder_i,
                             sigma=cfg.seed_repulsion_sigma,
                             eps=cfg.eps,
                         )
@@ -2908,7 +2911,7 @@ class NN_Trainer:
                         self.boundary_repulsion_term(
                             seeds=seeds_i,
                             boundary_uv=boundary_uv_i,
-                            gates=gates_struct_i,
+                            gates=gates_decoder_i,
                             margin=cfg.boundary_margin,
                             eps=cfg.eps,
                         )
@@ -2916,15 +2919,6 @@ class NN_Trainer:
 
                     w_geo_terms.append(self._pair_upper_values(w_geo_i).mean().reshape(()))
                     h_terms.append(h_i.reshape(()))
-
-                    if isinstance(gap_thr_i, torch.Tensor) and gap_thr_i.numel() > 0:
-                        gap_thr_terms.append(gap_thr_i.reshape(()))
-                    if isinstance(big_thr_i, torch.Tensor) and big_thr_i.numel() > 0:
-                        big_thr_terms.append(big_thr_i.reshape(()))
-                    if isinstance(alpha_i, torch.Tensor) and alpha_i.numel() > 0:
-                        alpha_terms.append(alpha_i.reshape(()))
-                    if isinstance(eta_i, torch.Tensor) and eta_i.numel() > 0:
-                        eta_terms.append(eta_i.reshape(()))
 
                     if isinstance(boundary_width_i, torch.Tensor) and boundary_width_i.numel() > 0:
                         boundary_width_terms.append(boundary_width_i.reshape(()))
@@ -2959,15 +2953,27 @@ class NN_Trainer:
                 if gate_face_count > 0:
                     active_count_mean = active_count_total / gate_face_count
                     active_frac_mean = active_frac_sum / gate_face_count
-                    gate_min_global = min(gate_min_list)
-                    gate_mean_global = gate_mean_sum / gate_face_count
-                    gate_max_global = max(gate_max_list)
+                    gate_raw_min_global = min(gate_raw_min_list)
+                    gate_raw_mean_global = gate_raw_mean_sum / gate_face_count
+                    gate_raw_max_global = max(gate_raw_max_list)
+                    gate_sharp_min_global = min(gate_sharp_min_list)
+                    gate_sharp_mean_global = gate_sharp_mean_sum / gate_face_count
+                    gate_sharp_max_global = max(gate_sharp_max_list)
+                    gate_decoder_min_global = min(gate_decoder_min_list)
+                    gate_decoder_mean_global = gate_decoder_mean_sum / gate_face_count
+                    gate_decoder_max_global = max(gate_decoder_max_list)
                 else:
                     active_count_mean = 0.0
                     active_frac_mean = 0.0
-                    gate_min_global = 0.0
-                    gate_mean_global = 0.0
-                    gate_max_global = 0.0
+                    gate_raw_min_global = 0.0
+                    gate_raw_mean_global = 0.0
+                    gate_raw_max_global = 0.0
+                    gate_sharp_min_global = 0.0
+                    gate_sharp_mean_global = 0.0
+                    gate_sharp_max_global = 0.0
+                    gate_decoder_min_global = 0.0
+                    gate_decoder_mean_global = 0.0
+                    gate_decoder_max_global = 0.0
 
                 rho = rho_acc / rho_wgt.clamp_min(cfg.eps)
                 rho_boundary = rho_b_acc / rho_b_wgt.clamp_min(cfg.eps)
@@ -2986,11 +2992,6 @@ class NN_Trainer:
 
                 w_geo_mean = self._safe_weighted_mean(w_geo_terms, face_weights_this_step, dtype, device, cfg.eps)
                 h_mean = self._safe_weighted_mean(h_terms, face_weights_this_step, dtype, device, cfg.eps)
-
-                gap_thr_mean = self._safe_weighted_mean(gap_thr_terms, face_weights_this_step, dtype, device, cfg.eps)
-                big_thr_mean = self._safe_weighted_mean(big_thr_terms, face_weights_this_step, dtype, device, cfg.eps)
-                alpha_mean = self._safe_weighted_mean(alpha_terms, face_weights_this_step, dtype, device, cfg.eps)
-                eta_mean = self._safe_weighted_mean(eta_terms, face_weights_this_step, dtype, device, cfg.eps)
 
                 boundary_width_mean = self._safe_weighted_mean(boundary_width_terms, face_weights_this_step, dtype, device, cfg.eps)
                 boundary_alpha_mean = self._safe_weighted_mean(boundary_alpha_terms, face_weights_this_step, dtype, device, cfg.eps)
@@ -3226,22 +3227,18 @@ class NN_Trainer:
                                 "seeds_raw": p["seeds_raw"].detach().clone(),
                                 "w_raw": p["w_raw"].detach().clone(),
                                 "h_raw": None if p["h_raw"] is None else p["h_raw"].detach().clone(),
+                                "gate_logits": None if p.get("gate_logits") is None else p["gate_logits"].detach().clone(),
+                                "gate_probs_raw": None if p.get("gate_probs_raw") is None else p["gate_probs_raw"].detach().clone(),
+                                "gate_probs_sharp": None if p.get("gate_probs_sharp") is None else p["gate_probs_sharp"].detach().clone(),
+                                "gate_probs_decoder": None if p.get("gate_probs_decoder") is None else p["gate_probs_decoder"].detach().clone(),
                                 "gate_probs": None if p["gate_probs"] is None else p["gate_probs"].detach().clone(),
                                 "theta": None if p["theta"] is None else p["theta"].detach().clone(),
                                 "a_raw": None if p["a_raw"] is None else p["a_raw"].detach().clone(),
-                                "gap_thr_raw": None if p["gap_thr_raw"] is None else p["gap_thr_raw"].detach().clone(),
-                                "big_thr_raw": None if p["big_thr_raw"] is None else p["big_thr_raw"].detach().clone(),
-                                "alpha_raw": None if p["alpha_raw"] is None else p["alpha_raw"].detach().clone(),
-                                "eta_raw": None if p["eta_raw"] is None else p["eta_raw"].detach().clone(),
                                 "boundary_width_raw": None if p["boundary_width_raw"] is None else p["boundary_width_raw"].detach().clone(),
                                 "boundary_alpha_raw": None if p["boundary_alpha_raw"] is None else p["boundary_alpha_raw"].detach().clone(),
                                 "boundary_beta_raw": None if p["boundary_beta_raw"] is None else p["boundary_beta_raw"].detach().clone(),
                                 "w_geo": p["w_geo"].detach().clone(),
                                 "h": None if p["h"] is None else p["h"].detach().clone(),
-                                "gap_thr": None if p["gap_thr"] is None else p["gap_thr"].detach().clone(),
-                                "big_thr": None if p["big_thr"] is None else p["big_thr"].detach().clone(),
-                                "alpha": None if p["alpha"] is None else p["alpha"].detach().clone(),
-                                "eta": None if p["eta"] is None else p["eta"].detach().clone(),
                                 "boundary_width": None if p["boundary_width"] is None else p["boundary_width"].detach().clone(),
                                 "boundary_alpha": None if p["boundary_alpha"] is None else p["boundary_alpha"].detach().clone(),
                                 "boundary_beta": None if p["boundary_beta"] is None else p["boundary_beta"].detach().clone(),
@@ -3338,11 +3335,6 @@ class NN_Trainer:
                         "w_geo_mean": self._finite_or_default(w_geo_mean),
                         "h_mean": self._finite_or_default(h_mean),
 
-                        "gap_thr_mean": self._finite_or_default(gap_thr_mean),
-                        "big_thr_mean": self._finite_or_default(big_thr_mean),
-                        "alpha_mean": self._finite_or_default(alpha_mean),
-                        "eta_mean": self._finite_or_default(eta_mean),
-
                         "boundary_width_mean": self._finite_or_default(boundary_width_mean),
                         "boundary_alpha_mean": self._finite_or_default(boundary_alpha_mean),
                         "boundary_beta_mean": self._finite_or_default(boundary_beta_mean),
@@ -3353,9 +3345,16 @@ class NN_Trainer:
                         "active_count_total": active_count_total,
                         "active_count_mean": active_count_mean,
                         "active_frac_mean": active_frac_mean,
-                        "gate_min": gate_min_global,
-                        "gate_mean": gate_mean_global,
-                        "gate_max": gate_max_global,
+                        "gate_raw_min": gate_raw_min_global,
+                        "gate_raw_mean": gate_raw_mean_global,
+                        "gate_raw_max": gate_raw_max_global,
+                        "gate_sharp_min": gate_sharp_min_global,
+                        "gate_sharp_mean": gate_sharp_mean_global,
+                        "gate_sharp_max": gate_sharp_max_global,
+                        "gate_decoder_min": gate_decoder_min_global,
+                        "gate_decoder_mean": gate_decoder_mean_global,
+                        "gate_decoder_max": gate_decoder_max_global,
+                        "hard_gate_mask_on": 1.0 if use_hard_gate_mask_step else 0.0,
                     }
                     history.append(row)
 
@@ -3364,7 +3363,6 @@ class NN_Trainer:
                         vol=f"{row['vol_frac_eff']:.3f}",
                         comp=f"{row['comp']:.2e}",
                         w=f"{row['w_geo_mean']:.3e}",
-                        gap=f"{row['gap_thr_mean']:.3e}",
                         bw=f"{row['boundary_width_mean']:.3e}",
                         act=f"{active_count_mean:.1f}",
                         fem="OK" if fem_is_valid else "BAD",
@@ -3396,7 +3394,6 @@ class NN_Trainer:
                             title_text=(
                                 f"vol={row['vol_frac']:.4f} | "
                                 f"W={row['w_geo_mean']:.4g} | "
-                                f"gap={row['gap_thr_mean']:.4g} | "
                                 f"bw={row['boundary_width_mean']:.4g} | "
                                 f"Δrho={drho:.2e} Δseed={dseed:.2e} grad_mean={g_mean:.2e} | "
                             ),
@@ -3421,7 +3418,10 @@ class NN_Trainer:
                         tqdm.write(
                             f"[{step:05d}] | "
                             f"active(total/mean)={active_count_total:.0f}/{active_count_mean:.2f} | "
-                            f"gate(min/mean/max)={gate_min_global:.3f}/{gate_mean_global:.3f}/{gate_max_global:.3f} | "
+                            f"hard_gate={'ON' if use_hard_gate_mask_step else 'off'} | "
+                            f"gate_raw(min/mean/max)={gate_raw_min_global:.3f}/{gate_raw_mean_global:.3f}/{gate_raw_max_global:.3f} | "
+                            f"gate_sharp(min/mean/max)={gate_sharp_min_global:.3f}/{gate_sharp_mean_global:.3f}/{gate_sharp_max_global:.3f} | "
+                            f"gate_dec(min/mean/max)={gate_decoder_min_global:.3f}/{gate_decoder_mean_global:.3f}/{gate_decoder_max_global:.3f} | "
                             f"L_total={row['L_total']:.4e} | "
                             f"L_vol={row['loss_vol']:.3e} "
                             f"L_fem={row['loss_fem']:.3e} "
@@ -3436,10 +3436,6 @@ class NN_Trainer:
                             f"comp={row['comp']:.3e} | "
                             f"w={row['w_geo_mean']:.3e} "
                             f"h={row['h_mean']:.3e} | "
-                            f"gap={row['gap_thr_mean']:.3e} "
-                            f"big={row['big_thr_mean']:.3e} "
-                            f"alpha={row['alpha_mean']:.3e} "
-                            f"eta={row['eta_mean']:.3e} | "
                             f"bw={row['boundary_width_mean']:.3e} "
                             f"ba={row['boundary_alpha_mean']:.3e} "
                             f"bb={row['boundary_beta_mean']:.3e} | "
@@ -3475,22 +3471,18 @@ class NN_Trainer:
                         "seeds_raw": p["seeds_raw"].detach().clone(),
                         "w_raw": p["w_raw"].detach().clone(),
                         "h_raw": None if p["h_raw"] is None else p["h_raw"].detach().clone(),
+                        "gate_logits": None if p.get("gate_logits") is None else p["gate_logits"].detach().clone(),
+                        "gate_probs_raw": None if p.get("gate_probs_raw") is None else p["gate_probs_raw"].detach().clone(),
+                        "gate_probs_sharp": None if p.get("gate_probs_sharp") is None else p["gate_probs_sharp"].detach().clone(),
+                        "gate_probs_decoder": None if p.get("gate_probs_decoder") is None else p["gate_probs_decoder"].detach().clone(),
                         "gate_probs": None if p["gate_probs"] is None else p["gate_probs"].detach().clone(),
                         "theta": None if p["theta"] is None else p["theta"].detach().clone(),
                         "a_raw": None if p["a_raw"] is None else p["a_raw"].detach().clone(),
-                        "gap_thr_raw": None if p["gap_thr_raw"] is None else p["gap_thr_raw"].detach().clone(),
-                        "big_thr_raw": None if p["big_thr_raw"] is None else p["big_thr_raw"].detach().clone(),
-                        "alpha_raw": None if p["alpha_raw"] is None else p["alpha_raw"].detach().clone(),
-                        "eta_raw": None if p["eta_raw"] is None else p["eta_raw"].detach().clone(),
                         "boundary_width_raw": None if p["boundary_width_raw"] is None else p["boundary_width_raw"].detach().clone(),
                         "boundary_alpha_raw": None if p["boundary_alpha_raw"] is None else p["boundary_alpha_raw"].detach().clone(),
                         "boundary_beta_raw": None if p["boundary_beta_raw"] is None else p["boundary_beta_raw"].detach().clone(),
                         "w_geo": p["w_geo"].detach().clone(),
                         "h": None if p["h"] is None else p["h"].detach().clone(),
-                        "gap_thr": None if p["gap_thr"] is None else p["gap_thr"].detach().clone(),
-                        "big_thr": None if p["big_thr"] is None else p["big_thr"].detach().clone(),
-                        "alpha": None if p["alpha"] is None else p["alpha"].detach().clone(),
-                        "eta": None if p["eta"] is None else p["eta"].detach().clone(),
                         "boundary_width": None if p["boundary_width"] is None else p["boundary_width"].detach().clone(),
                         "boundary_alpha": None if p["boundary_alpha"] is None else p["boundary_alpha"].detach().clone(),
                         "boundary_beta": None if p["boundary_beta"] is None else p["boundary_beta"].detach().clone(),

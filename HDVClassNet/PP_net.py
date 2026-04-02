@@ -15,11 +15,6 @@ class PPNet(nn.Module):
       pred["gate_logits"]          : (B,S)        if use_gating=True
       pred["gate_probs"]           : (B,S)        if use_gating=True
 
-      pred["gap_thr_raw"]          : (B,)         if predict_pair_gating=True
-      pred["big_thr_raw"]          : (B,)         if predict_pair_gating=True
-      pred["alpha_raw"]            : (B,)         if predict_pair_gating=True
-      pred["eta_raw"]              : (B,)         if predict_pair_gating=True
-
       pred["boundary_width_raw"]   : (B,)         if predict_boundary_params=True
       pred["boundary_alpha_raw"]   : (B,)         if predict_boundary_params=True
       pred["boundary_beta_raw"]    : (B,)         if predict_boundary_params=True
@@ -32,7 +27,6 @@ class PPNet(nn.Module):
         use_Metric_anisotropy=False,
         predict_height=False,
         use_gating=False,
-        predict_pair_gating=False,
         predict_boundary_width=False,
         hidden=256,
         freeze_w=False,
@@ -40,13 +34,13 @@ class PPNet(nn.Module):
         eps_uv=1e-4,
         max_delta_logit=0.30,
         max_step_uv=0.08,
+        gate_bias_init=0.0,
     ):
         super().__init__()
         self.n_seeds = n_seeds
         self.use_Metric_anisotropy = use_Metric_anisotropy
         self.predict_height = predict_height
         self.use_gating = use_gating
-        self.predict_pair_gating = predict_pair_gating
         self.predict_boundary_width = predict_boundary_width
 
         self.freeze_w = freeze_w
@@ -55,6 +49,7 @@ class PPNet(nn.Module):
         self.eps_uv = eps_uv
         self.max_delta_logit = max_delta_logit
         self.max_step_uv = max_step_uv
+        self.gate_bias_init = gate_bias_init
 
         # global context trunk
         self.mlp = nn.Sequential(
@@ -80,19 +75,13 @@ class PPNet(nn.Module):
         if self.predict_height:
             self.h_head = nn.Linear(hidden, 1)
 
-        if self.predict_pair_gating:
-            self.gap_thr_head = nn.Linear(hidden, 1)
-            self.big_thr_head = nn.Linear(hidden, 1)
-            self.alpha_head = nn.Linear(hidden, 1)
-            self.eta_head = nn.Linear(hidden, 1)
-
         if self.predict_boundary_width:
             self.boundary_width_head = nn.Linear(hidden, 1)
 
         if self.use_gating:
             self.gate_head = nn.Linear(hidden, 1)
             nn.init.zeros_(self.gate_head.weight)
-            nn.init.constant_(self.gate_head.bias, 2.0)
+            nn.init.constant_(self.gate_head.bias, self.gate_bias_init)
 
         if self.use_Metric_anisotropy:
             self.theta_head = nn.Linear(hidden, 1)
@@ -193,16 +182,6 @@ class PPNet(nn.Module):
             out["h_raw"] = self.h_head(z).view(-1)
             if not torch.isfinite(out["h_raw"]).all():
                 raise RuntimeError("PPNet produced non-finite h_raw")
-
-        if self.predict_pair_gating:
-            out["gap_thr_raw"] = self.gap_thr_head(z).view(-1)
-            out["big_thr_raw"] = self.big_thr_head(z).view(-1)
-            out["alpha_raw"] = self.alpha_head(z).view(-1)
-            out["eta_raw"] = self.eta_head(z).view(-1)
-
-            for k in ("gap_thr_raw", "big_thr_raw", "alpha_raw", "eta_raw"):
-                if not torch.isfinite(out[k]).all():
-                    raise RuntimeError(f"PPNet produced non-finite {k}")
 
         if self.predict_boundary_width:
             out["boundary_width_raw"] = self.boundary_width_head(z).view(-1)
