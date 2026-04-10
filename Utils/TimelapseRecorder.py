@@ -6,6 +6,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import textwrap
+import re
 
 
 class TimelapseRecorder:
@@ -13,33 +14,223 @@ class TimelapseRecorder:
         self.out_dir = out_dir
         self.video_path = video_path
         self.fps = fps
+        self.frame_width = 2560
+        self.frame_height = 1440
         os.makedirs(out_dir, exist_ok=True)
         self.frame_paths = []
 
-    def _make_loss_chart(self, loss_dict, title_text="", height=700, width=700):
-        fig = plt.figure(figsize=(width / 100, height / 100), dpi=100)
-        ax = fig.add_subplot(111)
+    @staticmethod
+    def _add_panel_border(img, pad=12, border=2, bg_color=(247, 247, 245), border_color=(180, 186, 195)):
+        if img.ndim != 3 or img.shape[2] != 3:
+            return img
+        inner = cv2.copyMakeBorder(
+            img,
+            pad,
+            pad,
+            pad,
+            pad,
+            borderType=cv2.BORDER_CONSTANT,
+            value=bg_color,
+        )
+        return cv2.copyMakeBorder(
+            inner,
+            border,
+            border,
+            border,
+            border,
+            borderType=cv2.BORDER_CONSTANT,
+            value=border_color,
+        )
 
+    @staticmethod
+    def _select_video_writer(video_path, fps, frame_size):
+        root, ext = os.path.splitext(video_path)
+        ext = ext.lower()
+
+        codec_candidates = []
+        if ext == ".avi":
+            codec_candidates = [
+                ("MJPG", video_path),
+            ]
+        else:
+            codec_candidates = [
+                ("avc1", video_path),
+                ("mp4v", video_path),
+                ("MJPG", root + ".avi"),
+            ]
+
+        for fourcc_name, out_path in codec_candidates:
+            writer = cv2.VideoWriter(
+                out_path,
+                cv2.VideoWriter_fourcc(*fourcc_name),
+                fps,
+                frame_size,
+            )
+            if writer.isOpened():
+                return writer, out_path, fourcc_name
+            writer.release()
+
+        raise RuntimeError("Could not open any supported video writer codec.")
+
+    @staticmethod
+    def _parse_summary_metrics(title_text):
+        metrics = []
+        for chunk in title_text.split("|"):
+            chunk = chunk.strip()
+            if not chunk:
+                continue
+            if "=" in chunk:
+                for key, value in re.findall(r"([A-Za-z0-9_Δ]+)\s*=\s*([^\s|]+)", chunk):
+                    metrics.append((key, value))
+            else:
+                metrics.append(("stage", chunk))
+        return metrics
+
+    @staticmethod
+    def _format_metric_label(key):
+        label_map = {
+            "iter": "Iteration",
+            "vol": "Volume Fraction",
+            "W": "Mean Width",
+            "bw": "Boundary Width",
+            "Δrho": "Delta Rho",
+            "Δseed": "Delta Seed",
+            "grad_mean": "Mean Gradient",
+            "stage": "Status",
+        }
+        return label_map.get(key, key.replace("_", " ").title())
+
+    @staticmethod
+    def _composite_to_white(img):
+        if img.ndim != 3:
+            return img
+        if img.shape[2] == 3:
+            return img
+        if img.shape[2] != 4:
+            return img[..., :3]
+
+        rgb = img[..., :3].astype(np.float32)
+        alpha = img[..., 3:4].astype(np.float32) / 255.0
+        white = np.full_like(rgb, 255.0)
+        out = rgb * alpha + white * (1.0 - alpha)
+        return np.clip(out, 0.0, 255.0).astype(np.uint8)
+
+    def _make_loss_chart(self, loss_dict, title_text="", height=700, width=700):
         keys = list(loss_dict.keys())
         vals = [float(loss_dict[k]) for k in keys]
+        fig = plt.figure(figsize=(width / 100, height / 100), dpi=100, facecolor="#f7f7f5")
+        gs = fig.add_gridspec(
+            2,
+            1,
+            height_ratios=[1.8, 1.0],
+            left=0.10,
+            right=0.96,
+            top=0.94,
+            bottom=0.07,
+            hspace=0.22,
+        )
+        ax = fig.add_subplot(gs[0, 0])
+        ax_text = fig.add_subplot(gs[1, 0])
 
-        ax.bar(keys, vals)
-        ax.set_title("Loss values")
-        ax.tick_params(axis="x", rotation=45)
+        bar_color = "#2563eb"
+        edge_color = "#1d4ed8"
+        y = np.arange(len(keys))
+        ax.barh(y, vals, color=bar_color, edgecolor=edge_color, alpha=0.88, height=0.62)
+        ax.set_yticks(y, labels=keys, fontsize=12)
+        ax.invert_yaxis()
+        ax.set_title("Optimization Losses", fontsize=18, pad=12, weight="bold")
+        ax.grid(axis="x", linestyle="--", linewidth=0.8, alpha=0.35)
+        ax.set_axisbelow(True)
+        ax.tick_params(axis="x", labelsize=11)
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
 
-        ymax = max(vals) if len(vals) else 1.0
-        ymax = max(ymax * 1.2, 1e-8)
-        ax.set_ylim(0.0, ymax)
+        xmax = max(vals) if len(vals) else 1.0
+        xmax = max(xmax * 1.18, 1e-8)
+        ax.set_xlim(0.0, xmax)
 
-        for i, v in enumerate(vals):
-            ax.text(i, v, f"{v:.3g}", ha="center", va="bottom", fontsize=9)
+        for yi, v in zip(y, vals):
+            ax.text(
+                min(v + 0.02 * xmax, 0.98 * xmax),
+                yi,
+                f"{v:.3g}",
+                va="center",
+                ha="left",
+                fontsize=11,
+                color="#0f172a",
+                weight="semibold",
+            )
 
-        max_len = len(title_text)
-        fontsize = max(10, min(14, 600 // max_len * 10))
-        wrapped_title = "\n".join(textwrap.wrap(title_text, width=50))
-        fig.suptitle(wrapped_title, fontsize=12)
+        ax_text.axis("off")
+        metrics = self._parse_summary_metrics(title_text)
 
-        fig.tight_layout(rect=[0, 0, 1, 0.9])
+        ax_text.text(
+            0.0,
+            1.0,
+            "Run Summary",
+            fontsize=16,
+            weight="bold",
+            va="top",
+            ha="left",
+            color="#111827",
+            transform=ax_text.transAxes,
+        )
+
+        card_x = 0.0
+        card_y = 0.08
+        card_w = 0.94
+        card_h = 0.76
+        card = plt.Rectangle(
+            (card_x, card_y),
+            card_w,
+            card_h,
+            transform=ax_text.transAxes,
+            facecolor="#ffffff",
+            edgecolor="#d1d5db",
+            linewidth=1.0,
+        )
+        ax_text.add_patch(card)
+
+        rows = metrics[:7]
+        if rows:
+            left_x = card_x + 0.04
+            right_x = card_x + 0.62
+            start_y = card_y + card_h - 0.12
+            row_step = min(0.14, (card_h - 0.12) / max(len(rows), 1))
+
+            for idx, (key, value) in enumerate(rows):
+                y = start_y - idx * row_step
+                ax_text.text(
+                    left_x,
+                    y,
+                    self._format_metric_label(key),
+                    fontsize=11,
+                    weight="semibold",
+                    va="center",
+                    ha="left",
+                    color="#374151",
+                    transform=ax_text.transAxes,
+                )
+                ax_text.text(
+                    right_x,
+                    y,
+                    value,
+                    fontsize=11,
+                    va="center",
+                    ha="left",
+                    color="#111827",
+                    family="monospace",
+                    transform=ax_text.transAxes,
+                )
+
+                if idx != len(rows) - 1:
+                    ax_text.plot(
+                        [card_x + 0.03, card_x + card_w - 0.03],
+                        [y - 0.055, y - 0.055],
+                        color="#e5e7eb",
+                        linewidth=0.8,
+                        transform=ax_text.transAxes,
+                    )
 
 
         fig.canvas.draw()
@@ -56,14 +247,16 @@ class TimelapseRecorder:
         if cad_img.ndim != 3 or cad_img.shape[2] not in (3, 4):
             raise ValueError(f"cad_img must be HxWx3 or HxWx4, got shape {cad_img.shape}")
 
-        cad_img = cad_img[..., :3]
+        cad_img = self._composite_to_white(cad_img)
+        # PyVista screenshots arrive as RGB; convert once before mixing with OpenCV BGR images.
+        cad_img = cv2.cvtColor(cad_img, cv2.COLOR_RGB2BGR)
 
         h_left, w_left = cad_img.shape[:2]
         chart_img = self._make_loss_chart(
             loss_dict=loss_dict,
             title_text=f"iter {step} | {title_text}",
             height=h_left,
-            width=max(600, int(0.75 * w_left)),
+            width=max(760, int(0.42 * w_left)),
         )
 
         h_right, w_right = chart_img.shape[:2]
@@ -77,11 +270,35 @@ class TimelapseRecorder:
 
         # matplotlib gives RGB, cv2 prefers BGR when writing
         chart_img = cv2.cvtColor(chart_img, cv2.COLOR_RGB2BGR)
+        chart_img = self._add_panel_border(chart_img)
 
-        combined = np.hstack([cad_img, chart_img])
+        gap = 24
+        target_h = max(cad_img.shape[0], chart_img.shape[0])
+        if cad_img.shape[0] != target_h:
+            cad_img = cv2.resize(cad_img, (cad_img.shape[1], target_h))
+        if chart_img.shape[0] != target_h:
+            chart_img = cv2.resize(chart_img, (chart_img.shape[1], target_h))
+
+        gap_tile = np.full((target_h, gap, 3), 255, dtype=np.uint8)
+        combined = np.hstack([cad_img, gap_tile, chart_img])
+
+        canvas = np.full((self.frame_height, self.frame_width, 3), 255, dtype=np.uint8)
+
+        scale = min(
+            (self.frame_width - 40) / combined.shape[1],
+            (self.frame_height - 40) / combined.shape[0],
+        )
+        scale = max(scale, 1e-6)
+        new_w = max(1, int(round(combined.shape[1] * scale)))
+        new_h = max(1, int(round(combined.shape[0] * scale)))
+        combined = cv2.resize(combined, (new_w, new_h), interpolation=cv2.INTER_AREA)
+
+        y0 = (self.frame_height - new_h) // 2
+        x0 = (self.frame_width - new_w) // 2
+        canvas[y0:y0 + new_h, x0:x0 + new_w] = combined
 
         frame_path = os.path.join(self.out_dir, f"frame_{step:06d}.png")
-        cv2.imwrite(frame_path, combined)
+        cv2.imwrite(frame_path, canvas)
         self.frame_paths.append(frame_path)
 
     def build_video(self,delete_frames=True):
@@ -94,9 +311,8 @@ class TimelapseRecorder:
 
         h, w = first.shape[:2]
 
-        writer = cv2.VideoWriter(
+        writer, actual_video_path, codec_name = self._select_video_writer(
             self.video_path,
-            cv2.VideoWriter_fourcc(*"mp4v"),
             self.fps,
             (w, h),
         )
@@ -110,7 +326,8 @@ class TimelapseRecorder:
             writer.write(img)
 
         writer.release()
-        print(f"Saved video to: {self.video_path}")
+        self.video_path = actual_video_path
+        print(f"Saved video to: {self.video_path} (codec={codec_name})")
         if delete_frames:
             try:
                 shutil.rmtree(self.out_dir)

@@ -1383,9 +1383,251 @@ class NN_Trainer:
         return {
             "xyz_dense": render_cache["xyz_dense"],
             "rho_dense": decoder_out["rho"],
+            "fiber3d_dense": decoder_out["fiber3d"],
             "grid_shape": render_cache["grid_shape"],
             "mask_dense_valid": render_cache["mask_dense_valid"],
         }
+
+    @staticmethod
+    def _build_faces_from_dense_mask(mask, Nu, Nv, rho_dense=None, thr=None):
+        full_indices = -np.ones(mask.shape[0], dtype=int)
+        full_indices[mask] = np.arange(mask.sum())
+
+        faces = []
+
+        def idx(i, j):
+            return i * Nv + j
+
+        for i in range(Nu - 1):
+            for j in range(Nv - 1):
+                ids = [idx(i, j), idx(i, j + 1), idx(i + 1, j), idx(i + 1, j + 1)]
+                mapped = [full_indices[k] for k in ids]
+                if any(m < 0 for m in mapped):
+                    continue
+
+                i0, i1, i2, i3 = mapped
+
+                if rho_dense is None or thr is None:
+                    faces.append([3, i0, i1, i2])
+                    faces.append([3, i2, i1, i3])
+                    continue
+
+                if rho_dense[i0] >= thr and rho_dense[i1] >= thr and rho_dense[i2] >= thr:
+                    faces.append([3, i0, i1, i2])
+                if rho_dense[i2] >= thr and rho_dense[i1] >= thr and rho_dense[i3] >= thr:
+                    faces.append([3, i2, i1, i3])
+
+        if len(faces) == 0:
+            return None
+        return np.array(faces, dtype=np.int64).reshape(-1)
+
+    @staticmethod
+    def _concat_polydata(meshes, scalar_name=None):
+        if len(meshes) == 0:
+            return None
+
+        pts_parts = []
+        face_parts = []
+        scalar_parts = []
+        offset = 0
+
+        for mesh in meshes:
+            pts = np.asarray(mesh.points, dtype=np.float32)
+            faces = np.asarray(mesh.faces, dtype=np.int64).reshape(-1, 4).copy()
+            faces[:, 1:] += offset
+            pts_parts.append(pts)
+            face_parts.append(faces.reshape(-1))
+            if scalar_name is not None:
+                scalar_parts.append(np.asarray(mesh[scalar_name], dtype=np.float32))
+            offset += pts.shape[0]
+
+        out = pv.PolyData(
+            np.concatenate(pts_parts, axis=0),
+            np.concatenate(face_parts, axis=0),
+        )
+        if scalar_name is not None and len(scalar_parts) > 0:
+            out[scalar_name] = np.concatenate(scalar_parts, axis=0)
+        return out
+
+    @staticmethod
+    def _composite_to_white(img):
+        if img.ndim != 3:
+            return img
+        if img.shape[2] == 3:
+            return img
+        if img.shape[2] != 4:
+            return img[..., :3]
+
+        rgb = img[..., :3].astype(np.float32)
+        alpha = (img[..., 3:4].astype(np.float32) / 255.0)
+        white = np.full_like(rgb, 255.0)
+        out = rgb * alpha + white * (1.0 - alpha)
+        return np.clip(out, 0.0, 255.0).astype(np.uint8)
+
+    @staticmethod
+    def _render_offscreen_plotter(plotter, view_name):
+        tight_view = None
+        if view_name == "xy":
+            plotter.enable_parallel_projection()
+            plotter.view_xy()
+            tight_view = "xy"
+        elif view_name == "xz":
+            plotter.enable_parallel_projection()
+            plotter.view_xz()
+            tight_view = "xz"
+        elif view_name == "yz":
+            plotter.enable_parallel_projection()
+            plotter.view_yz()
+            tight_view = "yz"
+        else:
+            plotter.disable_parallel_projection()
+            plotter.view_isometric()
+            tight_view = None
+
+        plotter.reset_camera()
+        if tight_view is not None:
+            try:
+                plotter.camera.tight(view=tight_view, adjust_render_window=False)
+            except Exception:
+                pass
+            try:
+                plotter.camera.zoom(0.90)
+            except Exception:
+                pass
+        else:
+            try:
+                plotter.camera.zoom(0.94)
+            except Exception:
+                pass
+        img = plotter.screenshot(return_img=True, transparent_background=False)
+        return NN_Trainer._composite_to_white(img)
+
+    @staticmethod
+    def _add_image_title(img, title, pad=10, band_height=42):
+        if img.ndim != 3 or img.shape[2] != 3:
+            return img
+
+        title_band = np.full((band_height, img.shape[1], 3), 255, dtype=np.uint8)
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        font_scale = 0.72
+        thickness = 2
+        text_size, baseline = cv2.getTextSize(title, font, font_scale, thickness)
+        x = max(pad, (img.shape[1] - text_size[0]) // 2)
+        y = max(pad + text_size[1], (band_height + text_size[1]) // 2 - baseline)
+        cv2.putText(
+            title_band,
+            title,
+            (x, y),
+            font,
+            font_scale,
+            (32, 32, 32),
+            thickness,
+            lineType=cv2.LINE_AA,
+        )
+        return np.vstack([title_band, img])
+
+    @staticmethod
+    def _add_panel_border(img, pad=10, border=2, bg_color=(255, 255, 255), border_color=(180, 186, 195)):
+        if img.ndim != 3 or img.shape[2] != 3:
+            return img
+        inner = cv2.copyMakeBorder(
+            img,
+            pad,
+            pad,
+            pad,
+            pad,
+            borderType=cv2.BORDER_CONSTANT,
+            value=bg_color,
+        )
+        return cv2.copyMakeBorder(
+            inner,
+            border,
+            border,
+            border,
+            border,
+            borderType=cv2.BORDER_CONSTANT,
+            value=border_color,
+        )
+
+    @staticmethod
+    def _pad_to_size(img, target_h=None, target_w=None, bg_color=(255, 255, 255)):
+        h, w = img.shape[:2]
+        if target_h is None:
+            target_h = h
+        if target_w is None:
+            target_w = w
+        if h == target_h and w == target_w:
+            return img
+
+        top = 0
+        bottom = max(0, target_h - h)
+        left = max(0, (target_w - w) // 2)
+        right = max(0, target_w - w - left)
+        return cv2.copyMakeBorder(
+            img,
+            top,
+            bottom,
+            left,
+            right,
+            borderType=cv2.BORDER_CONSTANT,
+            value=bg_color,
+        )
+
+    @staticmethod
+    def _resize_to_width(img, target_w):
+        h, w = img.shape[:2]
+        if w == target_w:
+            return img
+        target_h = max(1, int(round(h * (target_w / w))))
+        return cv2.resize(img, (target_w, target_h))
+
+    @staticmethod
+    def _equalize_row_heights(images):
+        target_h = min(img.shape[0] for img in images)
+        out = []
+        for img in images:
+            h, w = img.shape[:2]
+            if h == target_h:
+                out.append(img)
+            else:
+                target_w = max(1, int(round(w * (target_h / h))))
+                out.append(cv2.resize(img, (target_w, target_h)))
+        return out
+
+    @staticmethod
+    def _stack_row_with_gaps(images, gap=18, bg_color=(255, 255, 255)):
+        images = NN_Trainer._equalize_row_heights(images)
+        if len(images) == 1:
+            return images[0]
+        gap_tile = np.full((images[0].shape[0], gap, 3), bg_color, dtype=np.uint8)
+        parts = []
+        for i, img in enumerate(images):
+            parts.append(img)
+            if i != len(images) - 1:
+                parts.append(gap_tile)
+        return np.hstack(parts)
+
+    @staticmethod
+    def _center_row_to_width(images, target_w, gap=18, bg_color=(255, 255, 255)):
+        row = NN_Trainer._stack_row_with_gaps(images, gap=gap, bg_color=bg_color)
+        if row.shape[1] > target_w:
+            row = NN_Trainer._resize_to_width(row, target_w)
+        return NN_Trainer._pad_to_size(row, target_w=target_w, bg_color=bg_color)
+
+    @staticmethod
+    def _stack_col_with_gaps(images, gap=22, bg_color=(255, 255, 255)):
+        target_w = max(img.shape[1] for img in images)
+        resized = [NN_Trainer._resize_to_width(img, target_w) for img in images]
+        if len(resized) == 1:
+            return resized[0]
+        gap_tile = np.full((gap, target_w, 3), bg_color, dtype=np.uint8)
+        parts = []
+        for i, img in enumerate(resized):
+            parts.append(img)
+            if i != len(resized) - 1:
+                parts.append(gap_tile)
+        return np.vstack(parts)
+
     def _render_current_cad_frame_cached(
         self,
         seeds_list,
@@ -1396,11 +1638,13 @@ class NN_Trainer:
     ):
 
 
-        plotter = pv.Plotter(off_screen=True, window_size=(900, 700))
-        plotter.set_background("white")
-
         pred_by_face_id = {p["face_id"]: p for p in pred_list}
         dec_by_face_id = {ft["face_id"]: dec for ft, dec in zip(self.current_face_tensors, decoders)}
+        density_meshes = []
+        solid_meshes = []
+        fiber_xyz_parts = []
+        fiber_vec_parts = []
+        fiber_rho_parts = []
 
         for cache_i in render_cache:
             face_id = cache_i["face_id"]
@@ -1411,106 +1655,201 @@ class NN_Trainer:
 
             xyz = out["xyz_dense"].detach().cpu().numpy()
             rho_dense = out["rho_dense"].detach().cpu().numpy()
+            fiber_dense = out["fiber3d_dense"].detach().cpu().numpy()
             Nu, Nv = out["grid_shape"]
             mask = out["mask_dense_valid"].cpu().numpy()
+            faces_all = self._build_faces_from_dense_mask(mask, Nu, Nv)
+            if faces_all is not None:
+                mesh_all = pv.PolyData(xyz, faces_all)
+                mesh_all["rho"] = rho_dense.astype(np.float32)
+                density_meshes.append(mesh_all)
 
-            full_indices = -np.ones(mask.shape[0], dtype=int)
-            full_indices[mask] = np.arange(mask.sum())
+            faces_solid = self._build_faces_from_dense_mask(mask, Nu, Nv, rho_dense=rho_dense, thr=thr)
+            if faces_solid is not None:
+                solid_meshes.append(pv.PolyData(xyz, faces_solid))
 
-            faces = []
+            valid_fiber = np.isfinite(rho_dense)
+            valid_fiber &= np.isfinite(fiber_dense).all(axis=1)
+            valid_fiber &= (rho_dense >= float(thr))
+            valid_fiber &= (np.linalg.norm(fiber_dense, axis=1) > 1e-10)
+            if np.any(valid_fiber):
+                fiber_xyz_parts.append(xyz[valid_fiber])
+                fiber_vec_parts.append(fiber_dense[valid_fiber])
+                fiber_rho_parts.append(rho_dense[valid_fiber])
 
-            def idx(i, j):
-                return i * Nv + j
+        if density_meshes:
+            rho_all = np.concatenate([m["rho"] for m in density_meshes], axis=0)
+            rho_clim = [0.0, max(1.0, float(np.quantile(rho_all, 0.995)))]
+        else:
+            rho_clim = [0.0, 1.0]
 
-            for i in range(Nu - 1):
-                for j in range(Nv - 1):
-                    ids = [idx(i, j), idx(i, j + 1), idx(i + 1, j), idx(i + 1, j + 1)]
-                    mapped = [full_indices[k] for k in ids]
-                    if any(m < 0 for m in mapped):
-                        continue
+        density_mesh_merged = self._concat_polydata(density_meshes, scalar_name="rho")
+        solid_mesh_merged = self._concat_polydata(solid_meshes, scalar_name=None)
 
-                    i0, i1, i2, i3 = mapped
+        all_points = []
+        for mesh in density_meshes:
+            all_points.append(np.asarray(mesh.points))
+        if all_points:
+            all_points = np.concatenate(all_points, axis=0)
+            diag = float(np.linalg.norm(np.ptp(all_points, axis=0)))
+        else:
+            diag = 1.0
+        arrow_scale = 0.04 * max(diag, 1e-6)
 
-                    if rho_dense[i0] >= thr and rho_dense[i1] >= thr and rho_dense[i2] >= thr:
-                        faces.append([3, i0, i1, i2])
-                    if rho_dense[i2] >= thr and rho_dense[i1] >= thr and rho_dense[i3] >= thr:
-                        faces.append([3, i2, i1, i3])
-
-            if len(faces) == 0:
-                continue
-
-            mesh = pv.PolyData(xyz, np.array(faces).reshape(-1))
-            plotter.add_mesh(mesh, color="lightblue", opacity=1.0)
+        fiber_points = None
+        fiber_vectors = None
+        fiber_rho = None
+        if fiber_xyz_parts:
+            fiber_points = np.concatenate(fiber_xyz_parts, axis=0).astype(np.float32)
+            fiber_vectors = np.concatenate(fiber_vec_parts, axis=0).astype(np.float32)
+            fiber_rho = np.concatenate(fiber_rho_parts, axis=0).astype(np.float32)
+            max_arrows = 600
+            if fiber_points.shape[0] > max_arrows:
+                stride = int(np.ceil(fiber_points.shape[0] / max_arrows))
+                fiber_points = fiber_points[::stride]
+                fiber_vectors = fiber_vectors[::stride]
+                fiber_rho = fiber_rho[::stride]
 
         seed_vis = self._seed_points_xyz_and_gates_all_faces(
             seeds_list=seeds_list,
             pred_list=pred_list,
             face_tensors=self.current_face_tensors,
         )
+        active_seed_points = seed_vis["xyz_active"]
+        inactive_seed_points = seed_vis["xyz_inactive"]
+        seed_point_size = max(6.0, 0.006 * max(diag, 1.0) * 100.0)
+        show_seed_points = True
+        show_axes_widget = True
 
-        if seed_vis["xyz_active"] is not None and len(seed_vis["xyz_active"]) > 0:
-            seed_cloud_active = pv.PolyData(seed_vis["xyz_active"])
-            plotter.add_mesh(
-                seed_cloud_active,
-                color="red",
-                render_points_as_spheres=True,
-                point_size=12,
-            )
-
-        if seed_vis["xyz_inactive"] is not None and len(seed_vis["xyz_inactive"]) > 0:
-            seed_cloud_inactive = pv.PolyData(seed_vis["xyz_inactive"])
-            plotter.add_mesh(
-                seed_cloud_inactive,
-                color="gray",
-                render_points_as_spheres=True,
-                point_size=10,
-                opacity=0.45,
-            )
-
-        plotter.show_axes()
-        plotter.reset_camera()
-
-        view_specs = [
-            ("xy", lambda pl: pl.view_xy()),
-            ("xz", lambda pl: pl.view_xz()),
-            ("yz", lambda pl: pl.view_yz()),
-        ]
-
-        upper_row_imgs = []
-        for _name, set_view in view_specs:
-            set_view(plotter)
-            plotter.reset_camera()
+        def make_plotter(title, mode, window_size):
+            pl = pv.Plotter(off_screen=True, window_size=window_size)
+            pl.set_background("white")
             try:
-                plotter.camera.tight(view="xy", adjust_render_window=False)
+                pl.disable_anti_aliasing()
             except Exception:
                 pass
-            upper_row_imgs.append(plotter.screenshot(return_img=True))
+            try:
+                pl.ren_win.SetMultiSamples(0)
+            except Exception:
+                pass
+            pl.remove_all_lights()
 
-        plotter.view_isometric()
-        plotter.reset_camera()
-        try:
-            plotter.camera.tight(view="xy", adjust_render_window=False)
-        except Exception:
-            pass
-        main_view_img = plotter.screenshot(return_img=True)
+            if mode == "density":
+                if density_mesh_merged is not None:
+                    pl.add_mesh(
+                        density_mesh_merged,
+                        scalars="rho",
+                        cmap="viridis",
+                        clim=rho_clim,
+                        show_edges=False,
+                        lighting=False,
+                        smooth_shading=False,
+                        nan_color="white",
+                        interpolate_before_map=False,
+                        scalar_bar_args={
+                            "title": "rho",
+                            "position_x": 0.28,
+                            "position_y": 0.02,
+                            "width": 0.64,
+                            "height": 0.05,
+                            "title_font_size": 12,
+                            "label_font_size": 10,
+                            "color": "#4b5563",
+                            "fmt": "%.2f",
+                            "n_labels": 5,
+                        },
+                    )
+            elif mode == "solid":
+                if solid_mesh_merged is not None:
+                    pl.add_mesh(
+                        solid_mesh_merged,
+                        color="#8ecae6",
+                        smooth_shading=False,
+                        specular=0.0,
+                        show_edges=False,
+                        lighting=False,
+                    )
+            elif mode == "fiber":
+                if solid_mesh_merged is not None:
+                    pl.add_mesh(
+                        solid_mesh_merged,
+                        color="#dbeafe",
+                        opacity=1.0,
+                        smooth_shading=False,
+                        show_edges=False,
+                        lighting=False,
+                    )
+                if fiber_points is not None and fiber_points.shape[0] > 0:
+                    cloud = pv.PolyData(fiber_points)
+                    cloud["vectors"] = fiber_vectors
+                    cloud["rho"] = fiber_rho
+                    glyphs = cloud.glyph(
+                        orient="vectors",
+                        scale=False,
+                        factor=arrow_scale,
+                        geom=pv.Line(pointa=(0, 0, 0), pointb=(1, 0, 0)),
+                    )
+                    pl.add_mesh(glyphs, color="#1d4ed8", line_width=2)
 
-        plotter.close()
+            if show_seed_points and active_seed_points is not None and len(active_seed_points) > 0:
+                pl.add_mesh(
+                    pv.PolyData(active_seed_points.astype(np.float32)),
+                    color="red",
+                    render_points_as_spheres=True,
+                    point_size=seed_point_size,
+                )
+            if show_seed_points and inactive_seed_points is not None and len(inactive_seed_points) > 0:
+                pl.add_mesh(
+                    pv.PolyData(inactive_seed_points.astype(np.float32)),
+                    color="gray",
+                    opacity=0.35,
+                    render_points_as_spheres=True,
+                    point_size=max(5.0, 0.8 * seed_point_size),
+                )
+            if show_axes_widget:
+                pl.show_axes()
+            return pl
 
-        top_h = min(img.shape[0] for img in upper_row_imgs)
+        top_specs = [
+            ("Material Distribution | Front View", "density", "xz"),
+            ("Material Distribution | Side View", "density", "yz"),
+            ("Material Distribution | Top View", "density", "xy"),
+        ]
+        bottom_specs = [
+            ("Material Distribution | Perspective View", "density", "iso"),
+            (f"Hollowed Model | Perspective View | thr={thr:.2f}", "solid", "iso"),
+        ]
+
         top_imgs = []
-        for img in upper_row_imgs:
-            h, w = img.shape[:2]
-            new_w = max(1, int(round(w * (top_h / h))))
-            top_imgs.append(img if h == top_h else cv2.resize(img, (new_w, top_h)))
-        top_row = np.hstack(top_imgs)
+        for title, mode, view in top_specs:
+            pl = make_plotter(title, mode, window_size=(520, 280))
+            img = self._render_offscreen_plotter(pl, view)
+            top_imgs.append(self._add_panel_border(self._add_image_title(img, title)))
+            pl.close()
 
-        bottom_h, bottom_w = main_view_img.shape[:2]
-        target_bottom_w = top_row.shape[1]
-        if bottom_w != target_bottom_w:
-            target_bottom_h = max(1, int(round(bottom_h * (target_bottom_w / bottom_w))))
-            main_view_img = cv2.resize(main_view_img, (target_bottom_w, target_bottom_h))
+        bottom_imgs = []
+        for title, mode, view in bottom_specs:
+            pl = make_plotter(title, mode, window_size=(820, 820))
+            img = self._render_offscreen_plotter(pl, view)
+            bottom_imgs.append(self._add_panel_border(self._add_image_title(img, title)))
+            pl.close()
 
-        return np.vstack([top_row, main_view_img])
+        col_gap = 22
+        row_gap = 28
+        top_row = self._stack_row_with_gaps(top_imgs, gap=col_gap)
+        bottom_row = self._center_row_to_width(bottom_imgs, target_w=top_row.shape[1], gap=col_gap)
+        gap_tile = np.full((row_gap, top_row.shape[1], 3), 255, dtype=np.uint8)
+        cad_panel = np.vstack([top_row, gap_tile, bottom_row])
+        cad_panel = cv2.copyMakeBorder(
+            cad_panel,
+            16,
+            16,
+            16,
+            16,
+            borderType=cv2.BORDER_CONSTANT,
+            value=(255, 255, 255),
+        )
+        return cad_panel
     def _gate_activity_stats(
     self,
     gate_probs: torch.Tensor | None,
@@ -2064,6 +2403,103 @@ class NN_Trainer:
             "keep_mask": keep,
             "dense": dense,
         }
+
+    def Visualize_fresult_final_fiber_Direction(
+        self,
+        result,
+        points_xyz,
+        faces_ijk,
+        thr: float = 0.5,
+    ):
+        import numpy as np
+        import pyvista as pv
+
+        if result.get("Final_shape_fiber_direction", None) is None:
+            raise ValueError(
+                "result['Final_shape_fiber_direction'] is missing. "
+                "Run training with the updated trainer result output."
+            )
+
+        density = result["Final_shape_density"].detach().cpu()
+        fiber = result["Final_shape_fiber_direction"].detach().cpu()
+        points_xyz_cpu = points_xyz.detach().cpu()
+        pv_faces_fixed = self.generator.faces_ijk_to_pv_faces(faces_ijk)
+
+        keep = torch.isfinite(density)
+        keep = keep & torch.isfinite(fiber).all(dim=1)
+        keep = keep & (density >= float(thr))
+        keep = keep & (torch.linalg.norm(fiber, dim=1) > 1e-10)
+
+        keep_idx = torch.nonzero(keep, as_tuple=False).squeeze(1)
+        if keep_idx.numel() == 0:
+            print(f"No fiber arrows to display for threshold {thr:.3f}.")
+            return {
+                "points_xyz": points_xyz_cpu.numpy(),
+                "rho": density.numpy(),
+                "fiber3d": fiber.numpy(),
+                "keep_mask": keep.numpy(),
+            }
+
+        max_arrows = 2000
+        if keep_idx.numel() > max_arrows:
+            step = int(np.ceil(float(keep_idx.numel()) / float(max_arrows)))
+            keep_idx = keep_idx[::step]
+
+        pts_np = points_xyz_cpu[keep_idx].numpy().astype(np.float32)
+        fiber_np = fiber[keep_idx].numpy().astype(np.float32)
+        rho_np = density[keep_idx].numpy().astype(np.float32)
+
+        bbox = points_xyz_cpu.amax(dim=0) - points_xyz_cpu.amin(dim=0)
+        diag = float(torch.linalg.norm(bbox).item())
+        arrow_scale_used = 0.03 * diag
+
+        plotter = pv.Plotter()
+
+        surface = pv.PolyData(
+            points_xyz_cpu.numpy().astype(np.float32),
+            pv_faces_fixed,
+        )
+        surface["rho"] = density.numpy().astype(np.float32)
+        plotter.add_mesh(
+            surface,
+            scalars="rho",
+            cmap="Greys",
+            opacity=0.20,
+            show_edges=False,
+        )
+
+        arrow_cloud = pv.PolyData(pts_np)
+        arrow_cloud["vectors"] = fiber_np
+        arrow_cloud["rho"] = rho_np
+
+        glyphs = arrow_cloud.glyph(
+            orient="vectors",
+            scale=False,
+            factor=arrow_scale_used,
+            geom=pv.Arrow(),
+        )
+        plotter.add_mesh(glyphs, color="royalblue")
+        plotter.show_axes()
+        plotter.show()
+
+        print(
+            f"Fiber-direction visualization: showing {pts_np.shape[0]} arrows "
+            f"with threshold {thr:.3f}"
+        )
+
+        return {
+            "arrow_points": pts_np,
+            "arrow_vectors": fiber_np,
+            "arrow_rho": rho_np,
+            "points_xyz": points_xyz_cpu.numpy(),
+            "rho": density.numpy(),
+            "fiber3d": fiber.numpy(),
+            "keep_mask": keep.numpy(),
+            "arrow_scale_used": float(arrow_scale_used),
+        }
+
+    def visualize_result_final_fiber_direction(self, *args, **kwargs):
+        return self.Visualize_fresult_final_fiber_Direction(*args, **kwargs)
     
 
     def visualize_result_final_smooth_surface_pyvista(
@@ -2579,7 +3015,7 @@ class NN_Trainer:
             case_name = shape_path.stem
             recorder = TimelapseRecorder(
                 out_dir="timelapse_frames",
-                video_path=case_name + "_timelapse.mp4",
+                video_path=case_name + "_timelapse.avi",
                 fps=8,
             )
             render_cache = self.build_timelapse_render_cache(
@@ -2608,6 +3044,7 @@ class NN_Trainer:
         best_w_geo = None
         best_step = -1
         best_rho = None
+        best_fiber_surface = None
         best_seeds = None
         best_pred = None
         steps_since_improve = 0
@@ -2615,6 +3052,7 @@ class NN_Trainer:
         initial_shape_density = None
         mid_shape_density = None
         final_shape_density = None
+        final_shape_fiber_direction = None
 
         seed_points_init = None
         seed_points_mid = None
@@ -3220,6 +3658,7 @@ class NN_Trainer:
                         best_comp = float(comp_val.detach().item())
                         best_w_geo = float(w_geo_mean.detach().item())
                         best_rho = rho.detach().clone()
+                        best_fiber_surface = fiber_surface.detach().clone()
                         best_seeds = [s.detach().clone() for s in seeds_list]
                         best_pred = [
                             {
@@ -3506,6 +3945,9 @@ class NN_Trainer:
         # ------------------------------------------------------------
         with torch.no_grad():
             final_shape_density = best_rho.clone()
+            final_shape_fiber_direction = (
+                None if best_fiber_surface is None else best_fiber_surface.clone()
+            )
             seed_points_final = self._seed_points_xyz_all_faces(best_seeds, face_tensors)
 
             if mid_shape_density is None:
@@ -3541,6 +3983,7 @@ class NN_Trainer:
             "Initial_shape_density": initial_shape_density,
             "Mid_shape_density": mid_shape_density,
             "Final_shape_density": final_shape_density,
+            "Final_shape_fiber_direction": final_shape_fiber_direction,
             "seed_points_init": seed_points_init,
             "seed_points_mid": seed_points_mid,
             "seed_points_final": seed_points_final,
