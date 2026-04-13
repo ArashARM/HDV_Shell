@@ -2500,6 +2500,505 @@ class NN_Trainer:
 
     def visualize_result_final_fiber_direction(self, *args, **kwargs):
         return self.Visualize_fresult_final_fiber_Direction(*args, **kwargs)
+
+    def Visualize_fresult_final_fiber_Direction_2D(
+        self,
+        result,
+        shape_or_path=None,
+        thr: float = 0.5,
+        grid_res_u: int = 120,
+        grid_res_v: int = 120,
+        uv_mask_tol: float | None = None,
+        dense_factor: float = 1.0,
+        max_arrows_per_face: int = 1200,
+        arrow_scale: float = 28.0,
+        arrow_width: float = 0.0025,
+        cmap: str = "viridis",
+        show_boundary: bool = True,
+    ):
+        import numpy as np
+        import matplotlib.pyplot as plt
+
+        if result.get("Final_shape_fiber_direction", None) is None:
+            raise ValueError(
+                "result['Final_shape_fiber_direction'] is missing. "
+                "Run training with the updated trainer result output."
+            )
+
+        density_global = result["Final_shape_density"].detach().cpu()
+        fiber_global = result["Final_shape_fiber_direction"].detach().cpu()
+        face_tensors = result["face_tensors"]
+
+        n_faces = len(face_tensors)
+        ncols = min(3, max(1, n_faces))
+        nrows = int(np.ceil(n_faces / ncols))
+        fig, axes = plt.subplots(
+            nrows,
+            ncols,
+            figsize=(5.5 * ncols, 5.0 * nrows),
+            squeeze=False,
+        )
+
+        plotted_faces = []
+
+        for ax, ft in zip(axes.ravel(), face_tensors):
+            face_id = ft["face_id"]
+            gidx = ft["global_vertex_idx"].detach().cpu()
+
+            uv_face = ft["uv"].detach().cpu().numpy().astype(np.float32)
+            Xu_face = ft["Xu"].detach().cpu().numpy().astype(np.float32)
+            Xv_face = ft["Xv"].detach().cpu().numpy().astype(np.float32)
+            rho_face = density_global[gidx].numpy().astype(np.float32)
+            fiber_face = fiber_global[gidx].numpy().astype(np.float32)
+
+            t_uv_face = self._fiber3d_to_uv_direction(
+                Xu_np=Xu_face,
+                Xv_np=Xv_face,
+                fiber_np=fiber_face,
+            )
+
+            keep = (
+                np.isfinite(rho_face)
+                & np.isfinite(t_uv_face).all(axis=1)
+                & (rho_face >= float(thr))
+                & (np.linalg.norm(t_uv_face, axis=1) > 1e-10)
+            )
+
+            arrow_points = 0
+            if np.count_nonzero(keep) > 0:
+                uv_keep = uv_face[keep]
+                rho_keep = rho_face[keep]
+                t_uv_keep = t_uv_face[keep]
+
+                if uv_keep.shape[0] > int(max_arrows_per_face):
+                    pick = np.linspace(
+                        0,
+                        uv_keep.shape[0] - 1,
+                        num=int(max_arrows_per_face),
+                    ).round().astype(np.int64)
+                    uv_keep = uv_keep[pick]
+                    rho_keep = rho_keep[pick]
+                    t_uv_keep = t_uv_keep[pick]
+
+                ax.quiver(
+                    uv_keep[:, 0],
+                    uv_keep[:, 1],
+                    t_uv_keep[:, 0],
+                    t_uv_keep[:, 1],
+                    rho_keep,
+                    cmap=cmap,
+                    clim=(0.0, 1.0),
+                    angles="xy",
+                    scale_units="xy",
+                    scale=float(arrow_scale),
+                    width=float(arrow_width),
+                )
+                arrow_points = int(uv_keep.shape[0])
+
+            if show_boundary:
+                bidx = self._true_open_boundary_idx(ft)
+                if bidx.numel() > 0:
+                    boundary_uv = ft["uv"][bidx].detach().cpu().numpy().astype(np.float32)
+                    ax.scatter(
+                        boundary_uv[:, 0],
+                        boundary_uv[:, 1],
+                        s=12,
+                        c="red",
+                        alpha=0.85,
+                    )
+
+            ax.set_title(f"Face {face_id} | arrows={arrow_points}")
+            ax.set_xlabel("u")
+            ax.set_ylabel("v")
+            ax.set_aspect("equal")
+            plotted_faces.append(face_id)
+
+        for ax in axes.ravel()[len(face_tensors):]:
+            ax.axis("off")
+
+        fig.suptitle(
+            f"Final fiber direction in UV domain on training points | thr={float(thr):.3f}",
+            y=0.98,
+        )
+        fig.tight_layout()
+        plt.show()
+
+        print(
+            f"2D fiber-direction visualization: plotted {len(plotted_faces)} faces "
+            f"with threshold {thr:.3f}"
+        )
+
+        return {
+            "figure": fig,
+            "face_ids": plotted_faces,
+            "thr_used": float(thr),
+            "uv_by_face": {
+                int(ft["face_id"]): ft["uv"].detach().cpu().numpy().astype(np.float32)
+                for ft in face_tensors
+            },
+        }
+
+    def visualize_result_final_fiber_direction_2d(self, *args, **kwargs):
+        return self.Visualize_fresult_final_fiber_Direction_2D(*args, **kwargs)
+
+    def _trace_fiber_path_on_vertices(
+        self,
+        start_idx,
+        adjacency,
+        points_np,
+        fiber_np,
+        keep_mask_np,
+        sign=1.0,
+        max_steps=80,
+        min_align=0.15,
+    ):
+        path = [int(start_idx)]
+        used = {int(start_idx)}
+        prev = None
+
+        for _ in range(int(max_steps)):
+            cur = path[-1]
+            cur_dir = fiber_np[cur]
+            cur_nrm = np.linalg.norm(cur_dir)
+            if cur_nrm <= 1e-12:
+                break
+
+            cur_dir = (float(sign) * cur_dir) / cur_nrm
+            best_j = None
+            best_score = -np.inf
+
+            for nb in adjacency[cur]:
+                nb = int(nb)
+                if not keep_mask_np[nb]:
+                    continue
+                if prev is not None and nb == prev:
+                    continue
+                if nb in used:
+                    continue
+
+                edge = points_np[nb] - points_np[cur]
+                edge_nrm = np.linalg.norm(edge)
+                if edge_nrm <= 1e-12:
+                    continue
+
+                edge_hat = edge / edge_nrm
+                score = float(np.dot(cur_dir, edge_hat))
+                if score > best_score:
+                    best_score = score
+                    best_j = nb
+
+            if best_j is None or best_score < float(min_align):
+                break
+
+            prev = cur
+            path.append(best_j)
+            used.add(best_j)
+
+        return path
+
+    @staticmethod
+    def _fiber3d_to_uv_direction(Xu_np, Xv_np, fiber_np, eps=1e-12):
+        a11 = np.sum(Xu_np * Xu_np, axis=1)
+        a12 = np.sum(Xu_np * Xv_np, axis=1)
+        a22 = np.sum(Xv_np * Xv_np, axis=1)
+        b1 = np.sum(Xu_np * fiber_np, axis=1)
+        b2 = np.sum(Xv_np * fiber_np, axis=1)
+        det = a11 * a22 - a12 * a12
+        det = np.where(np.abs(det) < eps, np.nan, det)
+
+        du = (a22 * b1 - a12 * b2) / det
+        dv = (-a12 * b1 + a11 * b2) / det
+        tuv = np.stack([du, dv], axis=1)
+        nrm = np.linalg.norm(tuv, axis=1, keepdims=True)
+        ok = np.isfinite(tuv).all(axis=1, keepdims=True) & (nrm > eps)
+        tuv = np.where(ok, tuv / np.clip(nrm, eps, None), 0.0)
+        return tuv.astype(np.float32)
+
+    def _trace_streamline_on_dense_face(
+        self,
+        uv_np,
+        xyz_np,
+        t_uv_np,
+        rho_np,
+        start_idx,
+        step_uv,
+        max_steps,
+        kdtree,
+        align_thresh=0.2,
+        min_rho=0.0,
+        sign=1.0,
+    ):
+        path_xyz = [xyz_np[int(start_idx)]]
+        path_uv = [uv_np[int(start_idx)]]
+        current_uv = uv_np[int(start_idx)].copy()
+        prev_dir = None
+
+        for _ in range(int(max_steps)):
+            _dist, idx = kdtree.query(current_uv, k=1)
+            idx = int(idx)
+            if rho_np[idx] < float(min_rho):
+                break
+
+            direction = t_uv_np[idx].astype(np.float64) * float(sign)
+            nrm = np.linalg.norm(direction)
+            if not np.isfinite(nrm) or nrm <= 1e-12:
+                break
+            direction = direction / nrm
+
+            if prev_dir is not None and float(np.dot(direction, prev_dir)) < 0.0:
+                direction = -direction
+
+            next_uv = current_uv + float(step_uv) * direction
+            dist_next, next_idx = kdtree.query(next_uv, k=1)
+            next_idx = int(next_idx)
+            if not np.isfinite(dist_next):
+                break
+            if next_idx == idx:
+                break
+
+            chord = uv_np[next_idx] - current_uv
+            chord_nrm = np.linalg.norm(chord)
+            if chord_nrm <= 1e-12:
+                break
+            align = float(np.dot(direction, chord / chord_nrm))
+            if align < float(align_thresh):
+                break
+
+            current_uv = uv_np[next_idx].copy()
+            prev_dir = direction
+            path_uv.append(current_uv)
+            path_xyz.append(xyz_np[next_idx])
+
+        return np.asarray(path_uv, dtype=np.float32), np.asarray(path_xyz, dtype=np.float32)
+
+    def Visualize_fresult_final_fiber_Paths(
+        self,
+        result,
+        points_xyz,
+        faces_ijk,
+        thr: float = 0.5,
+        shape_or_path=None,
+        grid_res_u: int = 120,
+        grid_res_v: int = 120,
+        uv_mask_tol: float | None = None,
+        max_paths: int = 120,
+        max_steps: int = 80,
+        min_align: float = 0.20,
+        line_width: float = 3.0,
+        dense_factor: float = 1.0,
+    ):
+        import numpy as np
+        import pyvista as pv
+        from scipy.spatial import cKDTree
+
+        if result.get("Final_shape_fiber_direction", None) is None:
+            raise ValueError(
+                "result['Final_shape_fiber_direction'] is missing. "
+                "Run training with the updated trainer result output."
+            )
+
+        density = result["Final_shape_density"].detach().cpu()
+        fiber = result["Final_shape_fiber_direction"].detach().cpu()
+        points_xyz_cpu = points_xyz.detach().cpu()
+        pv_faces_fixed = self.generator.faces_ijk_to_pv_faces(faces_ijk)
+
+        keep = torch.isfinite(density)
+        keep = keep & torch.isfinite(fiber).all(dim=1)
+        keep = keep & (density >= float(thr))
+        keep = keep & (torch.linalg.norm(fiber, dim=1) > 1e-10)
+
+        keep_idx = torch.nonzero(keep, as_tuple=False).squeeze(1)
+        if keep_idx.numel() == 0:
+            print(f"No fiber paths to display for threshold {thr:.3f}.")
+            return {
+                "points_xyz": points_xyz_cpu.numpy(),
+                "rho": density.numpy(),
+                "fiber3d": fiber.numpy(),
+                "keep_mask": keep.numpy(),
+                "paths_vertex_idx": [],
+            }
+
+        density_np = density.numpy().astype(np.float32)
+        points_np = points_xyz_cpu.numpy().astype(np.float32)
+
+        grid_res_u, grid_res_v = self._resolve_visualization_grid_resolution(
+            grid_res_u=grid_res_u,
+            grid_res_v=grid_res_v,
+            dense_factor=dense_factor,
+        )
+        dense = self.sample_result_field_dense_for_visualization(
+            result=result,
+            shape_or_path=shape_or_path,
+            grid_res_u=grid_res_u,
+            grid_res_v=grid_res_v,
+            uv_mask_tol=uv_mask_tol,
+            use_best_pred=True,
+        )
+
+        paths_xyz = []
+        path_rho = []
+
+        for face_data in dense["per_face"]:
+            uv_face = face_data["uv_dense"].detach().cpu().numpy().astype(np.float32)
+            xyz_face = face_data["xyz_dense"].detach().cpu().numpy().astype(np.float32)
+            Xu_face = face_data["Xu_dense"].detach().cpu().numpy().astype(np.float32)
+            Xv_face = face_data["Xv_dense"].detach().cpu().numpy().astype(np.float32)
+            fiber_face = face_data["fiber3d_dense"].detach().cpu().numpy().astype(np.float32)
+            rho_face = face_data["rho_dense"].detach().cpu().numpy().astype(np.float32)
+
+            keep_face = (
+                np.isfinite(rho_face)
+                & np.isfinite(fiber_face).all(axis=1)
+                & (rho_face >= float(thr))
+                & (np.linalg.norm(fiber_face, axis=1) > 1e-10)
+            )
+            valid_idx = np.flatnonzero(keep_face)
+            if valid_idx.size < 2:
+                continue
+
+            uv_keep = uv_face[keep_face]
+            xyz_keep = xyz_face[keep_face]
+            rho_keep = rho_face[keep_face]
+            t_uv_keep = self._fiber3d_to_uv_direction(
+                Xu_np=Xu_face[keep_face],
+                Xv_np=Xv_face[keep_face],
+                fiber_np=fiber_face[keep_face],
+            )
+            good_t = np.linalg.norm(t_uv_keep, axis=1) > 1e-10
+            if np.count_nonzero(good_t) < 2:
+                continue
+
+            uv_keep = uv_keep[good_t]
+            xyz_keep = xyz_keep[good_t]
+            rho_keep = rho_keep[good_t]
+            t_uv_keep = t_uv_keep[good_t]
+
+            tree = cKDTree(uv_keep)
+            if uv_keep.shape[0] > 1:
+                nn_d, _ = tree.query(uv_keep, k=2)
+                step_uv = float(np.median(nn_d[:, 1]))
+            else:
+                step_uv = 0.0
+            if not np.isfinite(step_uv) or step_uv <= 1e-8:
+                continue
+
+            n_seed_face = min(
+                max(4, int(round(max_paths / max(1, len(dense["per_face"]))))),
+                uv_keep.shape[0],
+            )
+            seed_pick = np.linspace(0, uv_keep.shape[0] - 1, num=n_seed_face).round().astype(np.int64)
+            covered = np.zeros(uv_keep.shape[0], dtype=bool)
+
+            for seed_local in seed_pick.tolist():
+                if covered[seed_local]:
+                    continue
+
+                back_uv, back_xyz = self._trace_streamline_on_dense_face(
+                    uv_np=uv_keep,
+                    xyz_np=xyz_keep,
+                    t_uv_np=t_uv_keep,
+                    rho_np=rho_keep,
+                    start_idx=seed_local,
+                    step_uv=step_uv,
+                    max_steps=max_steps,
+                    kdtree=tree,
+                    align_thresh=min_align,
+                    min_rho=thr,
+                    sign=-1.0,
+                )
+                fwd_uv, fwd_xyz = self._trace_streamline_on_dense_face(
+                    uv_np=uv_keep,
+                    xyz_np=xyz_keep,
+                    t_uv_np=t_uv_keep,
+                    rho_np=rho_keep,
+                    start_idx=seed_local,
+                    step_uv=step_uv,
+                    max_steps=max_steps,
+                    kdtree=tree,
+                    align_thresh=min_align,
+                    min_rho=thr,
+                    sign=1.0,
+                )
+
+                path_xyz = np.vstack([back_xyz[:0:-1], fwd_xyz])
+                path_uv = np.vstack([back_uv[:0:-1], fwd_uv])
+                if path_xyz.shape[0] < 3:
+                    continue
+
+                qd, qi = tree.query(path_uv, k=1)
+                covered[qi[np.isfinite(qd)]] = True
+                paths_xyz.append(path_xyz.astype(np.float32))
+                path_rho.append(float(np.mean(rho_keep[qi[np.isfinite(qd)]])))
+
+                if len(paths_xyz) >= int(max_paths):
+                    break
+
+            if len(paths_xyz) >= int(max_paths):
+                break
+
+        if len(paths_xyz) == 0:
+            print(f"No valid fiber paths could be traced for threshold {thr:.3f}.")
+            return {
+                "points_xyz": points_np,
+                "rho": density_np,
+                "fiber3d": fiber.numpy(),
+                "keep_mask": keep.numpy(),
+                "paths_xyz": [],
+            }
+
+        line_points = []
+        line_cells = []
+        offset = 0
+        for coords in paths_xyz:
+            line_points.append(coords)
+            line_cells.append(
+                np.concatenate((
+                    np.array([coords.shape[0]], dtype=np.int64),
+                    np.arange(offset, offset + coords.shape[0], dtype=np.int64),
+                ))
+            )
+            offset += coords.shape[0]
+
+        line_points = np.vstack(line_points).astype(np.float32)
+        line_cells = np.concatenate(line_cells).astype(np.int64)
+        path_rho = np.asarray(path_rho, dtype=np.float32)
+
+        plotter = pv.Plotter()
+        surface = pv.PolyData(points_np, pv_faces_fixed)
+        surface["rho"] = density_np
+        plotter.add_mesh(
+            surface,
+            scalars="rho",
+            cmap="Greys",
+            opacity=0.20,
+            show_edges=False,
+        )
+
+        lines = pv.PolyData()
+        lines.points = line_points
+        lines.lines = line_cells
+        lines.cell_data["rho"] = path_rho
+        plotter.add_mesh(lines, scalars="rho", cmap="plasma", line_width=float(line_width))
+        plotter.show_axes()
+        plotter.show()
+
+        print(
+            f"Fiber-path visualization: showing {len(paths_xyz)} paths "
+            f"with threshold {thr:.3f}"
+        )
+
+        return {
+            "paths_xyz": paths_xyz,
+            "path_points": line_points,
+            "path_rho": path_rho,
+            "points_xyz": points_np,
+            "rho": density_np,
+            "fiber3d": fiber.numpy(),
+            "keep_mask": keep.numpy(),
+        }
+
+    def visualize_result_final_fiber_paths(self, *args, **kwargs):
+        return self.Visualize_fresult_final_fiber_Paths(*args, **kwargs)
     
 
     def visualize_result_final_smooth_surface_pyvista(

@@ -2,6 +2,7 @@ import numpy as np
 import pandas as pd
 import torch
 import tempfile
+import os
 
 from OCC.Core.STEPControl import STEPControl_Reader
 from OCC.Core.IGESControl import IGESControl_Reader
@@ -1835,8 +1836,8 @@ class CADTensorGenerator:
         if metric_tol is None:
             metric_tol = self.metric_tol
 
-        if isinstance(shape_or_path, str):
-            shape = self.load_shape(shape_or_path)
+        if isinstance(shape_or_path, (str, os.PathLike)):
+            shape = self.load_shape(os.fspath(shape_or_path))
         else:
             shape = shape_or_path
 
