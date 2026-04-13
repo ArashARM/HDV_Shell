@@ -1280,57 +1280,16 @@ class NN_Trainer:
     def build_timelapse_render_cache(
         self,
         face_tensors,
-        shape_or_path,
-        grid_res_u=80,
-        grid_res_v=80,
-        uv_mask_tol=None,
-        trim_tol=1e-7,
     ):
         cache = []
 
         for ft in face_tensors:
             device = ft["uv"].device
-            dtype = ft["uv"].dtype
             uv_face = ft["uv"]
-            u_periodic = bool(ft.get("u_periodic", False))
-            v_periodic = bool(ft.get("v_periodic", False))
-
-            uv_grid, _u_lin, _v_lin = self._build_face_uv_grid(ft, grid_res_u, grid_res_v)
-
-            if uv_mask_tol is None:
-                uv_mask_tol_i = self._estimate_uv_mask_tol(
-                    uv_face=uv_face,
-                    u_periodic=u_periodic,
-                    v_periodic=v_periodic,
-                )
-            else:
-                uv_mask_tol_i = uv_mask_tol
-
-            dmin = self._periodic_uv_min_dist(
-                uv_grid,
-                uv_face,
-                u_periodic=u_periodic,
-                v_periodic=v_periodic,
-            )
-            mask_dense_prefilter = dmin <= uv_mask_tol_i
-            uv_query = uv_grid[mask_dense_prefilter]
-
-            geom = self.generator.eval_face_uv_from_face_tensor(
-                shape_or_path=shape_or_path,
-                face_tensor=ft,
-                uv_norm=uv_query,
-                metric_tol=getattr(self.generator, "metric_tol", 1e-9),
-                trim_tol=trim_tol,
-                as_torch=True,
-            )
-
-            valid_mask = geom["valid_mask"]
-            uv_dense = geom["uv_norm"][valid_mask]
-            xyz_dense = geom["points_xyz"][valid_mask]
-            Xu_dense = geom["Xu"][valid_mask]
-            Xv_dense = geom["Xv"][valid_mask]
-            mask_dense_valid = torch.zeros_like(mask_dense_prefilter, dtype=torch.bool)
-            mask_dense_valid[mask_dense_prefilter] = valid_mask
+            uv_dense = ft["uv"]
+            xyz_dense = ft["points_xyz"]
+            Xu_dense = ft["Xu"]
+            Xv_dense = ft["Xv"]
 
             local_face_id = torch.zeros(
                 uv_dense.shape[0], dtype=torch.long, device=device
@@ -1354,12 +1313,11 @@ class NN_Trainer:
                 "local_face_id": local_face_id,
                 "boundary_uv": boundary_uv_i,
                 "boundary_face_id": boundary_face_id_i,
-                "mask_dense_prefilter": mask_dense_prefilter,
-                "mask_dense_valid": mask_dense_valid,
-                "grid_shape": (grid_res_u, grid_res_v),
+                "faces_ijk": ft["faces_ijk"],
             })
 
         return cache
+
     def evaluate_cached_face_fields(self, render_cache, decoder, pred):
         decoder_out = decoder.evaluate_at_uv(
             points_uv=render_cache["uv_dense"],
@@ -1384,42 +1342,8 @@ class NN_Trainer:
             "xyz_dense": render_cache["xyz_dense"],
             "rho_dense": decoder_out["rho"],
             "fiber3d_dense": decoder_out["fiber3d"],
-            "grid_shape": render_cache["grid_shape"],
-            "mask_dense_valid": render_cache["mask_dense_valid"],
+            "faces_ijk": render_cache["faces_ijk"],
         }
-
-    @staticmethod
-    def _build_faces_from_dense_mask(mask, Nu, Nv, rho_dense=None, thr=None):
-        full_indices = -np.ones(mask.shape[0], dtype=int)
-        full_indices[mask] = np.arange(mask.sum())
-
-        faces = []
-
-        def idx(i, j):
-            return i * Nv + j
-
-        for i in range(Nu - 1):
-            for j in range(Nv - 1):
-                ids = [idx(i, j), idx(i, j + 1), idx(i + 1, j), idx(i + 1, j + 1)]
-                mapped = [full_indices[k] for k in ids]
-                if any(m < 0 for m in mapped):
-                    continue
-
-                i0, i1, i2, i3 = mapped
-
-                if rho_dense is None or thr is None:
-                    faces.append([3, i0, i1, i2])
-                    faces.append([3, i2, i1, i3])
-                    continue
-
-                if rho_dense[i0] >= thr and rho_dense[i1] >= thr and rho_dense[i2] >= thr:
-                    faces.append([3, i0, i1, i2])
-                if rho_dense[i2] >= thr and rho_dense[i1] >= thr and rho_dense[i3] >= thr:
-                    faces.append([3, i2, i1, i3])
-
-        if len(faces) == 0:
-            return None
-        return np.array(faces, dtype=np.int64).reshape(-1)
 
     @staticmethod
     def _concat_polydata(meshes, scalar_name=None):
@@ -1656,17 +1580,23 @@ class NN_Trainer:
             xyz = out["xyz_dense"].detach().cpu().numpy()
             rho_dense = out["rho_dense"].detach().cpu().numpy()
             fiber_dense = out["fiber3d_dense"].detach().cpu().numpy()
-            Nu, Nv = out["grid_shape"]
-            mask = out["mask_dense_valid"].cpu().numpy()
-            faces_all = self._build_faces_from_dense_mask(mask, Nu, Nv)
-            if faces_all is not None:
-                mesh_all = pv.PolyData(xyz, faces_all)
+            faces_local = out["faces_ijk"].detach().cpu().numpy().astype(np.int64)
+            if faces_local.size > 0:
+                pv_faces_all = np.empty((faces_local.shape[0], 4), dtype=np.int64)
+                pv_faces_all[:, 0] = 3
+                pv_faces_all[:, 1:] = faces_local
+                mesh_all = pv.PolyData(xyz, pv_faces_all.reshape(-1))
                 mesh_all["rho"] = rho_dense.astype(np.float32)
                 density_meshes.append(mesh_all)
 
-            faces_solid = self._build_faces_from_dense_mask(mask, Nu, Nv, rho_dense=rho_dense, thr=thr)
-            if faces_solid is not None:
-                solid_meshes.append(pv.PolyData(xyz, faces_solid))
+            if faces_local.size > 0:
+                solid_keep = np.all(rho_dense[faces_local] >= float(thr), axis=1)
+                faces_solid_local = faces_local[solid_keep]
+                if faces_solid_local.size > 0:
+                    pv_faces_solid = np.empty((faces_solid_local.shape[0], 4), dtype=np.int64)
+                    pv_faces_solid[:, 0] = 3
+                    pv_faces_solid[:, 1:] = faces_solid_local
+                    solid_meshes.append(pv.PolyData(xyz, pv_faces_solid.reshape(-1)))
 
             valid_fiber = np.isfinite(rho_dense)
             valid_fiber &= np.isfinite(fiber_dense).all(axis=1)
@@ -2501,9 +2431,17 @@ class NN_Trainer:
     def visualize_result_final_fiber_direction(self, *args, **kwargs):
         return self.Visualize_fresult_final_fiber_Direction(*args, **kwargs)
 
+    def Visualize_fresult_final_fiber_Direction_3D(self, *args, **kwargs):
+        return self.Visualize_fresult_final_fiber_Direction(*args, **kwargs)
+
+    def visualize_result_final_fiber_direction_3d(self, *args, **kwargs):
+        return self.Visualize_fresult_final_fiber_Direction(*args, **kwargs)
+
     def Visualize_fresult_final_fiber_Direction_2D(
         self,
         result,
+        points_xyz=None,
+        faces_ijk=None,
         shape_or_path=None,
         thr: float = 0.5,
         grid_res_u: int = 120,
@@ -2594,18 +2532,6 @@ class NN_Trainer:
                     width=float(arrow_width),
                 )
                 arrow_points = int(uv_keep.shape[0])
-
-            if show_boundary:
-                bidx = self._true_open_boundary_idx(ft)
-                if bidx.numel() > 0:
-                    boundary_uv = ft["uv"][bidx].detach().cpu().numpy().astype(np.float32)
-                    ax.scatter(
-                        boundary_uv[:, 0],
-                        boundary_uv[:, 1],
-                        s=12,
-                        c="red",
-                        alpha=0.85,
-                    )
 
             ax.set_title(f"Face {face_id} | arrows={arrow_points}")
             ax.set_xlabel("u")
@@ -3004,6 +2930,8 @@ class NN_Trainer:
     def visualize_result_final_smooth_surface_pyvista(
         self,
         result,
+        points_xyz=None,
+        faces_ijk=None,
         shape_or_path=None,
         thr: float | str | None = 0.5,
         grid_res_u: int = 120,
@@ -3022,17 +2950,23 @@ class NN_Trainer:
             dense_factor=dense_factor,
         )
 
+        if shape_or_path is None:
+            shape_or_path = result.get("shape_path", None)
+        if shape_or_path is None:
+            raise ValueError(
+                "shape_or_path is required for smooth CAD-native visualization. "
+                "Pass it explicitly or store it in result['shape_path']."
+            )
+
         dense = self.sample_result_field_dense_for_visualization(
             result=result,
             shape_or_path=shape_or_path,
             grid_res_u=grid_res_u,
             grid_res_v=grid_res_v,
             uv_mask_tol=uv_mask_tol,
+            use_best_pred=True,
         )
 
-        # ------------------------------------------------------------
-        # Area-weighted global stats on dense CAD-native samples
-        # ------------------------------------------------------------
         rho_all = []
         area_w_all = []
         for face_data in dense["per_face"]:
@@ -3073,81 +3007,73 @@ class NN_Trainer:
         )
 
         plotter = pv.Plotter()
+        per_face = []
 
         for face_data in dense["per_face"]:
-            uv_dense = face_data["uv_dense"]
-            xyz = face_data["xyz_dense"].detach().cpu().numpy()
-            rho = face_data["rho_dense"].detach().cpu().numpy()
+            xyz = face_data["xyz_dense"].detach().cpu().numpy().astype(np.float32)
+            rho = face_data["rho_dense"].detach().cpu().numpy().astype(np.float32)
             face_id = face_data["face_id"]
-            ft = next(ft_i for ft_i in result["face_tensors"] if ft_i["face_id"] == face_id)
-            u_periodic = bool(ft.get("u_periodic", False))
-            v_periodic = bool(ft.get("v_periodic", False))
-
             Nu, Nv = face_data["grid_shape"]
+            mask = face_data["mask_dense_valid"].detach().cpu().numpy()
+            uv = face_data["uv_dense"].detach().cpu().numpy().astype(np.float32)
 
-            # We need full grid mapping
-            mask = face_data["mask_dense_valid"].cpu().numpy()
+            full_indices = -np.ones(mask.shape[0], dtype=np.int64)
+            full_indices[mask] = np.arange(mask.sum(), dtype=np.int64)
 
-            # Build full grid index map
-            full_indices = -np.ones(mask.shape[0], dtype=int)
-            full_indices[mask] = np.arange(mask.sum())
-
-            faces = []
+            faces_keep = []
 
             def idx(i, j):
                 return i * Nv + j
 
-            max_i = Nu if u_periodic else (Nu - 1)
-            max_j = Nv if v_periodic else (Nv - 1)
-
-            for i in range(max_i):
-                i2g = self._wrapped_grid_next(i, Nu, u_periodic)
-                if i2g is None:
-                    continue
-                for j in range(max_j):
-                    j2g = self._wrapped_grid_next(j, Nv, v_periodic)
-                    if j2g is None:
-                        continue
-                    ids = [
-                        idx(i, j),
-                        idx(i, j2g),
-                        idx(i2g, j),
-                        idx(i2g, j2g),
-                    ]
-
+            for i in range(Nu - 1):
+                for j in range(Nv - 1):
+                    ids = [idx(i, j), idx(i, j + 1), idx(i + 1, j), idx(i + 1, j + 1)]
                     mapped = [full_indices[k] for k in ids]
-
                     if any(m < 0 for m in mapped):
                         continue
 
                     i0, i1, i2, i3 = mapped
-
-                    # triangle 1
                     if rho[i0] >= thr_used and rho[i1] >= thr_used and rho[i2] >= thr_used:
-                        faces.append([3, i0, i1, i2])
-
-                    # triangle 2
+                        faces_keep.append([i0, i1, i2])
                     if rho[i2] >= thr_used and rho[i1] >= thr_used and rho[i3] >= thr_used:
-                        faces.append([3, i2, i1, i3])
+                        faces_keep.append([i2, i1, i3])
 
-            if len(faces) == 0:
+            faces_keep = np.asarray(faces_keep, dtype=np.int64)
+            if faces_keep.size == 0:
+                per_face.append({
+                    "face_id": face_id,
+                    "uv": uv,
+                    "xyz": xyz,
+                    "rho": rho,
+                    "faces_keep": faces_keep,
+                })
                 continue
 
-            faces = np.array(faces).reshape(-1)
-
-            mesh = pv.PolyData(xyz, faces)
+            pv_faces = np.empty((faces_keep.shape[0], 4), dtype=np.int64)
+            pv_faces[:, 0] = 3
+            pv_faces[:, 1:] = faces_keep
+            mesh = pv.PolyData(xyz, pv_faces.reshape(-1))
 
             if show_density:
                 mesh["rho"] = rho
                 plotter.add_mesh(mesh, scalars="rho", cmap="viridis", clim=[0, 1])
             else:
                 plotter.add_mesh(mesh, color="lightblue")
+
+            per_face.append({
+                "face_id": face_id,
+                "uv": uv,
+                "xyz": xyz,
+                "rho": rho,
+                "faces_keep": faces_keep,
+            })
         plotter.show()
         return {
             "thr_used": float(thr_used),
             "volfrac_cont": float(volfrac_cont),
             "volfrac_thr": float(volfrac_thr),
             "dense": dense,
+            "per_face": per_face,
         }
 
     def visualize_boundary_attachment_debug(
@@ -3519,10 +3445,6 @@ class NN_Trainer:
             )
             render_cache = self.build_timelapse_render_cache(
                 face_tensors=face_tensors,
-                shape_or_path=str(shape_path),
-                grid_res_u=cfg.TM_laps_res_u,
-                grid_res_v=cfg.TM_laps_res_v,
-                uv_mask_tol=None,
             )
 
         # ------------------------------------------------------------

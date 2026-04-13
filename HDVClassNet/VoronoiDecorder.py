@@ -3,6 +3,12 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import numpy as np
+import matplotlib.pyplot as plt
+import pyvista as pv
+
+from dataclasses import dataclass
+from typing import Any
 
 
 class VoronoiDecoder(nn.Module):
@@ -20,6 +26,7 @@ class VoronoiDecoder(nn.Module):
         eps: float = 1e-8,
         use_Metric_anisotropy: bool = True,
         use_band_weighted_fiber_pairs: bool = False,
+        use_boundary_tangent_fibers: bool = True,
 
         # geometric strut half-width lower bound
         w_min: float = 0.005,
@@ -83,6 +90,7 @@ class VoronoiDecoder(nn.Module):
         self.eps = float(eps)
         self.use_Metric_anisotropy = bool(use_Metric_anisotropy)
         self.use_band_weighted_fiber_pairs = bool(use_band_weighted_fiber_pairs)
+        self.use_boundary_tangent_fibers = bool(use_boundary_tangent_fibers)
 
         self.w_min = float(w_min)
         self.beta = float(beta)
@@ -476,6 +484,113 @@ class VoronoiDecoder(nn.Module):
         pair_norm, ok_mask = self._normalize_upper_tri_pair_weights(raw_pair)
         return torch.where(ok_mask, pair_norm, soft_pair)
 
+    def _estimate_boundary_sample_tangents_uv(
+        self,
+        boundary_uv: torch.Tensor,
+        boundary_face_id: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if boundary_uv.numel() == 0:
+            return torch.zeros_like(boundary_uv)
+
+        B = boundary_uv.shape[0]
+        if B < 2:
+            return torch.zeros_like(boundary_uv)
+
+        if boundary_face_id is None:
+            boundary_face_id = torch.zeros(B, device=boundary_uv.device, dtype=torch.long)
+        elif boundary_face_id.dtype != torch.long:
+            boundary_face_id = boundary_face_id.to(torch.long)
+
+        diff = boundary_uv.unsqueeze(1) - boundary_uv.unsqueeze(0)
+        dmat = torch.norm(diff, dim=-1)
+
+        same_face = boundary_face_id[:, None] == boundary_face_id[None, :]
+        eye = torch.eye(B, device=boundary_uv.device, dtype=torch.bool)
+        valid_neighbor = same_face & (~eye)
+        dmat = torch.where(valid_neighbor, dmat, torch.full_like(dmat, 1e6))
+
+        k = min(max(1, self.boundary_knn_k), max(1, B - 1))
+        d_knn, idx_knn = torch.topk(dmat, k=k, dim=1, largest=False)
+        valid_knn = d_knn < 1e5
+
+        local_diff = boundary_uv[idx_knn] - boundary_uv.unsqueeze(1)
+        sigma = d_knn[..., 0].clamp_min(self.boundary_softmin_tau)
+        w = torch.exp(-0.5 * (d_knn / sigma.unsqueeze(1).clamp_min(self.eps)).pow(2))
+        w = w * valid_knn.to(w.dtype)
+
+        cov = (
+            w.unsqueeze(-1).unsqueeze(-1)
+            * (local_diff.unsqueeze(-1) * local_diff.unsqueeze(-2))
+        ).sum(dim=1)
+        cov = cov / w.sum(dim=1, keepdim=True).unsqueeze(-1).clamp_min(self.eps)
+
+        tangent = self._principal_axial_direction(cov)
+        has_support = valid_knn.any(dim=1, keepdim=True)
+        return torch.where(has_support, tangent, torch.zeros_like(tangent))
+
+    def _boundary_tangent_tensor_field(
+        self,
+        points_uv: torch.Tensor,
+        boundary_uv: torch.Tensor,
+        points_face_id: torch.Tensor | None = None,
+        boundary_face_id: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if boundary_uv.numel() == 0:
+            return torch.zeros(
+                (points_uv.shape[0], 2, 2),
+                device=points_uv.device,
+                dtype=points_uv.dtype,
+            )
+
+        B = boundary_uv.shape[0]
+        if points_face_id is None:
+            points_face_id = torch.zeros(points_uv.shape[0], device=points_uv.device, dtype=torch.long)
+        elif points_face_id.dtype != torch.long:
+            points_face_id = points_face_id.to(torch.long)
+
+        if boundary_face_id is None:
+            boundary_face_id = torch.zeros(B, device=boundary_uv.device, dtype=torch.long)
+        elif boundary_face_id.dtype != torch.long:
+            boundary_face_id = boundary_face_id.to(torch.long)
+
+        tangent_uv = self._estimate_boundary_sample_tangents_uv(
+            boundary_uv=boundary_uv,
+            boundary_face_id=boundary_face_id,
+        )
+        sample_Q = tangent_uv.unsqueeze(-1) * tangent_uv.unsqueeze(-2)
+
+        bb_diff = boundary_uv.unsqueeze(1) - boundary_uv.unsqueeze(0)
+        bb_dmat = torch.norm(bb_diff, dim=-1)
+        same_face_bb = boundary_face_id[:, None] == boundary_face_id[None, :]
+        eye = torch.eye(B, device=boundary_uv.device, dtype=torch.bool)
+        bb_valid = same_face_bb & (~eye)
+        bb_dmat = torch.where(bb_valid, bb_dmat, torch.full_like(bb_dmat, 1e6))
+        local_scale = bb_dmat.min(dim=1).values
+        local_scale = torch.where(
+            local_scale < 1e5,
+            local_scale,
+            torch.full_like(local_scale, self.boundary_softmin_tau),
+        ).clamp_min(self.boundary_softmin_tau)
+
+        pb_dmat = torch.cdist(points_uv, boundary_uv)
+        same_face_pb = points_face_id[:, None] == boundary_face_id[None, :]
+        pb_dmat = torch.where(same_face_pb, pb_dmat, torch.full_like(pb_dmat, 1e6))
+
+        weights = torch.exp(
+            -0.5 * (pb_dmat / local_scale.unsqueeze(0).clamp_min(self.eps)).pow(2)
+        )
+        weights = weights * same_face_pb.to(weights.dtype)
+
+        weight_sum = weights.sum(dim=1, keepdim=True)
+        # Shell boundaries should inject tangent-aligned line directions, but
+        # only where the shell-boundary field is active; away from the boundary
+        # the Voronoi interior tensor remains in control.
+        Q_boundary = (weights.unsqueeze(-1).unsqueeze(-1) * sample_Q.unsqueeze(0)).sum(dim=1)
+        Q_boundary = Q_boundary / weight_sum.unsqueeze(-1).clamp_min(self.eps)
+
+        has_support = weight_sum.squeeze(1) > self.eps
+        return torch.where(has_support[:, None, None], Q_boundary, torch.zeros_like(Q_boundary))
+
     def map_to_3d(self, t_uv: torch.Tensor, Xu: torch.Tensor, Xv: torch.Tensor, eps: float = 1e-8):
         T = t_uv[:, 0:1] * Xu + t_uv[:, 1:2] * Xv
         return F.normalize(T, dim=1, eps=eps)
@@ -806,7 +921,35 @@ class VoronoiDecoder(nn.Module):
             seeds=seeds,
             pair_weights=fiber_pair_weights,
         )
-        fiber_coherence = self._axial_coherence_from_tensor(fiber_tensor_Q)
+        fiber_tensor_Q_interior = fiber_tensor_Q
+
+        if (
+            self.use_boundary_attachment
+            and self.use_boundary_tangent_fibers
+            and boundary_uv is not None
+            and boundary_uv.numel() > 0
+        ):
+            # Boundary tangents are also an axial line field, so blend them as
+            # tensors rather than signed vectors to avoid sign-flip cancellation.
+            fiber_tensor_Q_boundary = self._boundary_tangent_tensor_field(
+                points_uv=points_uv,
+                boundary_uv=boundary_uv,
+                points_face_id=points_face_id,
+                boundary_face_id=boundary_face_id,
+            )
+            boundary_tangent_weight = rho_b.clamp(0.0, 1.0)
+            lam_b = boundary_tangent_weight.unsqueeze(-1).unsqueeze(-1)
+            fiber_tensor_Q_final = (
+                (1.0 - lam_b) * fiber_tensor_Q_interior
+                + lam_b * fiber_tensor_Q_boundary
+            )
+            t_uv_raw = self._principal_axial_direction(fiber_tensor_Q_final)
+        else:
+            fiber_tensor_Q_boundary = torch.zeros_like(fiber_tensor_Q_interior)
+            boundary_tangent_weight = torch.zeros_like(rho_b)
+            fiber_tensor_Q_final = fiber_tensor_Q_interior
+
+        fiber_coherence = self._axial_coherence_from_tensor(fiber_tensor_Q_final)
 
         rho0, gamma = 0.5, 0.05
         m = torch.sigmoid((rho - rho0) / gamma).unsqueeze(1)
@@ -831,7 +974,11 @@ class VoronoiDecoder(nn.Module):
             "fiber_strength": fiber_strength,
             "fiber_coherence": fiber_coherence,
             "fiber_pair_weights": fiber_pair_weights,
-            "fiber_tensor_Q": fiber_tensor_Q,
+            "fiber_tensor_Q": fiber_tensor_Q_final,
+            "fiber_tensor_Q_interior": fiber_tensor_Q_interior,
+            "fiber_tensor_Q_boundary": fiber_tensor_Q_boundary,
+            "fiber_tensor_Q_final": fiber_tensor_Q_final,
+            "boundary_tangent_weight": boundary_tangent_weight,
             "h": h,
             "w_geo": w_geo,
             "pair_strength": pair_strength,
@@ -888,3 +1035,546 @@ class VoronoiDecoder(nn.Module):
             boundary_beta_raw=boundary_beta_raw,
             seed_gates=seed_gates,
         )
+
+
+@dataclass
+class MeshQueryData:
+    points_uv: torch.Tensor
+    Xu: torch.Tensor
+    Xv: torch.Tensor
+    points_xyz: torch.Tensor
+    faces_ijk: torch.Tensor
+    tau: float
+    points_face_id: torch.Tensor | None = None
+    boundary_uv: torch.Tensor | None = None
+    boundary_face_id: torch.Tensor | None = None
+
+
+class VoronoiModelVisualizer:
+    """
+    Helper for evaluating a VoronoiDecoder on a fixed mesh/query set and
+    visualizing results in UV and 3D.
+
+    Boundary data can be supplied either:
+    - at initialization as defaults
+    - or per evaluation call to override defaults
+    """
+
+    def __init__(
+        self,
+        *,
+        points_uv,
+        Xu,
+        Xv,
+        points_xyz,
+        faces_ijk,
+        tau: float,
+        n_seeds: int,
+        points_face_id=None,
+        boundary_uv=None,
+        boundary_face_id=None,
+        eps: float = 1e-8,
+        use_metric_anisotropy: bool = False,
+        w_min: float = 0.005,
+        fixed_height: float | None = None,
+        use_boundary_attachment: bool = False,
+        boundary_solid_idx: torch.Tensor | None = None,
+        face_u_periodic: torch.Tensor | None = None,
+        face_v_periodic: torch.Tensor | None = None,
+        seed_face_id: torch.Tensor | None = None,
+        device: torch.device | str | None = None,
+        dtype: torch.dtype = torch.float32,
+        **decoder_kwargs,
+    ) -> None:
+        self.device = torch.device(device) if device is not None else torch.device("cpu")
+        self.dtype = dtype
+        self.n_seeds = int(n_seeds)
+
+        self.query = MeshQueryData(
+            points_uv=self._to_tensor(points_uv, dtype=self.dtype),
+            Xu=self._to_tensor(Xu, dtype=self.dtype),
+            Xv=self._to_tensor(Xv, dtype=self.dtype),
+            points_xyz=self._to_tensor(points_xyz, dtype=self.dtype),
+            faces_ijk=self._to_tensor(faces_ijk, dtype=torch.long),
+            tau=float(tau),
+            points_face_id=self._to_tensor(points_face_id, dtype=torch.long),
+            boundary_uv=self._to_tensor(boundary_uv, dtype=self.dtype),
+            boundary_face_id=self._to_tensor(boundary_face_id, dtype=torch.long),
+        )
+
+        self.decoder = VoronoiDecoder(
+            n_seeds=self.n_seeds,
+            eps=eps,
+            use_Metric_anisotropy=use_metric_anisotropy,
+            w_min=w_min,
+            fixed_height=fixed_height,
+            use_boundary_attachment=use_boundary_attachment,
+            boundary_solid_idx=boundary_solid_idx,
+            face_u_periodic=face_u_periodic,
+            face_v_periodic=face_v_periodic,
+            seed_face_id=seed_face_id,
+            **decoder_kwargs,
+        ).to(device=self.device, dtype=self.dtype)
+        self.decoder.eval()
+
+        try:
+            pv.set_jupyter_backend("trame")
+        except Exception:
+            pass
+
+    # ---------------------------
+    # tensor helpers
+    # ---------------------------
+
+    def _to_tensor(
+        self,
+        value,
+        *,
+        dtype: torch.dtype | None = None,
+        device: torch.device | None = None,
+    ) -> torch.Tensor | None:
+        if value is None:
+            return None
+        if isinstance(value, torch.Tensor):
+            return value.to(device=device or self.device, dtype=dtype or value.dtype)
+        return torch.as_tensor(
+            value,
+            device=device or self.device,
+            dtype=dtype or self.dtype,
+        )
+
+    def make_query_data(
+        self,
+        *,
+        points_uv=None,
+        Xu=None,
+        Xv=None,
+        points_xyz=None,
+        faces_ijk=None,
+        tau: float | None = None,
+        points_face_id=None,
+        boundary_uv=None,
+        boundary_face_id=None,
+    ) -> MeshQueryData:
+        """
+        Create a query object, using stored defaults for omitted values.
+        """
+        return MeshQueryData(
+            points_uv=self._to_tensor(
+                self.query.points_uv if points_uv is None else points_uv,
+                dtype=self.dtype,
+            ),
+            Xu=self._to_tensor(
+                self.query.Xu if Xu is None else Xu,
+                dtype=self.dtype,
+            ),
+            Xv=self._to_tensor(
+                self.query.Xv if Xv is None else Xv,
+                dtype=self.dtype,
+            ),
+            points_xyz=self._to_tensor(
+                self.query.points_xyz if points_xyz is None else points_xyz,
+                dtype=self.dtype,
+            ),
+            faces_ijk=self._to_tensor(
+                self.query.faces_ijk if faces_ijk is None else faces_ijk,
+                dtype=torch.long,
+            ),
+            tau=float(self.query.tau if tau is None else tau),
+            points_face_id=self._to_tensor(
+                self.query.points_face_id if points_face_id is None else points_face_id,
+                dtype=torch.long,
+            ),
+            boundary_uv=self._to_tensor(
+                self.query.boundary_uv if boundary_uv is None else boundary_uv,
+                dtype=self.dtype,
+            ),
+            boundary_face_id=self._to_tensor(
+                self.query.boundary_face_id if boundary_face_id is None else boundary_face_id,
+                dtype=torch.long,
+            ),
+        )
+
+    # ---------------------------
+    # geometry helpers
+    # ---------------------------
+
+    @staticmethod
+    def faces_ijk_to_pv_faces(faces_ijk: torch.Tensor) -> np.ndarray:
+        f = faces_ijk.detach().cpu().numpy().astype(np.int64)
+        pv_faces = np.empty((f.shape[0], 4), dtype=np.int64)
+        pv_faces[:, 0] = 3
+        pv_faces[:, 1:] = f
+        return pv_faces.reshape(-1)
+
+    @staticmethod
+    def seeds_uv_to_xyz_nearest(
+        seeds_uv: torch.Tensor,
+        uv: torch.Tensor,
+        points_xyz: torch.Tensor,
+    ) -> torch.Tensor:
+        device = uv.device
+        seeds_uv = seeds_uv.to(device=device, dtype=uv.dtype)
+        points_xyz = points_xyz.to(device=device, dtype=points_xyz.dtype)
+        nn = torch.cdist(seeds_uv, uv).argmin(dim=1)
+        return points_xyz[nn]
+
+    # ---------------------------
+    # evaluation
+    # ---------------------------
+
+    def run_case(
+        self,
+        *,
+        seeds_raw,
+        w_raw,
+        h_raw=None,
+        theta=None,
+        a_raw=None,
+        seed_gates=None,
+        query: MeshQueryData | None = None,
+        boundary_uv=None,
+        boundary_face_id=None,
+        boundary_width_raw=None,
+        boundary_alpha_raw=None,
+        boundary_beta_raw=None,
+    ) -> dict[str, torch.Tensor]:
+        q = self.query if query is None else query
+
+        q_boundary_uv = (
+            q.boundary_uv
+            if boundary_uv is None
+            else self._to_tensor(boundary_uv, dtype=self.dtype)
+        )
+        q_boundary_face_id = (
+            q.boundary_face_id
+            if boundary_face_id is None
+            else self._to_tensor(boundary_face_id, dtype=torch.long)
+        )
+
+        with torch.no_grad():
+            return self.decoder.evaluate_at_uv(
+                points_uv=q.points_uv,
+                Xu=q.Xu,
+                Xv=q.Xv,
+                tau=float(q.tau),
+                seeds_raw=self._to_tensor(seeds_raw, dtype=self.dtype),
+                w_raw=self._to_tensor(w_raw, dtype=self.dtype),
+                h_raw=self._to_tensor(h_raw, dtype=self.dtype),
+                theta=self._to_tensor(theta, dtype=self.dtype),
+                a_raw=self._to_tensor(a_raw, dtype=self.dtype),
+                points_face_id=q.points_face_id,
+                boundary_uv=q_boundary_uv,
+                boundary_face_id=q_boundary_face_id,
+                boundary_width_raw=self._to_tensor(boundary_width_raw, dtype=self.dtype),
+                boundary_alpha_raw=self._to_tensor(boundary_alpha_raw, dtype=self.dtype),
+                boundary_beta_raw=self._to_tensor(boundary_beta_raw, dtype=self.dtype),
+                seed_gates=self._to_tensor(seed_gates, dtype=self.dtype),
+            )
+
+    def evaluate_cases(
+        self,
+        *,
+        seeds_raw,
+        gate_vectors: dict[str, torch.Tensor | list[float]],
+        w_raw,
+        h_raw=None,
+        theta=None,
+        a_raw=None,
+        query: MeshQueryData | None = None,
+        boundary_uv=None,
+        boundary_face_id=None,
+        boundary_width_raw=None,
+        boundary_alpha_raw=None,
+        boundary_beta_raw=None,
+    ) -> dict[str, dict[str, torch.Tensor]]:
+        seeds_raw_t = self._to_tensor(seeds_raw, dtype=self.dtype)
+        w_raw_t = self._to_tensor(w_raw, dtype=self.dtype)
+
+        outputs: dict[str, dict[str, torch.Tensor]] = {}
+        for name, gates in gate_vectors.items():
+            outputs[name] = self.run_case(
+                seeds_raw=seeds_raw_t,
+                w_raw=w_raw_t,
+                h_raw=h_raw,
+                theta=theta,
+                a_raw=a_raw,
+                seed_gates=gates,
+                query=query,
+                boundary_uv=boundary_uv,
+                boundary_face_id=boundary_face_id,
+                boundary_width_raw=boundary_width_raw,
+                boundary_alpha_raw=boundary_alpha_raw,
+                boundary_beta_raw=boundary_beta_raw,
+            )
+        return outputs
+
+    def sweep_single_seed(
+        self,
+        *,
+        seeds_raw,
+        w_raw,
+        seed_index: int,
+        gate_values: list[float],
+        h_raw=None,
+        theta=None,
+        a_raw=None,
+        query: MeshQueryData | None = None,
+        boundary_uv=None,
+        boundary_face_id=None,
+        boundary_width_raw=None,
+        boundary_alpha_raw=None,
+        boundary_beta_raw=None,
+        baseline_gate: float = 1.0,
+    ) -> dict[str, dict[str, torch.Tensor]]:
+        seed_index = int(seed_index)
+        if not (0 <= seed_index < self.n_seeds):
+            raise ValueError(f"seed_index must be in [0, {self.n_seeds}), got {seed_index}")
+
+        base = torch.full(
+            (self.n_seeds,),
+            float(baseline_gate),
+            device=self.device,
+            dtype=self.dtype,
+        )
+
+        gate_vectors: dict[str, torch.Tensor] = {}
+        for gate_value in gate_values:
+            g = base.clone()
+            g[seed_index] = float(gate_value)
+            gate_vectors[f"seed_{seed_index}_gate_{gate_value:.4f}"] = g
+
+        return self.evaluate_cases(
+            seeds_raw=seeds_raw,
+            gate_vectors=gate_vectors,
+            w_raw=w_raw,
+            h_raw=h_raw,
+            theta=theta,
+            a_raw=a_raw,
+            query=query,
+            boundary_uv=boundary_uv,
+            boundary_face_id=boundary_face_id,
+            boundary_width_raw=boundary_width_raw,
+            boundary_alpha_raw=boundary_alpha_raw,
+            boundary_beta_raw=boundary_beta_raw,
+        )
+
+    # ---------------------------
+    # plotting
+    # ---------------------------
+
+    def plot_uv_cases(
+        self,
+        *,
+        cases: dict[str, dict[str, torch.Tensor]],
+        seeds_raw,
+        gate_vectors: dict[str, torch.Tensor | list[float]],
+        active_threshold: float = 0.05,
+        cmap: str = "viridis",
+        figsize_scale: float = 5.0,
+        query: MeshQueryData | None = None,
+    ):
+        q = self.query if query is None else query
+        uv_plot = q.points_uv.detach().cpu()
+        seeds_plot = self._to_tensor(seeds_raw, dtype=self.dtype).detach().cpu()
+
+        n_cases = len(cases)
+        ncols = min(3, n_cases)
+        nrows = math.ceil(n_cases / ncols)
+
+        fig, axes = plt.subplots(
+            nrows,
+            ncols,
+            figsize=(figsize_scale * ncols, figsize_scale * nrows),
+            squeeze=False,
+        )
+
+        for ax, (case_name, out) in zip(axes.ravel(), cases.items()):
+            rho_plot = out["rho"].detach().cpu()
+            gates_plot = self._to_tensor(gate_vectors[case_name], dtype=self.dtype).detach().cpu()
+            active_mask = gates_plot > active_threshold
+
+            ax.scatter(
+                uv_plot[:, 0],
+                uv_plot[:, 1],
+                c=rho_plot,
+                s=8,
+                cmap=cmap,
+                vmin=0.0,
+                vmax=1.0,
+            )
+
+            if (~active_mask).any():
+                ax.scatter(
+                    seeds_plot[~active_mask, 0],
+                    seeds_plot[~active_mask, 1],
+                    s=90,
+                    c="lightgray",
+                    edgecolors="black",
+                    linewidths=1.0,
+                    label="inactive seed",
+                )
+
+            if active_mask.any():
+                ax.scatter(
+                    seeds_plot[active_mask, 0],
+                    seeds_plot[active_mask, 1],
+                    s=90,
+                    c="red",
+                    edgecolors="white",
+                    linewidths=1.0,
+                    label="active seed",
+                )
+
+            ax.set_title(case_name)
+            ax.set_aspect("equal")
+            ax.set_xlabel("u")
+            ax.set_ylabel("v")
+
+        for ax in axes.ravel()[n_cases:]:
+            ax.axis("off")
+
+        handles, labels = axes[0, 0].get_legend_handles_labels()
+        if handles:
+            fig.legend(handles, labels, loc="upper center", ncol=min(3, len(labels)))
+
+        fig.subplots_adjust(top=0.88, wspace=0.25, hspace=0.30)
+        return fig
+
+    def plot_3d_cases(
+        self,
+        *,
+        cases: dict[str, dict[str, torch.Tensor]],
+        seeds_raw,
+        gate_vectors: dict[str, torch.Tensor | list[float]],
+        active_threshold: float = 0.05,
+        cmap: str = "viridis",
+        window_size: tuple[int, int] = (1400, 900),
+        clim: tuple[float, float] = (0.0, 1.0),
+        show_edges: bool = False,
+        query: MeshQueryData | None = None,
+    ):
+        q = self.query if query is None else query
+
+        seed_xyz = self.seeds_uv_to_xyz_nearest(
+            seeds_uv=self._to_tensor(seeds_raw, dtype=self.dtype),
+            uv=q.points_uv,
+            points_xyz=q.points_xyz,
+        )
+        pv_faces = self.faces_ijk_to_pv_faces(q.faces_ijk)
+
+        n_cases = len(cases)
+        ncols = min(3, n_cases)
+        nrows = int(np.ceil(n_cases / ncols))
+
+        plotter = pv.Plotter(shape=(nrows, ncols), window_size=window_size)
+
+        for idx, (case_name, out) in enumerate(cases.items()):
+            r = idx // ncols
+            c = idx % ncols
+            plotter.subplot(r, c)
+
+            rho_plot = out["rho"].detach().cpu().numpy().astype(np.float32)
+            gates_plot = self._to_tensor(gate_vectors[case_name], dtype=self.dtype).detach().cpu().numpy()
+            active_mask = gates_plot > active_threshold
+
+            mesh = pv.PolyData(
+                q.points_xyz.detach().cpu().numpy(),
+                pv_faces,
+            )
+            mesh["rho"] = rho_plot
+
+            plotter.add_text(case_name, font_size=10)
+            plotter.add_mesh(
+                mesh,
+                scalars="rho",
+                cmap=cmap,
+                clim=list(clim),
+                show_edges=show_edges,
+            )
+
+            if active_mask.any():
+                active_cloud = pv.PolyData(seed_xyz[active_mask].detach().cpu().numpy())
+                plotter.add_mesh(
+                    active_cloud,
+                    color="red",
+                    render_points_as_spheres=True,
+                    point_size=14,
+                )
+
+            if (~active_mask).any():
+                inactive_cloud = pv.PolyData(seed_xyz[~active_mask].detach().cpu().numpy())
+                plotter.add_mesh(
+                    inactive_cloud,
+                    color="gray",
+                    opacity=0.45,
+                    render_points_as_spheres=True,
+                    point_size=12,
+                )
+
+            plotter.show_axes()
+
+        plotter.link_views()
+        return plotter
+
+    # ---------------------------
+    # one-shot interface
+    # ---------------------------
+
+    def visualize(
+        self,
+        *,
+        seeds_raw,
+        gate_vectors: dict[str, torch.Tensor | list[float]],
+        w_raw,
+        h_raw=None,
+        theta=None,
+        a_raw=None,
+        query: MeshQueryData | None = None,
+        boundary_uv=None,
+        boundary_face_id=None,
+        boundary_width_raw=None,
+        boundary_alpha_raw=None,
+        boundary_beta_raw=None,
+        active_threshold: float = 0.05,
+        show_uv: bool = True,
+        show_3d: bool = True,
+    ) -> dict[str, Any]:
+        cases = self.evaluate_cases(
+            seeds_raw=seeds_raw,
+            gate_vectors=gate_vectors,
+            w_raw=w_raw,
+            h_raw=h_raw,
+            theta=theta,
+            a_raw=a_raw,
+            query=query,
+            boundary_uv=boundary_uv,
+            boundary_face_id=boundary_face_id,
+            boundary_width_raw=boundary_width_raw,
+            boundary_alpha_raw=boundary_alpha_raw,
+            boundary_beta_raw=boundary_beta_raw,
+        )
+
+        result: dict[str, Any] = {"cases": cases}
+
+        if show_uv:
+            fig = self.plot_uv_cases(
+                cases=cases,
+                seeds_raw=seeds_raw,
+                gate_vectors=gate_vectors,
+                active_threshold=active_threshold,
+                query=query,
+            )
+            result["uv_fig"] = fig
+
+        if show_3d:
+            plotter = self.plot_3d_cases(
+                cases=cases,
+                seeds_raw=seeds_raw,
+                gate_vectors=gate_vectors,
+                active_threshold=active_threshold,
+                query=query,
+            )
+            result["plotter"] = plotter
+
+        return result
