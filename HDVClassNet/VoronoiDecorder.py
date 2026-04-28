@@ -774,60 +774,116 @@ class VoronoiDecoder(nn.Module):
         return e3.clamp_min(0.0)
 
     # -------------------- bisector band density --------------------
-
     def _bisector_band_density(
         self,
-        seeds: torch.Tensor,
-        d: torch.Tensor,
-        w_soft: torch.Tensor,
+        points: torch.Tensor,          # (N, 2) query UV points
+        seeds: torch.Tensor,           # (S, 2)
+        d: torch.Tensor,               # (N, S)
+        w_soft: torch.Tensor,          # (N, S)
         w_geo: torch.Tensor,
         beta: float | torch.Tensor,
         seed_gates: torch.Tensor | None = None,
     ):
         N, S = d.shape
 
+        # --------------------------------------------------
+        # 1. Structural seed weights
+        # --------------------------------------------------
         w_struct = w_soft
+
         if seed_gates is not None:
             if seed_gates.ndim != 1 or seed_gates.shape[0] != S:
                 raise ValueError(
                     f"seed_gates must have shape ({S},), got {tuple(seed_gates.shape)}"
                 )
+
             g = seed_gates.to(device=d.device, dtype=d.dtype).clamp_min(self.eps)
             w_struct = w_soft * g.unsqueeze(0)
             w_struct = w_struct / w_struct.sum(dim=1, keepdim=True).clamp_min(self.eps)
 
-        d_i = d.unsqueeze(2)
-        d_j = d.unsqueeze(1)
-
-        tri = self._strict_upper_tri_mask(S, d.device, d.dtype)
+        # --------------------------------------------------
+        # 2. Pairwise distance difference
+        # --------------------------------------------------
+        d_i = d.unsqueeze(2)  # (N, S, 1)
+        d_j = d.unsqueeze(1)  # (N, 1, S)
 
         delta = d_i - d_j
         abs_delta = torch.sqrt(delta * delta + self.eps)
 
+        # --------------------------------------------------
+        # 3. Convert |d_i - d_j| to true distance to bisector
+        # --------------------------------------------------
+        # vector from seed to point
+        x_minus_s = points.unsqueeze(1) - seeds.unsqueeze(0)  # (N, S, 2)
+
+        # unit direction from seed to point
+        unit = x_minus_s / d.unsqueeze(2).clamp_min(self.eps)  # (N, S, 2)
+
+        unit_i = unit.unsqueeze(2)  # (N, S, 1, 2)
+        unit_j = unit.unsqueeze(1)  # (N, 1, S, 2)
+
+        grad_vec = unit_i - unit_j
+        grad_norm = torch.sqrt((grad_vec * grad_vec).sum(dim=-1) + self.eps)  # (N, S, S)
+
+        # This is the important correction:
+        # true_dist is approximately perpendicular distance to the bisector
+        true_dist = abs_delta / grad_norm.clamp_min(self.eps)
+
+        # --------------------------------------------------
+        # 4. Ambiguity / junction information
+        # --------------------------------------------------
         ambiguity = (1.0 - w_struct.pow(2).sum(dim=1)).clamp(0.0, 1.0)
 
         beta_t = torch.as_tensor(beta, device=d.device, dtype=d.dtype)
-        beta_eff = beta_t * (
-            1.0 + self.junction_beta_scale * ambiguity.unsqueeze(1).unsqueeze(2)
+
+        # Start clean: do NOT widen bands using ambiguity yet
+        beta_eff = beta_t
+        w_geo_eff = w_geo
+
+        # Later, after geometry looks good, you may restore:
+        #
+        # beta_eff = beta_t * (
+        #     1.0 + self.junction_beta_scale * ambiguity.unsqueeze(1).unsqueeze(2)
+        # )
+        #
+        # w_geo_eff = w_geo * (
+        #     1.0 + self.junction_width_bonus * ambiguity.unsqueeze(1).unsqueeze(2)
+        # )
+
+        # --------------------------------------------------
+        # 5. Valid seed-pair mask
+        # --------------------------------------------------
+        pair_distinctness = self._pair_distinctness(
+            seeds=seeds,
+            device=d.device,
+            dtype=d.dtype,
         )
-        w_geo_eff = w_geo * (
-            1.0 + self.junction_width_bonus * ambiguity.unsqueeze(1).unsqueeze(2)
+
+        # --------------------------------------------------
+        # 6. Uniform-width bisector band
+        # --------------------------------------------------
+        band_raw = torch.sigmoid(
+            (w_geo_eff - true_dist) / (beta_eff + self.eps)
         )
 
-        pair_distinctness = self._pair_distinctness(seeds=seeds, device=d.device, dtype=d.dtype)
+        band_peak = torch.sigmoid(
+            w_geo_eff / (beta_eff + self.eps)
+        )
 
-        band_raw = torch.sigmoid((w_geo_eff - abs_delta) / (beta_eff + self.eps))
-        band_peak = torch.sigmoid(w_geo_eff / (beta_eff + self.eps))
-        band_ij = (band_raw / (band_peak + self.eps)).clamp(0.0, 1.0) * pair_distinctness
+        band_ij = (band_raw / (band_peak + self.eps)).clamp(0.0, 1.0)
+        band_ij = band_ij * pair_distinctness
 
-        
-
+        # --------------------------------------------------
+        # 7. Pair relevance
+        # --------------------------------------------------
         pair_prod = w_struct.unsqueeze(2) * w_struct.unsqueeze(1)
 
         sum_w2 = w_struct.pow(2).sum(dim=1).clamp_min(self.eps)
         k_eff = 1.0 / sum_w2
+
         junction_mult = 1.0 + self.junction_keff_lambda * torch.sigmoid(
-            (k_eff - self.junction_keff_k0) / (self.junction_keff_s + self.eps)
+            (k_eff - self.junction_keff_k0)
+            / (self.junction_keff_s + self.eps)
         )
 
         pair_relevance = (
@@ -836,8 +892,14 @@ class VoronoiDecoder(nn.Module):
             * junction_mult.unsqueeze(1).unsqueeze(2)
             * pair_distinctness
         )
-        pair_strength = pair_relevance * band_ij
 
+        # IMPORTANT:
+        # Use pair_relevance, not only pair_prod.
+        pair_strength = pair_prod * band_ij
+
+        # --------------------------------------------------
+        # 8. Optional pair boost
+        # --------------------------------------------------
         if self.pair_boost_enabled:
             valid_pair_count = pair_distinctness.sum().clamp_min(1.0)
             reference_pair_count = max(float(S - 1), 1.0)
@@ -849,22 +911,30 @@ class VoronoiDecoder(nn.Module):
 
             pair_strength = pair_strength * pair_boost
 
-            
+        # --------------------------------------------------
+        # 9. Final density
+        # --------------------------------------------------
         R_pair = pair_strength.sum(dim=(1, 2))
 
         R_junction = self._triple_junction_score(w_struct)
+
         R = R_pair + self.junction_triple_lambda * R_junction
+
+        rho = 1.0 - torch.exp(-self.alpha_union * R)
+        rho = rho.clamp(0.0, 1.0)
+
+        # --------------------------------------------------
+        # 10. Pure geometric edge field
+        # --------------------------------------------------
         band_soft = band_ij.clamp(0.0, 1.0)
 
         eye = torch.eye(S, dtype=torch.bool, device=band_soft.device).unsqueeze(0)
+
         one_minus = torch.where(
             eye,
             torch.ones_like(band_soft),
             1.0 - band_soft,
         )
-
-        rho = 1.0 - torch.exp(-self.alpha_union * R)
-        rho = rho.clamp(0.0, 1.0)
 
         edge_field = 1.0 - one_minus.prod(dim=2).prod(dim=1)
         edge_field = edge_field.clamp(0.0, 1.0)
@@ -991,6 +1061,7 @@ class VoronoiDecoder(nn.Module):
         w_geo = self.width(w_raw, seeds=seeds)
 
         rho_v, pair_strength, band_ij, pair_relevance, edge_field = self._bisector_band_density(
+            points =points_uv,
             seeds=seeds,
             d=d,
             w_soft=w_soft,

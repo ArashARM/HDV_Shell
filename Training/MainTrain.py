@@ -96,6 +96,27 @@ class TrainingConfig:
     seed_anchor_momentum: float = 0.20
     seed_anchor_warmup_frac: float = 0.05
     use_rolling_seed_anchors: bool = True
+    guard_seed_anchor_updates: bool = True
+    anchor_guard_rep_max: float = 0.30
+    anchor_guard_bnd_max: float = 0.80
+    anchor_guard_vol_eff_min: float = 0.10
+    anchor_guard_width_factor_min: float = 1.20
+    anchor_guard_min_seed_dist_factor: float = 2.0
+
+    restore_best_on_collapse: bool = True
+    collapse_rep_threshold: float = 0.80
+    collapse_bnd_threshold: float = 0.90
+    collapse_vol_eff_threshold: float = 0.05
+    collapse_width_factor: float = 1.10
+    collapse_min_seed_dist_factor: float = 2.0
+    collapse_restore_cooldown: int = 75
+    collapse_lr_shrink: float = 0.5
+    post_restore_seed_freeze_steps: int = 100
+    post_restore_offset_scale: float = 0.25
+    repair_collapsed_seed_anchors: bool = True
+    seed_repair_iters: int = 8
+    project_seed_spacing_each_step: bool = True
+    seed_projection_iters: int = 4
 
     lr_seed_refine: float = 1e-1
     lr_delta_head: float = 2e-4
@@ -108,6 +129,8 @@ class TrainingConfig:
     early_stop_start: int = 300
     patience: int = 300
     min_delta: float = 1e-4
+    best_score_vol_tolerance: float = 0.04
+    best_score_vol_penalty: float = 100.0
 
     use_gating: bool = True
     lr_gate_head: float = 5e-5
@@ -156,6 +179,9 @@ class TrainingConfig:
     sharp_vol_ramp_frac: float = 0.3
 
     Offset_scale: float = 1.00
+    seed_offset_scale_start: float | None = None
+    seed_offset_scale_final: float | None = None
+    seed_offset_scale_ramp_frac: float = 0.60
     scheduler_milestones: tuple[float, ...] = (80, 160)
     scheduler_gamma: float = 0.5
 
@@ -219,6 +245,55 @@ class TrainingConfig:
         if not (0.0 <= self.seed_anchor_warmup_frac <= 1.0):
             raise ValueError(
                 f"seed_anchor_warmup_frac must be in [0,1], got {self.seed_anchor_warmup_frac}"
+            )
+        if self.anchor_guard_width_factor_min < 1.0:
+            raise ValueError(
+                "anchor_guard_width_factor_min must be >= 1, "
+                f"got {self.anchor_guard_width_factor_min}"
+            )
+        if self.anchor_guard_min_seed_dist_factor < 0.0:
+            raise ValueError(
+                "anchor_guard_min_seed_dist_factor must be >= 0, "
+                f"got {self.anchor_guard_min_seed_dist_factor}"
+            )
+        if self.collapse_width_factor < 1.0:
+            raise ValueError(f"collapse_width_factor must be >= 1, got {self.collapse_width_factor}")
+        if self.collapse_min_seed_dist_factor < 0.0:
+            raise ValueError(
+                "collapse_min_seed_dist_factor must be >= 0, "
+                f"got {self.collapse_min_seed_dist_factor}"
+            )
+        if self.collapse_restore_cooldown < 0:
+            raise ValueError(
+                f"collapse_restore_cooldown must be >= 0, got {self.collapse_restore_cooldown}"
+            )
+        if not (0.0 < self.collapse_lr_shrink <= 1.0):
+            raise ValueError(f"collapse_lr_shrink must be in (0,1], got {self.collapse_lr_shrink}")
+        if self.post_restore_seed_freeze_steps < 0:
+            raise ValueError(
+                "post_restore_seed_freeze_steps must be >= 0, "
+                f"got {self.post_restore_seed_freeze_steps}"
+            )
+        if self.post_restore_offset_scale <= 0.0:
+            raise ValueError(
+                f"post_restore_offset_scale must be > 0, got {self.post_restore_offset_scale}"
+            )
+        if self.seed_repair_iters < 0:
+            raise ValueError(f"seed_repair_iters must be >= 0, got {self.seed_repair_iters}")
+        if self.seed_projection_iters < 0:
+            raise ValueError(f"seed_projection_iters must be >= 0, got {self.seed_projection_iters}")
+        if self.seed_offset_scale_start is not None and self.seed_offset_scale_start <= 0.0:
+            raise ValueError(
+                f"seed_offset_scale_start must be > 0, got {self.seed_offset_scale_start}"
+            )
+        if self.seed_offset_scale_final is not None and self.seed_offset_scale_final <= 0.0:
+            raise ValueError(
+                f"seed_offset_scale_final must be > 0, got {self.seed_offset_scale_final}"
+            )
+        if not (0.0 < self.seed_offset_scale_ramp_frac <= 1.0):
+            raise ValueError(
+                "seed_offset_scale_ramp_frac must be in (0,1], "
+                f"got {self.seed_offset_scale_ramp_frac}"
             )
         if not (0.0 <= self.gate_warmup_frac <= 1.0):
             raise ValueError(
@@ -632,6 +707,76 @@ class NN_Trainer:
             return 1.0
         return float(step - start_step) / float(ramp_steps)
 
+    def seed_offset_scale_for_step(self, step: int) -> float:
+        cfg = self.cfg
+        start = cfg.Offset_scale if cfg.seed_offset_scale_start is None else cfg.seed_offset_scale_start
+        final = start if cfg.seed_offset_scale_final is None else cfg.seed_offset_scale_final
+        if cfg.num_steps <= 0:
+            return float(final)
+
+        t = min(max(float(step) / max(float(cfg.seed_offset_scale_ramp_frac) * float(cfg.num_steps), 1.0), 0.0), 1.0)
+        # Smooth decay: exploration changes gently instead of snapping at a milestone.
+        t = t * t * (3.0 - 2.0 * t)
+        return float((1.0 - t) * float(start) + t * float(final))
+
+    @staticmethod
+    def min_pairwise_seed_distance(seeds_list: list[torch.Tensor]) -> float:
+        min_seed_dist = float("inf")
+        for seeds_i in seeds_list:
+            if seeds_i.shape[0] < 2:
+                continue
+            d_seed = torch.cdist(seeds_i, seeds_i)
+            eye = torch.eye(
+                seeds_i.shape[0],
+                dtype=torch.bool,
+                device=seeds_i.device,
+            )
+            d_seed = d_seed.masked_fill(eye, float("inf"))
+            min_seed_dist = min(min_seed_dist, float(d_seed.min().detach().item()))
+        if not math.isfinite(min_seed_dist):
+            min_seed_dist = 0.0
+        return min_seed_dist
+
+    @staticmethod
+    def project_seed_spacing(
+        seeds_list: list[torch.Tensor],
+        min_dist: float,
+        iters: int = 8,
+        eps_uv: float = 1e-4,
+        detach: bool = True,
+    ) -> list[torch.Tensor]:
+        repaired = [(s.detach() if detach else s).clone() for s in seeds_list]
+        if min_dist <= 0.0 or iters <= 0:
+            return repaired
+
+        for _ in range(int(iters)):
+            for seeds in repaired:
+                s = int(seeds.shape[0])
+                if s < 2:
+                    continue
+                for i in range(s - 1):
+                    for j in range(i + 1, s):
+                        diff = seeds[i] - seeds[j]
+                        dist = torch.linalg.norm(diff)
+                        shortfall = float(min_dist) - float(dist.detach().item())
+                        if shortfall <= 0.0:
+                            continue
+                        if float(dist.detach().item()) > 1e-8:
+                            direction = diff / dist.clamp_min(1e-8)
+                        else:
+                            # Deterministic fallback direction for exact overlaps.
+                            angle = torch.as_tensor(
+                                2.399963229728653 * float(i + 1) + 1.61803398875 * float(j + 1),
+                                dtype=seeds.dtype,
+                                device=seeds.device,
+                            )
+                            direction = torch.stack((torch.cos(angle), torch.sin(angle)))
+                        step = 0.5 * shortfall * direction
+                        seeds[i] = seeds[i] + step
+                        seeds[j] = seeds[j] - step
+                seeds.clamp_(float(eps_uv), 1.0 - float(eps_uv))
+        return repaired
+
     @staticmethod
     def gate_target_loss(
         gates: torch.Tensor | None,
@@ -827,23 +972,34 @@ class NN_Trainer:
         seeds: torch.Tensor,
         gates: torch.Tensor | None = None,
         sigma: float = 0.08,
+        min_dist: float | None = None,
         eps: float = 1e-12,
     ) -> torch.Tensor:
         S = seeds.shape[0]
-        d2 = torch.cdist(seeds, seeds).pow(2)
+        if S < 2:
+            return torch.zeros((), dtype=seeds.dtype, device=seeds.device)
 
-        eye = torch.eye(S, dtype=torch.bool, device=seeds.device)
-        mask = ~eye
+        d = torch.cdist(seeds, seeds)
+        pair_mask = torch.triu(
+            torch.ones((S, S), dtype=torch.bool, device=seeds.device),
+            diagonal=1,
+        )
 
-        K = torch.exp(-d2 / (sigma**2 + eps))
+        if min_dist is not None and min_dist > 0.0:
+            target = torch.as_tensor(min_dist, dtype=seeds.dtype, device=seeds.device)
+            penalty = torch.relu(target - d).pow(2) / (target.pow(2) + eps)
+        else:
+            penalty = torch.exp(-d.pow(2) / (sigma**2 + eps))
 
         if gates is None:
-            return K[mask].mean()
+            return penalty[pair_mask].max()
 
         g = gates.view(-1).clamp(0.0, 1.0)
         G = g[:, None] * g[None, :]
-
-        return (G * K)[mask].sum() / (G[mask].sum() + eps)
+        active_pair = pair_mask & (G > eps)
+        if not bool(active_pair.any()):
+            return torch.zeros((), dtype=seeds.dtype, device=seeds.device)
+        return (G * penalty)[active_pair].max()
 
     @staticmethod
     def boundary_repulsion_term(
@@ -3380,6 +3536,7 @@ class NN_Trainer:
         best_fiber_surface = None
         best_seeds = None
         best_pred = None
+        best_ppnet_state = None
         best_hard_score = float("inf")
         best_hard_vol_frac = None
         best_hard_comp = None
@@ -3403,6 +3560,10 @@ class NN_Trainer:
         seed_points_final = None
         rho0 = None
         seeds0 = None
+        anchor_update_allowed = True
+        collapse_restore_count = 0
+        last_collapse_restore_step = -10**9
+        seed_freeze_until_step = -1
         history = []
 
         self.current_face_tensors = face_tensors
@@ -3520,7 +3681,12 @@ class NN_Trainer:
                 update_seed_anchors = (
                     cfg.use_rolling_seed_anchors
                     and step >= int(round(float(cfg.seed_anchor_warmup_frac) * float(cfg.num_steps)))
+                    and (anchor_update_allowed or not cfg.guard_seed_anchor_updates)
                 )
+                seed_offset_scale_step = self.seed_offset_scale_for_step(step)
+                seed_motion_frozen = step < seed_freeze_until_step
+                if seed_motion_frozen:
+                    seed_offset_scale_step = min(seed_offset_scale_step, float(cfg.post_restore_offset_scale))
                 uv_anchor_next_list = []
 
                 for ft, decoder, ppnet, uv_anchor_i, context_i, A_local, face_weight_i in zip(
@@ -3532,9 +3698,18 @@ class NN_Trainer:
                     local_vertex_areas,
                     local_face_weights,
                 ):
-                    pred_i = ppnet(context_i, uv_anchor_i, offset_scale=cfg.Offset_scale)
+                    pred_i = ppnet(context_i, uv_anchor_i, offset_scale=seed_offset_scale_step)
 
                     seeds_raw_i = pred_i["seeds_raw"][0]
+                    if cfg.project_seed_spacing_each_step:
+                        seeds_raw_i = self.project_seed_spacing(
+                            seeds_list=[seeds_raw_i],
+                            min_dist=float(cfg.collapse_min_seed_dist_factor) * float(cfg.w_min),
+                            iters=int(cfg.seed_projection_iters),
+                            detach=False,
+                        )[0]
+                        pred_i["seeds_raw"] = pred_i["seeds_raw"].clone()
+                        pred_i["seeds_raw"][0] = seeds_raw_i
                     w_raw_i = pred_i["w_raw"][0]
 
                     h_raw_i = None
@@ -3804,6 +3979,7 @@ class NN_Trainer:
                                 seeds=seeds_i,
                                 gates=gates_decoder_i,
                                 sigma=cfg.seed_repulsion_sigma,
+                                min_dist=2.0 * float(cfg.w_min),
                                 eps=cfg.eps,
                             )
                         )
@@ -4186,6 +4362,12 @@ class NN_Trainer:
                                     if cfg.freeze_tau_head_during_hard_refine and hasattr(ppnet, "tau_head"):
                                         for p in ppnet.tau_head.parameters():
                                             p.grad = None
+                            if seed_motion_frozen:
+                                for ppnet in ppnets:
+                                    for p in ppnet.seed_refine.parameters():
+                                        p.grad = None
+                                    for p in ppnet.delta_head.parameters():
+                                        p.grad = None
 
                             opt.step()
 
@@ -4220,9 +4402,25 @@ class NN_Trainer:
                     vol_frac = (rho * A_v).sum() / (A_v.sum() + cfg.eps)
                     vol_dev = torch.abs(vol_frac - cfg.target_volfrac)
                     vol_dev_eff = torch.abs(vol_frac_eff - cfg.target_volfrac)
+                    min_seed_dist = self.min_pairwise_seed_distance(seeds_list)
+                    min_seed_dist_required = float(cfg.collapse_min_seed_dist_factor) * float(cfg.w_min)
 
                     score = float(L_total.detach().item()) if total_is_finite else float("inf")
-                    best_candidate_is_valid = (cfg.lam_fem == 0.0) or fem_is_valid
+                    if total_is_finite and fem_is_valid:
+                        comp_score = float(comp_val.detach().item())
+                        vol_error = float(vol_dev_eff.detach().item())
+
+                        score = comp_score
+                        vol_tol = float(cfg.best_score_vol_tolerance)
+                        if vol_error > vol_tol:
+                            score += float(cfg.best_score_vol_penalty) * (vol_error - vol_tol) ** 2
+                    else:
+                        score = float("inf")
+
+                    best_candidate_is_valid = (
+                        ((cfg.lam_fem == 0.0) or fem_is_valid)
+                        and min_seed_dist >= min_seed_dist_required
+                    )
 
                     prev_best_step = best_step
                     improvement_gap = (step - prev_best_step) if prev_best_step >= 0 else None
@@ -4247,6 +4445,13 @@ class NN_Trainer:
                         best_fiber_surface = fiber_surface.detach().clone()
                         best_seeds = [s.detach().clone() for s in seeds_list]
                         best_pred = self._clone_pred_list(pred_list)
+                        best_ppnet_state = [
+                            {
+                                k: v.detach().clone()
+                                for k, v in ppnet.state_dict().items()
+                            }
+                            for ppnet in ppnets
+                        ]
 
                         if improvement_gap is None or improvement_gap > 50:
                             tqdm.write(
@@ -4337,6 +4542,7 @@ class NN_Trainer:
                         "vol_dev": float(vol_dev.detach().item()),
                         "vol_dev_eff": float(vol_dev_eff.detach().item()),
                         "tau": float(tau_step),
+                        "seed_offset_scale": float(seed_offset_scale_step),
                         "rho_min": rho_min,
                         "rho_mean": rho_mean,
                         "rho_max": rho_max,
@@ -4348,6 +4554,7 @@ class NN_Trainer:
                         "rho_v_mean": float(rho_v_all.mean().detach().item()),
                         "drho": drho,
                         "dseed": dseed,
+                        "min_seed_dist": min_seed_dist,
                         "grad_mean": g_mean,
                         "best_score": best_score,
                         "best_step": best_step,
@@ -4391,6 +4598,9 @@ class NN_Trainer:
                         "hard_refine_on": 1.0 if use_hard_refine_step else 0.0,
                         "loss_width_active": self._finite_or_default(loss_width_active),
                         "lam_width_active_eff": lam_width_active_eff,
+                        "anchor_update_allowed": 1.0 if anchor_update_allowed else 0.0,
+                        "collapse_restore_count": float(collapse_restore_count),
+                        "seed_motion_frozen": 1.0 if seed_motion_frozen else 0.0,
                     }
                     history.append(row)
 
@@ -4400,6 +4610,7 @@ class NN_Trainer:
                         comp=f"{row['comp']:.2e}",
                         tau=f"{row['tau']:.2e}",
                         w=f"{row['w_geo_mean']:.3e}",
+                        dmin=f"{row['min_seed_dist']:.3e}",
                         bw=f"{row['boundary_width_mean']:.3e}",
                         sel=f"{selected_count_mean:.1f}",
                         part=f"{participating_count_mean:.1f}",
@@ -4438,7 +4649,8 @@ class NN_Trainer:
                                 f"ba={row['boundary_alpha_mean']:.4g} | "
                                 f"bb={row['boundary_beta_mean']:.4g} | "
                                 f"act={row['active_count_total']:.0f} inact={row['inactive_count_total']:.0f} | "
-                                f"Δrho={drho:.2e} Δseed={dseed:.2e} grad_mean={g_mean:.2e} | "
+                                f"Δrho={drho:.2e} Δseed={dseed:.2e} "
+                                f"dmin={min_seed_dist:.2e} grad_mean={g_mean:.2e} | "
                             ),
                         )
 
@@ -4477,6 +4689,7 @@ class NN_Trainer:
                             f"vol_eff={row['vol_frac_eff']:.3f} "
                             f"(/{cfg.target_volfrac:.3f}) "
                             f"tau={row['tau']:.3e} "
+                            f"os={row['seed_offset_scale']:.2e} "
                             f"comp={row['comp']:.3e} | "
                             f"hard_gate={'ON' if use_hard_gate_mask_step else 'off'} "
                             f"hard_refine={'ON' if use_hard_refine_step else 'off'} | "
@@ -4495,10 +4708,74 @@ class NN_Trainer:
                             f"gate_raw(min/mean/max)={gate_raw_min_global:.3f}/{gate_raw_mean_global:.3f}/{gate_raw_max_global:.3f} | "
                             f"gate_sharp(min/mean/max)={gate_sharp_min_global:.3f}/{gate_sharp_mean_global:.3f}/{gate_sharp_max_global:.3f} | "
                             f"gate_dec(min/mean/max)={gate_decoder_min_global:.3f}/{gate_decoder_mean_global:.3f}/{gate_decoder_max_global:.3f} | "
-                            f"Δrho={drho:.2e} Δseed={dseed:.2e} grad_mean={g_mean:.2e} | "
+                            f"Δrho={drho:.2e} Δseed={dseed:.2e} "
+                            f"dmin={min_seed_dist:.2e} grad_mean={g_mean:.2e} | "
                             f"fem={fem_status} | "
                             f"best={best_score:.4e}@{best_step} | "
                             f"best_hard={best_hard_score:.4e}@{best_hard_step}"
+                        )
+
+                    rep_value = float(row["loss_rep"])
+                    bnd_value = float(row["loss_bnd"])
+                    vol_eff_value = float(row["vol_frac_eff"])
+                    w_geo_value = float(row["w_geo_mean"])
+                    min_seed_dist_value = float(row["min_seed_dist"])
+                    min_seed_dist_limit = float(cfg.anchor_guard_min_seed_dist_factor) * float(cfg.w_min)
+                    collapse_seed_dist_limit = float(cfg.collapse_min_seed_dist_factor) * float(cfg.w_min)
+
+                    anchor_update_allowed = (
+                        rep_value <= float(cfg.anchor_guard_rep_max)
+                        and bnd_value <= float(cfg.anchor_guard_bnd_max)
+                        and vol_eff_value >= float(cfg.anchor_guard_vol_eff_min)
+                        and w_geo_value >= float(cfg.anchor_guard_width_factor_min) * float(cfg.w_min)
+                        and min_seed_dist_value >= min_seed_dist_limit
+                    )
+
+                    collapsed = (
+                        rep_value >= float(cfg.collapse_rep_threshold)
+                        or bnd_value >= float(cfg.collapse_bnd_threshold)
+                        or vol_eff_value <= float(cfg.collapse_vol_eff_threshold)
+                        or w_geo_value <= float(cfg.collapse_width_factor) * float(cfg.w_min)
+                        or min_seed_dist_value < collapse_seed_dist_limit
+                    )
+                    seed_spacing_collapsed = min_seed_dist_value < collapse_seed_dist_limit
+                    can_restore_from_best = (
+                        cfg.restore_best_on_collapse
+                        and collapsed
+                        and best_ppnet_state is not None
+                        and best_seeds is not None
+                        and step > best_step
+                        and (step - last_collapse_restore_step) >= int(cfg.collapse_restore_cooldown)
+                    )
+                    if can_restore_from_best:
+                        for ppnet, state in zip(ppnets, best_ppnet_state):
+                            ppnet.load_state_dict(state)
+                            ppnet.zero_grad(set_to_none=True)
+                        opt.state.clear()
+                        for group in opt.param_groups:
+                            group["lr"] = max(float(group["lr"]) * float(cfg.collapse_lr_shrink), 1e-8)
+                        if cfg.repair_collapsed_seed_anchors and seed_spacing_collapsed:
+                            uv_anchor_list = self.project_seed_spacing(
+                                seeds_list=best_seeds,
+                                min_dist=collapse_seed_dist_limit,
+                                iters=int(cfg.seed_repair_iters),
+                            )
+                            repaired_dmin = self.min_pairwise_seed_distance(uv_anchor_list)
+                            anchor_source = f"repaired collapsed seeds dmin={repaired_dmin:.3e}"
+                        else:
+                            uv_anchor_list = [s.detach().clone() for s in best_seeds]
+                            anchor_source = "best seeds"
+                        anchor_update_allowed = False
+                        seed_freeze_until_step = step + int(cfg.post_restore_seed_freeze_steps)
+                        collapse_restore_count += 1
+                        last_collapse_restore_step = step
+                        steps_since_improve = 0
+                        tqdm.write(
+                            f"[step {step}] Collapse detected; restored best_step={best_step}, "
+                            f"shrunk optimizer LRs by {float(cfg.collapse_lr_shrink):.3g}, "
+                            f"froze seed motion until step {seed_freeze_until_step}, "
+                            f"anchors={anchor_source}, "
+                            f"restores={collapse_restore_count}."
                         )
 
                     if step >= cfg.early_stop_start and steps_since_improve >= cfg.patience:
