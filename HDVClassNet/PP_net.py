@@ -1,47 +1,61 @@
+import math
 import torch
 import torch.nn as nn
 
 
 class PPNet(nn.Module):
     """
-    PPNet: predicts all learnable decoder controls.
+    PPNet: predicts ALL VoronoiDecoder controls.
 
-    Returns possible keys:
-      pred["seeds_raw"]            : (B,S,2)
-      pred["w_raw"]                : (B,S,S)
-      pred["h_raw"]                : (B,)         if predict_height=True
-      pred["theta"]                : (B,S)        if anisotropy enabled
-      pred["a_raw"]                : (B,S)        if anisotropy enabled
-      pred["gate_logits"]          : (B,S)        if use_gating=True
-      pred["gate_probs"]           : (B,S)        if use_gating=True
-
-      pred["boundary_width_raw"]   : (B,)         if predict_boundary_params=True
-      pred["boundary_alpha_raw"]   : (B,)         if predict_boundary_params=True
-      pred["boundary_beta_raw"]    : (B,)         if predict_boundary_params=True
+    Outputs always contain full control dictionary:
+    - seeds_raw (required)
+    - w_raw (required)
+    - optional parameters returned as None if disabled
     """
 
     def __init__(
         self,
         context_dim,
         n_seeds,
+        hidden=256,
+
+        # feature toggles
         use_Metric_anisotropy=False,
         predict_height=False,
         use_gating=False,
-        predict_boundary_width=False,
-        hidden=256,
+        predict_boundary_params=False,
+        predict_tau=False,
+        tau_pred_start=0.02,
+        tau_pred_min=1e-4,
+        tau_pred_max=0.2,
+
+        # width behavior
         freeze_w=False,
         w_const=0.25,
+        w_head_bias_init=0.0,
+
+        # seed update constraints
         eps_uv=1e-4,
         max_delta_logit=0.30,
         max_step_uv=0.08,
+
+        # init biases
         gate_bias_init=0.0,
+
+        # safety
+        enable_checks=True,
     ):
         super().__init__()
+
         self.n_seeds = n_seeds
         self.use_Metric_anisotropy = use_Metric_anisotropy
         self.predict_height = predict_height
         self.use_gating = use_gating
-        self.predict_boundary_width = predict_boundary_width
+        self.predict_boundary_params = predict_boundary_params
+        self.predict_tau = predict_tau
+        self.tau_pred_start = float(tau_pred_start)
+        self.tau_pred_min = float(tau_pred_min)
+        self.tau_pred_max = float(tau_pred_max)
 
         self.freeze_w = freeze_w
         self.w_const = w_const
@@ -49,9 +63,25 @@ class PPNet(nn.Module):
         self.eps_uv = eps_uv
         self.max_delta_logit = max_delta_logit
         self.max_step_uv = max_step_uv
-        self.gate_bias_init = gate_bias_init
 
-        # global context trunk
+        self.enable_checks = enable_checks
+
+        if self.predict_tau:
+            if not (self.tau_pred_min > 0.0):
+                raise ValueError(f"tau_pred_min must be > 0, got {self.tau_pred_min}")
+            if not (self.tau_pred_max > self.tau_pred_min):
+                raise ValueError(
+                    f"tau_pred_max must be > tau_pred_min, got min={self.tau_pred_min}, max={self.tau_pred_max}"
+                )
+            if not (self.tau_pred_min <= self.tau_pred_start <= self.tau_pred_max):
+                raise ValueError(
+                    "tau_pred_start must lie within [tau_pred_min, tau_pred_max], "
+                    f"got start={self.tau_pred_start}, min={self.tau_pred_min}, max={self.tau_pred_max}"
+                )
+
+        # -------------------------
+        # trunk
+        # -------------------------
         self.mlp = nn.Sequential(
             nn.Linear(context_dim, hidden),
             nn.ReLU(),
@@ -59,7 +89,9 @@ class PPNet(nn.Module):
             nn.ReLU(),
         )
 
+        # -------------------------
         # per-seed refinement
+        # -------------------------
         self.seed_refine = nn.Sequential(
             nn.Linear(hidden + 2, hidden),
             nn.ReLU(),
@@ -69,140 +101,198 @@ class PPNet(nn.Module):
 
         self.delta_head = nn.Linear(hidden, 2)
 
-        # global heads
+        # -------------------------
+        # heads
+        # -------------------------
         self.w_head = nn.Linear(hidden, 1)
+        nn.init.zeros_(self.w_head.weight)
+        nn.init.constant_(self.w_head.bias, w_head_bias_init)
 
         if self.predict_height:
             self.h_head = nn.Linear(hidden, 1)
 
-        if self.predict_boundary_width:
-            self.boundary_width_head = nn.Linear(hidden, 1)
-
         if self.use_gating:
             self.gate_head = nn.Linear(hidden, 1)
             nn.init.zeros_(self.gate_head.weight)
-            nn.init.constant_(self.gate_head.bias, self.gate_bias_init)
+            nn.init.constant_(self.gate_head.bias, gate_bias_init)
 
         if self.use_Metric_anisotropy:
             self.theta_head = nn.Linear(hidden, 1)
             self.a_head = nn.Linear(hidden, 1)
 
+        if self.predict_boundary_params:
+            self.boundary_width_head = nn.Linear(hidden, 1)
+            self.boundary_alpha_head = nn.Linear(hidden, 1)
+            self.boundary_beta_head = nn.Linear(hidden, 1)
+
+        if self.predict_tau:
+            self.tau_head = nn.Linear(hidden, 1)
+            nn.init.zeros_(self.tau_head.weight)
+            tau_range = self.tau_pred_max - self.tau_pred_min
+            tau_frac = (self.tau_pred_start - self.tau_pred_min) / tau_range
+            tau_frac = min(max(tau_frac, 1e-6), 1.0 - 1e-6)
+            nn.init.constant_(self.tau_head.bias, math.log(tau_frac / (1.0 - tau_frac)))
+
+    # -------------------------------------------------------
+    # safety helper
+    # -------------------------------------------------------
+
+    def _check(self, tensor, name):
+        if self.enable_checks and not torch.isfinite(tensor).all():
+            raise RuntimeError(f"PPNet produced non-finite {name}")
+
+    # -------------------------------------------------------
+    # forward
+    # -------------------------------------------------------
+
     def forward(self, context, uv_init, offset_scale=1.0):
         B = context.shape[0]
         S = self.n_seeds
-
         eps_uv = self.eps_uv
-        max_delta_logit = self.max_delta_logit
-        max_step_uv = self.max_step_uv
 
+        self._check(context, "context")
+
+        # -------------------------
+        # prepare seeds
+        # -------------------------
         if uv_init.dim() == 2:
             uv_init_b = uv_init.unsqueeze(0).expand(B, -1, -1)
         elif uv_init.dim() == 3:
             uv_init_b = uv_init
         else:
-            raise ValueError("uv_init must have shape (S,2) or (B,S,2)")
-
-        if uv_init_b.shape[1:] != (S, 2):
-            raise ValueError(
-                f"Expected uv_init (B,{S},2) or ({S},2), got {tuple(uv_init_b.shape)}"
-            )
-
-        if not torch.isfinite(context).all():
-            raise RuntimeError("PPNet input 'context' is non-finite")
-        if not torch.isfinite(uv_init_b).all():
-            raise RuntimeError("PPNet input 'uv_init' is non-finite")
+            raise ValueError("uv_init must be (S,2) or (B,S,2)")
 
         uv_base = uv_init_b.clamp(eps_uv, 1.0 - eps_uv)
-        if not torch.isfinite(uv_base).all():
-            raise RuntimeError("PPNet produced non-finite uv_base")
+        self._check(uv_base, "uv_base")
 
+        # -------------------------
+        # trunk
+        # -------------------------
         z = self.mlp(context)
-        if not torch.isfinite(z).all():
-            raise RuntimeError("PPNet produced non-finite z from mlp(context)")
+        self._check(z, "z")
 
         z_rep = z.unsqueeze(1).expand(-1, S, -1)
         seed_in = torch.cat([z_rep, uv_base], dim=-1)
-        if not torch.isfinite(seed_in).all():
-            raise RuntimeError("PPNet produced non-finite seed_in")
+        self._check(seed_in, "seed_in")
 
         h = self.seed_refine(seed_in)
-        if not torch.isfinite(h).all():
-            raise RuntimeError("PPNet produced non-finite h from seed_refine")
+        self._check(h, "h")
 
+        # -------------------------
+        # seed refinement (bounded)
+        # -------------------------
         delta_raw = self.delta_head(h)
-        if not torch.isfinite(delta_raw).all():
-            raise RuntimeError("PPNet produced non-finite delta_raw")
+        self._check(delta_raw, "delta_raw")
 
-        delta_logit = max_delta_logit * offset_scale * torch.tanh(delta_raw)
-        if not torch.isfinite(delta_logit).all():
-            raise RuntimeError("PPNet produced non-finite delta_logit")
+        # Apply residual updates directly in UV space so seeds near the domain
+        # boundary can still move back inward without sigmoid/logit saturation.
+        delta_dir = torch.tanh(delta_raw)
+        self._check(delta_dir, "delta_dir")
 
-        uv_logits = torch.logit(uv_base, eps=eps_uv)
-        if not torch.isfinite(uv_logits).all():
-            raise RuntimeError("PPNet produced non-finite uv_logits")
+        step_cap = torch.as_tensor(
+            self.max_step_uv * offset_scale,
+            device=uv_base.device,
+            dtype=uv_base.dtype,
+        )
+        room_lo = (uv_base - eps_uv).clamp_min(0.0)
+        room_hi = (1.0 - eps_uv - uv_base).clamp_min(0.0)
+        step_lo = torch.minimum(room_lo, step_cap)
+        step_hi = torch.minimum(room_hi, step_cap)
 
-        seeds_uv = torch.sigmoid(uv_logits + delta_logit)
-        if not torch.isfinite(seeds_uv).all():
-            raise RuntimeError("PPNet produced non-finite seeds_uv before trust region")
+        delta_uv = torch.where(
+            delta_dir >= 0.0,
+            delta_dir * step_hi,
+            delta_dir * step_lo,
+        )
+        self._check(delta_uv, "delta_uv")
 
-        delta_uv = seeds_uv - uv_base
-        if not torch.isfinite(delta_uv).all():
-            raise RuntimeError("PPNet produced non-finite delta_uv before clamp")
-
-        delta_uv = delta_uv.clamp(-max_step_uv, max_step_uv)
         seeds_uv = (uv_base + delta_uv).clamp(eps_uv, 1.0 - eps_uv)
-
-        if not torch.isfinite(seeds_uv).all():
-            raise RuntimeError("PPNet produced non-finite seeds_uv after trust region")
+        self._check(seeds_uv, "seeds_uv_final")
 
         out = {
-            "uv_init": uv_base,
             "seeds_raw": seeds_uv,
-            "delta_raw": delta_raw,
-            "delta_logit": delta_logit,
-            "delta_uv": delta_uv,
         }
 
+        # -------------------------
+        # width
+        # -------------------------
         if self.freeze_w:
-            out["w_raw"] = torch.full(
-                (B, S, S),
-                self.w_const,
-                device=z.device,
-                dtype=z.dtype,
-            )
+            w_raw = torch.full((B, S, S), self.w_const, device=z.device, dtype=z.dtype)
         else:
             pair_h = 0.5 * (h.unsqueeze(2) + h.unsqueeze(1))
             w_raw = self.w_head(pair_h).squeeze(-1)
-            out["w_raw"] = 0.5 * (w_raw + w_raw.transpose(1, 2))
+            w_raw = 0.5 * (w_raw + w_raw.transpose(1, 2))
 
-        if not torch.isfinite(out["w_raw"]).all():
-            raise RuntimeError("PPNet produced non-finite w_raw")
+        self._check(w_raw, "w_raw")
+        out["w_raw"] = w_raw
 
+        # -------------------------
+        # height
+        # -------------------------
         if self.predict_height:
-            out["h_raw"] = self.h_head(z).view(-1)
-            if not torch.isfinite(out["h_raw"]).all():
-                raise RuntimeError("PPNet produced non-finite h_raw")
+            h_raw = self.h_head(z).view(-1)
+            self._check(h_raw, "h_raw")
+        else:
+            h_raw = None
+        out["h_raw"] = h_raw
 
-        if self.predict_boundary_width:
-            out["boundary_width_raw"] = self.boundary_width_head(z).view(-1)
-            if not torch.isfinite(out["boundary_width_raw"]).all():
-                raise RuntimeError("PPNet produced non-finite boundary_width_raw")
-
+        # -------------------------
+        # gating
+        # -------------------------
         if self.use_gating:
             gate_logits = self.gate_head(h).squeeze(-1)
-            if not torch.isfinite(gate_logits).all():
-                raise RuntimeError("PPNet produced non-finite gate_logits")
-            out["gate_logits"] = gate_logits
-            out["gate_probs"] = torch.sigmoid(gate_logits)
+            self._check(gate_logits, "gate_logits")
+            seed_gates = torch.sigmoid(gate_logits)
+        else:
+            gate_logits = None
+            seed_gates = None
 
+        out["gate_logits"] = gate_logits
+        out["seed_gates"] = seed_gates
+
+        # -------------------------
+        # anisotropy
+        # -------------------------
         if self.use_Metric_anisotropy:
             theta = self.theta_head(h).squeeze(-1)
             a_raw = self.a_head(h).squeeze(-1)
-            if not torch.isfinite(theta).all():
-                raise RuntimeError("PPNet produced non-finite theta")
-            if not torch.isfinite(a_raw).all():
-                raise RuntimeError("PPNet produced non-finite a_raw")
-            out["theta"] = theta
-            out["a_raw"] = a_raw
+            self._check(theta, "theta")
+            self._check(a_raw, "a_raw")
+        else:
+            theta = None
+            a_raw = None
+
+        out["theta"] = theta
+        out["a_raw"] = a_raw
+
+        # -------------------------
+        # boundary
+        # -------------------------
+        if self.predict_boundary_params:
+            bw = self.boundary_width_head(z).view(-1)
+            ba = self.boundary_alpha_head(z).view(-1)
+            bb = self.boundary_beta_head(z).view(-1)
+
+            self._check(bw, "boundary_width_raw")
+            self._check(ba, "boundary_alpha_raw")
+            self._check(bb, "boundary_beta_raw")
+        else:
+            bw = ba = bb = None
+
+        out["boundary_width_raw"] = bw
+        out["boundary_alpha_raw"] = ba
+        out["boundary_beta_raw"] = bb
+
+        # -------------------------
+        # tau
+        # -------------------------
+        if self.predict_tau:
+            tau_logits = self.tau_head(z).view(-1)
+            tau = self.tau_pred_min + (self.tau_pred_max - self.tau_pred_min) * torch.sigmoid(tau_logits)
+            self._check(tau, "tau")
+        else:
+            tau = None
+
+        out["tau"] = tau
 
         return out

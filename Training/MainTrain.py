@@ -31,11 +31,17 @@ class TrainingConfig:
     freeze_w: bool = False
     use_boundary_attachment: bool = True
     boundary_volume_assist: float = 0.10
+    w_const: float = 0.25
 
     # boundary defaults / fallback values used by decoder if PPNet does not predict them
     boundary_attach_width: float = 0.03
     boundary_attach_beta: float = 0.01
     boundary_attach_alpha: float = 0.35
+
+    hollow_void_threshold: float = 0.85
+    hollow_edge_threshold: float = 0.45
+    hollow_temp: float = 0.05
+    hollow_rho_edge_min: float = 0.75
 
     boundary_attach_width_min: float = 0.005
     boundary_attach_width_max: float = 0.10
@@ -47,9 +53,10 @@ class TrainingConfig:
     boundary_attach_beta_max: float = 0.05
 
     gate_sharpen_gamma: float = 4.0
+    predict_tau: bool = None
 
     w_min: float = 0.005
-    w_max: float = 0.5  # Deprecated: pairwise widths now use 0.8 * seed distance as the upper bound.
+    w_max_ratio: float = 0.5  # Deprecated: pairwise widths now use 0.8 * seed distance as the upper bound.
 
     lam_fem: float = 1.0
     lam_vol: float = 2.0
@@ -59,6 +66,15 @@ class TrainingConfig:
     lam_strut: float = 0.02
     lam_strut_edge: float = 1.0
     lam_strut_void: float = 0.25
+    lam_width_active: float = 0.05
+    width_target_frac: float = 0.20
+    width_target_sparse_boost: float = 1.5
+    width_target_frac_max: float = 0.85
+    width_warmup_start_frac: float = 0.50
+    width_warmup_ramp_frac: float = 0.20
+    lam_width_active_hard_multiplier: float = 8.0
+    decoder_raw_temp: float = 1.25
+    w_head_bias_init: float | None = None
 
     comp_normalize_by: float | None = 1e10
     normalize_losses: bool = True
@@ -69,7 +85,17 @@ class TrainingConfig:
     context_vector_size: int = 8
 
     tau: float = 0.02
+    tau_pred_start: float = 0.02
+    tau_pred_min: float = 1e-4
+    tau_pred_max: float = 0.2
+    tau_anneal_final: float | None = None
+    tau__anneal_final: float | None = None
+    tau_anneal_start_frac: float = 0.0
+    tau_anneal_ramp_frac: float = 0.5
     beta: float = 0.05
+    seed_anchor_momentum: float = 0.20
+    seed_anchor_warmup_frac: float = 0.05
+    use_rolling_seed_anchors: bool = True
 
     lr_seed_refine: float = 1e-1
     lr_delta_head: float = 2e-4
@@ -85,24 +111,39 @@ class TrainingConfig:
 
     use_gating: bool = True
     lr_gate_head: float = 5e-5
-    gate_active_threshold: float = 0.5
+    gate_active_threshold: float = 0.22
     gate_eps: float = 1e-8
-    gate_bias_init: float = math.log(0.45 / 0.55)
-    Gating_binirize_sharpness: float = 20.0
+    gate_bias_init: float | None = None
+    Gating_binirize_sharpness: float = 12.0
     Gating_binirize_limit: float = 0.45
-    use_hard_gate_mask: bool = False
-    hard_gate_start_frac: float = 0.90
+    use_hard_gate_mask: bool = True
+    hard_gate_start_frac: float = 0.85
     hard_gate_allow_early_stability: bool = True
-    hard_gate_stability_patience: int = 200
+    hard_gate_stability_patience: int = 180
     hard_gate_min_frac_for_stability: float = 0.25
+    hard_refine_start_frac: float = 0.85
+    freeze_gate_head_during_hard_refine: bool = True
+    freeze_tau_head_during_hard_refine: bool = True
+    disable_gate_count_loss_during_hard_refine: bool = True
+    disable_gate_binary_loss_during_hard_refine: bool = True
+    disable_gate_usage_loss_during_hard_refine: bool = True
+    disable_gate_weak_contrib_during_hard_refine: bool = True
+    hard_refine_width_multiplier: float = 2.0
 
-    lam_gate_count: float = 2.0
-    gate_target_count: float = 10.0
-    lam_gate_binary: float = 0.2
-    gate_binary_warmup_steps: int = 40
-    gate_warmup_steps: int = 20
+    lam_gate_count: float = 0.2
+    gate_target_count: float = 14.0
+    lam_gate_binary: float = 0.5
+    lam_gate_usage: float = 2.0
+    lam_gate_weak_contrib: float = 1.0
+    weak_contrib_power: float = 2.0
+    weak_contrib_threshold: float | None = None
+    gate_binary_warmup_frac: float = 0.10
+    gate_warmup_frac: float = 0.08
+    gate_binary_warmup_steps: int | None = None
+    gate_warmup_steps: int | None = None
+    prefer_hard_gate_result: bool = True
 
-    predict_boundary_width: bool = True
+    predict_boundary_params: bool = True
 
     eps: float = 1e-12
 
@@ -134,6 +175,60 @@ class TrainingConfig:
     TM_laps_res_v: int = 100
     TM_laps_Thr: float = 0.45
 
+    def __post_init__(self):
+        if self.tau__anneal_final is not None:
+            self.tau_anneal_final = self.tau__anneal_final
+
+        # Backward compatibility: allow legacy absolute-step warmup settings,
+        # but prefer the new fraction-based controls.
+        if self.num_steps > 0:
+            if self.gate_warmup_steps is not None:
+                self.gate_warmup_frac = float(self.gate_warmup_steps) / float(self.num_steps)
+            if self.gate_binary_warmup_steps is not None:
+                self.gate_binary_warmup_frac = float(self.gate_binary_warmup_steps) / float(self.num_steps)
+
+        if self.tau <= 0.0:
+            raise ValueError(f"tau must be > 0, got {self.tau}")
+        if self.tau_pred_start <= 0.0:
+            raise ValueError(f"tau_pred_start must be > 0, got {self.tau_pred_start}")
+        if self.tau_pred_min <= 0.0:
+            raise ValueError(f"tau_pred_min must be > 0, got {self.tau_pred_min}")
+        if self.tau_pred_max <= self.tau_pred_min:
+            raise ValueError(
+                f"tau_pred_max must be > tau_pred_min, got min={self.tau_pred_min}, max={self.tau_pred_max}"
+            )
+        if not (self.tau_pred_min <= self.tau_pred_start <= self.tau_pred_max):
+            raise ValueError(
+                "tau_pred_start must lie within [tau_pred_min, tau_pred_max], "
+                f"got start={self.tau_pred_start}, min={self.tau_pred_min}, max={self.tau_pred_max}"
+            )
+        if not (0.0 <= self.hard_refine_start_frac <= 1.0):
+            raise ValueError(
+                f"hard_refine_start_frac must be in [0,1], got {self.hard_refine_start_frac}"
+            )
+        if self.hard_refine_width_multiplier < 0.0:
+            raise ValueError(
+                f"hard_refine_width_multiplier must be >= 0, got {self.hard_refine_width_multiplier}"
+            )
+        if self.tau_anneal_final is not None and self.tau_anneal_final <= 0.0:
+            raise ValueError(f"tau_anneal_final must be > 0, got {self.tau_anneal_final}")
+        if not (0.0 <= self.seed_anchor_momentum <= 1.0):
+            raise ValueError(
+                f"seed_anchor_momentum must be in [0,1], got {self.seed_anchor_momentum}"
+            )
+        if not (0.0 <= self.seed_anchor_warmup_frac <= 1.0):
+            raise ValueError(
+                f"seed_anchor_warmup_frac must be in [0,1], got {self.seed_anchor_warmup_frac}"
+            )
+        if not (0.0 <= self.gate_warmup_frac <= 1.0):
+            raise ValueError(
+                f"gate_warmup_frac must be in [0,1], got {self.gate_warmup_frac}"
+            )
+        if not (0.0 <= self.gate_binary_warmup_frac <= 1.0):
+            raise ValueError(
+                f"gate_binary_warmup_frac must be in [0,1], got {self.gate_binary_warmup_frac}"
+            )
+
 class RunningNorm:
     def __init__(self, momentum: float = 0.99, eps: float = 1e-12):
         self.val = None
@@ -151,7 +246,6 @@ class RunningNorm:
         else:
             self.val = self.momentum * self.val + (1.0 - self.momentum) * x
         return max(self.val, 1e-8)
-
 
 class NN_Trainer:
     def __init__(
@@ -345,10 +439,17 @@ class NN_Trainer:
 
         self._tb_add_scalar("Metric/ThetaMean", row["theta_mean"], step)
         self._tb_add_scalar("Metric/AMean", row["a_metric_mean"], step)
+        self._tb_add_scalar("Train/Tau", row["tau"], step)
 
+        self._tb_add_scalar("gate/selected_count_total", row["selected_count_total"], step)
+        self._tb_add_scalar("gate/selected_count_mean", row["selected_count_mean"], step)
+        self._tb_add_scalar("gate/selected_frac_mean", row["selected_frac_mean"], step)
         self._tb_add_scalar("gate/active_count_total", row["active_count_total"], step)
         self._tb_add_scalar("gate/active_count_mean", row["active_count_mean"], step)
         self._tb_add_scalar("gate/active_frac_mean", row["active_frac_mean"], step)
+        self._tb_add_scalar("gate/inactive_count_total", row["inactive_count_total"], step)
+        self._tb_add_scalar("gate/inactive_count_mean", row["inactive_count_mean"], step)
+        self._tb_add_scalar("gate/inactive_frac_mean", row["inactive_frac_mean"], step)
         self._tb_add_scalar("gate/raw/min", row["gate_raw_min"], step)
         self._tb_add_scalar("gate/raw/mean", row["gate_raw_mean"], step)
         self._tb_add_scalar("gate/raw/max", row["gate_raw_max"], step)
@@ -359,10 +460,19 @@ class NN_Trainer:
         self._tb_add_scalar("gate/decoder/mean", row["gate_decoder_mean"], step)
         self._tb_add_scalar("gate/decoder/max", row["gate_decoder_max"], step)
         self._tb_add_scalar("gate/hard_mask_on", row["hard_gate_mask_on"], step)
+        self._tb_add_scalar("gate/hard_refine_on", row["hard_refine_on"], step)
         self._tb_add_scalar("Loss/Gate", row["loss_gate"], step)
         self._tb_add_scalar("gate/lam_eff", row["lam_gate_eff"], step)
         self._tb_add_scalar("Loss/GateBinary", row["loss_gate_binary"], step)
         self._tb_add_scalar("gate/lam_binary_eff", row["lam_gate_binary_eff"], step)
+        self._tb_add_scalar("Loss/GateUsage", row["loss_gate_usage"], step)
+        self._tb_add_scalar("gate/lam_usage_eff", row["lam_gate_usage_eff"], step)
+        self._tb_add_scalar("Loss/GateWeakContributor", row["loss_gate_weak_contrib"], step)
+        self._tb_add_scalar("gate/lam_weak_contrib_eff", row["lam_gate_weak_contrib_eff"], step)
+        self._tb_add_scalar("Loss/WidthActive", row["loss_width_active"], step)
+        self._tb_add_scalar("Geometry/lam_width_active_eff", row["lam_width_active_eff"], step)
+        self._tb_add_scalar("Train/BestHardScore", row["best_hard_score"], step)
+        self._tb_add_scalar("Train/BestHardStep", row["best_hard_step"], step)
 
         fiber_norm = torch.linalg.norm(fiber_surface, dim=1)
         if fiber_norm.numel() > 0:
@@ -423,6 +533,7 @@ class NN_Trainer:
             gate_raw_vals = []
             gate_sharp_vals = []
             gate_decoder_vals = []
+            tau_vals = []
             for p in pred_list:
                 if p.get("gate_logits") is not None:
                     gate_logit_vals.append(p["gate_logits"].reshape(-1))
@@ -432,6 +543,8 @@ class NN_Trainer:
                     gate_sharp_vals.append(p["gate_probs_sharp"].reshape(-1))
                 if p.get("gate_probs_decoder") is not None:
                     gate_decoder_vals.append(p["gate_probs_decoder"].reshape(-1))
+                if p.get("tau") is not None:
+                    tau_vals.append(p["tau"].reshape(-1))
 
             if gate_logit_vals:
                 self._tb_add_histogram("gate/logits", torch.cat(gate_logit_vals, dim=0), step)
@@ -441,6 +554,8 @@ class NN_Trainer:
                 self._tb_add_histogram("gate/sharp", torch.cat(gate_sharp_vals, dim=0), step)
             if gate_decoder_vals:
                 self._tb_add_histogram("gate/decoder", torch.cat(gate_decoder_vals, dim=0), step)
+            if tau_vals:
+                self._tb_add_histogram("Train/TauHist", torch.cat(tau_vals, dim=0), step)
 
         if self.last_fem_debug:
             dbg = self.last_fem_debug
@@ -539,6 +654,160 @@ class NN_Trainer:
             return None
         one = torch.ones((), device=gates.device, dtype=gates.dtype)
         return (gates * (one - gates)).mean()
+
+    @staticmethod
+    def gate_usage_targets(
+        usage: torch.Tensor | None,
+        target_count: float,
+    ) -> torch.Tensor | None:
+        if usage is None:
+            return None
+        if usage.ndim != 1:
+            raise ValueError(f"usage must be 1D, got shape {tuple(usage.shape)}")
+
+        s = int(usage.shape[0])
+        k = max(1, min(int(round(float(target_count))), s))
+        topk = torch.topk(usage.detach(), k=k, largest=True, sorted=False).indices
+        target = torch.zeros_like(usage)
+        target[topk] = 1.0
+        return target
+
+    @staticmethod
+    def gate_usage_loss(
+        gates: torch.Tensor | None,
+        usage: torch.Tensor | None,
+        target_count: float,
+        eps: float = 1e-8,
+    ) -> torch.Tensor | None:
+        if gates is None or usage is None:
+            return None
+        target = NN_Trainer.gate_usage_targets(usage=usage, target_count=target_count)
+        gates_clamped = gates.clamp(eps, 1.0 - eps)
+        return torch.nn.functional.binary_cross_entropy(gates_clamped, target)
+
+    @staticmethod
+    def weak_contributor_loss(
+        gates: torch.Tensor | None,
+        usage: torch.Tensor | None,
+        threshold: float,
+        power: float = 2.0,
+        eps: float = 1e-8,
+    ) -> torch.Tensor | None:
+        if gates is None or usage is None:
+            return None
+        if gates.ndim != 1 or usage.ndim != 1 or gates.shape != usage.shape:
+            raise ValueError(
+                f"gates and usage must be 1D with same shape, got {tuple(gates.shape)} and {tuple(usage.shape)}"
+            )
+
+        gates = gates.clamp(0.0, 1.0)
+        usage = usage.clamp_min(0.0)
+        shortfall = torch.relu(torch.as_tensor(threshold, device=gates.device, dtype=gates.dtype) - gates)
+        penalty = shortfall.pow(float(power))
+        return (usage * penalty).sum() / (usage.sum() + eps)
+
+    @staticmethod
+    def active_width_loss(
+        w_raw: torch.Tensor,
+        seeds: torch.Tensor,
+        gates_decoder: torch.Tensor | None,
+        width_target_frac: float,
+        width_target_sparse_boost: float,
+        width_target_frac_max: float,
+        active_threshold: float,
+        raw_temp: float,
+        w_min: float,
+        eps: float = 1e-8,
+    ) -> torch.Tensor:
+        if w_raw.ndim != 2 or w_raw.shape[0] != w_raw.shape[1]:
+            raise ValueError(f"w_raw must be square, got {tuple(w_raw.shape)}")
+        if seeds.ndim != 2 or seeds.shape[1] != 2:
+            raise ValueError(f"seeds must be (S,2), got {tuple(seeds.shape)}")
+
+        s = w_raw.shape[0]
+        if s < 2:
+            return torch.zeros((), dtype=w_raw.dtype, device=w_raw.device)
+
+        tri_mask = torch.triu(torch.ones((s, s), dtype=torch.bool, device=w_raw.device), diagonal=1)
+        if gates_decoder is None:
+            target_frac_eff = float(width_target_frac)
+            active_pair = tri_mask
+        else:
+            g = gates_decoder.to(device=w_raw.device, dtype=w_raw.dtype).reshape(-1)
+            active_seed_mask = g >= float(active_threshold)
+            if not bool(active_seed_mask.any()):
+                active_seed_mask = g > eps
+            if not bool(active_seed_mask.any()):
+                active_seed_mask = torch.zeros_like(g, dtype=torch.bool)
+                active_seed_mask[torch.argmax(g)] = True
+            active_pair = (active_seed_mask[:, None] & active_seed_mask[None, :] & tri_mask)
+            active_seed_count = max(int(active_seed_mask.sum().item()), 1)
+            sparse_ratio = float(s) / float(active_seed_count)
+            target_frac_eff = float(width_target_frac) * (sparse_ratio ** float(width_target_sparse_boost))
+            target_frac_eff = min(max(target_frac_eff, 0.0), float(width_target_frac_max))
+
+        if not bool(active_pair.any()):
+            return torch.zeros((), dtype=w_raw.dtype, device=w_raw.device)
+
+        target_frac_eff = min(max(float(target_frac_eff), 1e-4), 1.0 - 1e-4)
+        target_logit = math.log(target_frac_eff / (1.0 - target_frac_eff))
+        logits = w_raw / max(float(raw_temp), eps)
+        shortfall = torch.relu(float(target_logit) - logits[active_pair])
+        return shortfall.square().mean()
+
+    def _tau_for_step(self, step: int) -> float:
+        cfg = self.cfg
+        if cfg.predict_tau:
+            return float(cfg.tau_pred_start)
+        if cfg.predict_tau == None:
+            return float(cfg.tau)
+        
+
+        tau_start = float(cfg.tau)
+        tau_end = tau_start if cfg.tau_anneal_final is None else float(cfg.tau_anneal_final)
+
+        anneal = self.ramp_weight(
+            step=step,
+            total_steps=cfg.num_steps,
+            start_frac=cfg.tau_anneal_start_frac,
+            ramp_frac=cfg.tau_anneal_ramp_frac,
+        )
+        return (1.0 - anneal) * tau_start + anneal * tau_end
+
+    def _fallback_tau_value(self) -> float:
+        cfg = self.cfg
+        if cfg.predict_tau:
+            return float(cfg.tau_pred_start)
+        return float(cfg.tau)
+
+    @staticmethod
+    def _clone_pred_list(pred_list: list[dict]) -> list[dict]:
+        return [
+            {
+                "face_id": p["face_id"],
+                "seeds_raw": p["seeds_raw"].detach().clone(),
+                "w_raw": p["w_raw"].detach().clone(),
+                "h_raw": None if p["h_raw"] is None else p["h_raw"].detach().clone(),
+                "gate_logits": None if p.get("gate_logits") is None else p["gate_logits"].detach().clone(),
+                "gate_probs_raw": None if p.get("gate_probs_raw") is None else p["gate_probs_raw"].detach().clone(),
+                "gate_probs_sharp": None if p.get("gate_probs_sharp") is None else p["gate_probs_sharp"].detach().clone(),
+                "gate_probs_decoder": None if p.get("gate_probs_decoder") is None else p["gate_probs_decoder"].detach().clone(),
+                "theta": None if p["theta"] is None else p["theta"].detach().clone(),
+                "a_raw": None if p["a_raw"] is None else p["a_raw"].detach().clone(),
+                "tau": None if p.get("tau") is None else p["tau"].detach().clone(),
+                "boundary_width_raw": None if p["boundary_width_raw"] is None else p["boundary_width_raw"].detach().clone(),
+                "boundary_alpha_raw": None if p["boundary_alpha_raw"] is None else p["boundary_alpha_raw"].detach().clone(),
+                "boundary_beta_raw": None if p["boundary_beta_raw"] is None else p["boundary_beta_raw"].detach().clone(),
+                "w_geo": p["w_geo"].detach().clone(),
+                "h": None if p["h"] is None else p["h"].detach().clone(),
+                "boundary_width": None if p["boundary_width"] is None else p["boundary_width"].detach().clone(),
+                "boundary_alpha": None if p["boundary_alpha"] is None else p["boundary_alpha"].detach().clone(),
+                "boundary_beta": None if p["boundary_beta"] is None else p["boundary_beta"].detach().clone(),
+                "theta_mean": None if p["theta_mean"] is None else p["theta_mean"].detach().clone(),
+                "a_metric": None if p["a_metric"] is None else p["a_metric"].detach().clone(),
+            }
+            for p in pred_list
+        ]
     @staticmethod
     def volume_loss_with_boundary_discount(
         rho: torch.Tensor,
@@ -565,13 +834,15 @@ class NN_Trainer:
 
         eye = torch.eye(S, dtype=torch.bool, device=seeds.device)
         mask = ~eye
+
         K = torch.exp(-d2 / (sigma**2 + eps))
 
         if gates is None:
             return K[mask].mean()
 
-        g = gates.view(-1)
+        g = gates.view(-1).clamp(0.0, 1.0)
         G = g[:, None] * g[None, :]
+
         return (G * K)[mask].sum() / (G[mask].sum() + eps)
 
     @staticmethod
@@ -592,7 +863,9 @@ class NN_Trainer:
             return penalty.mean()
 
         g = gates.view(-1)
-        return (g * penalty).sum() / (g.sum() + eps)
+        penalty =(g * penalty).sum() / (g.sum() + eps)
+        penalty =torch.zeros((), dtype=seeds.dtype, device=seeds.device) 
+        return penalty
 
     @staticmethod
     def compliance_loss(
@@ -606,27 +879,62 @@ class NN_Trainer:
         return comp
 
     @staticmethod
-    def strutness_loss_from_edge_field(
+    def hollow_cell_loss(
         rho: torch.Tensor,
-        edge_field: torch.Tensor,
+        w_soft: torch.Tensor,
+        rho_b: torch.Tensor | None = None,
+        void_threshold: float = 0.85,
+        edge_threshold: float = 0.45,
+        temp: float = 0.05,
+        rho_edge_min: float = 0.75,
+        lam_void: float = 2.0,
         lam_edge: float = 1.0,
-        lam_void: float = 1.0,
         eps: float = 1e-12,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        edge_field = edge_field.clamp(0.0, 1.0)
-        void_field = 1.0 - edge_field
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Encourage a hollow Voronoi strut network.
 
-        loss_edge = (edge_field * (1.0 - rho).pow(2)).sum() / (edge_field.sum() + eps)
-        loss_void = (void_field * rho.pow(2)).sum() / (void_field.sum() + eps)
+        - Cell interiors should be void: rho -> 0
+        - Voronoi edges/junctions should contain material: rho >= rho_edge_min
+        - Boundary attachment rho_b is exempt from void penalty
+        """
 
-        loss = lam_edge * loss_edge + lam_void * loss_void
-        return loss, loss_edge, loss_void
-    
+        rho = rho.clamp(0.0, 1.0)
 
+        # Interior mask:
+        # max_w high means this point strongly belongs to one seed = inside a cell.
+        max_w = w_soft.max(dim=1).values
+        void_mask = torch.sigmoid((max_w - void_threshold) / (temp + eps))
+
+        # Edge mask:
+        # ambiguity high means multiple seeds compete = near Voronoi edge/junction.
+        ambiguity = (1.0 - w_soft.pow(2).sum(dim=1)).clamp(0.0, 1.0)
+        edge_mask = torch.sigmoid((ambiguity - edge_threshold) / (temp + eps))
+
+        if rho_b is not None:
+            rho_b = rho_b.to(device=rho.device, dtype=rho.dtype).clamp(0.0, 1.0)
+
+            # Do not punish boundary-attached material as filled interior.
+            void_mask = void_mask * (1.0 - rho_b)
+
+            # Boundary attachment is also valid structural support.
+            edge_mask = torch.maximum(edge_mask, rho_b)
+
+        loss_void = (void_mask * rho.pow(2)).sum() / (void_mask.sum() + eps)
+
+        loss_edge = (
+            edge_mask * torch.relu(rho_edge_min - rho).pow(2)
+        ).sum() / (edge_mask.sum() + eps)
+
+        loss = lam_void * loss_void + lam_edge * loss_edge
+
+        return loss, loss_edge, loss_void, edge_mask, void_mask
 
     @staticmethod
-    def _scalar_tensor_is_finite(x: torch.Tensor) -> bool:
-        return bool(torch.isfinite(x).reshape(()).detach().item())
+    def _scalar_tensor_is_finite(x: torch.Tensor | float | int) -> bool:
+        if isinstance(x, torch.Tensor):
+            return bool(torch.isfinite(x).reshape(()).detach().item())
+        return math.isfinite(float(x))
 
     @staticmethod
     def _require_decoder_keys(decoder_out: dict, required_keys: list[str]):
@@ -650,7 +958,6 @@ class NN_Trainer:
         if save_debug_history:
             self.fem_debug_history.append(debug.copy())
 
-    
     def fem_loss(
         self,
         rho_surface: torch.Tensor,
@@ -799,32 +1106,42 @@ class NN_Trainer:
     ) -> dict:
         sigma = self.cfg.seed_repulsion_sigma
         margin = self.cfg.boundary_margin
+        zero = torch.zeros((), dtype=rho.dtype, device=rho.device)
 
-        loss_vol = self.volume_loss_constant_height(
-            rho=rho,
-            A_v=A_v,
-            target_volfrac=target_volfrac,
-            eps=eps,
-        )
+        if w_vol != 0.0:
+            loss_vol = self.volume_loss_constant_height(
+                rho=rho,
+                A_v=A_v,
+                target_volfrac=target_volfrac,
+                eps=eps,
+            )
+        else:
+            loss_vol = zero
 
-        loss_seed = self.seed_repulsion_term(
-            seeds=seeds,
-            gates=gates,
-            sigma=sigma,
-            eps=eps,
-        )
+        if w_seed != 0.0:
+            loss_seed = self.seed_repulsion_term(
+                seeds=seeds,
+                gates=gates,
+                sigma=sigma,
+                eps=eps,
+            )
+        else:
+            loss_seed = zero
 
-        loss_boundary = self.boundary_repulsion_term(
-            seeds=seeds,
-            boundary_uv=boundary_uv,
-            gates=gates,
-            margin=margin,
-            eps=eps,
-        )
+        if w_boundary != 0.0:
+            loss_boundary = self.boundary_repulsion_term(
+                seeds=seeds,
+                boundary_uv=boundary_uv,
+                gates=gates,
+                margin=margin,
+                eps=eps,
+            )
+        else:
+            loss_boundary = zero
 
-        loss_strut = torch.zeros((), dtype=rho.dtype, device=rho.device)
-        loss_strut_edge = torch.zeros((), dtype=rho.dtype, device=rho.device)
-        loss_strut_void = torch.zeros((), dtype=rho.dtype, device=rho.device)
+        loss_strut = zero
+        loss_strut_edge = zero
+        loss_strut_void = zero
 
         total = (
             w_vol * loss_vol +
@@ -871,7 +1188,6 @@ class NN_Trainer:
             "fem_valid": fem_out["fem_valid"],
             "fem_failure_reason": fem_out["failure_reason"],
         }
-
     # ------------------------------------------------------------------
     # Model / optimizer builders
         # ------------------------------------------------------------------
@@ -882,22 +1198,27 @@ class NN_Trainer:
         boundary_idx_ring1,
         u_periodic,
         v_periodic,
-        use_Metric_anisotropy,
-        context_vector_size,
-        freeze_w,
     ):
+        gate_bias_init = self.cfg.gate_bias_init
+        if gate_bias_init is None:
+            target_frac = float(self.cfg.gate_target_count) / max(int(seed_number), 1)
+            target_frac = min(max(target_frac, 1e-4), 1.0 - 1e-4)
+            gate_bias_init = math.log(target_frac / (1.0 - target_frac))
+
         face_u_periodic = torch.tensor([bool(u_periodic)], dtype=torch.bool, device=device)
         face_v_periodic = torch.tensor([bool(v_periodic)], dtype=torch.bool, device=device)
         seed_face_id = torch.zeros(seed_number, dtype=torch.long, device=device)
 
         decoder = self.decoder_cls(
             n_seeds=seed_number,
+            use_Metric_anisotropy=self.cfg.use_Metric_anisotropy,
             boundary_solid_idx=boundary_idx_ring1,
             seed_face_id=seed_face_id,
             face_u_periodic=face_u_periodic,
             face_v_periodic=face_v_periodic,
-            use_Metric_anisotropy=use_Metric_anisotropy,
             w_min=self.cfg.w_min,
+            w_max_ratio=self.cfg.w_max_ratio,
+            raw_temp=self.cfg.decoder_raw_temp,
             fixed_height=self.cfg.fixed_height,
 
             use_boundary_attachment=self.cfg.use_boundary_attachment,
@@ -914,14 +1235,28 @@ class NN_Trainer:
         ).to(device)
 
         ppnet = self.ppnet_cls(
-            context_dim=context_vector_size,
+            context_dim=self.cfg.context_vector_size,
             n_seeds=seed_number,
-            use_Metric_anisotropy=use_Metric_anisotropy,
+            use_Metric_anisotropy=self.cfg.use_Metric_anisotropy,
+            predict_boundary_params=self.cfg.predict_boundary_params,
+            predict_tau=self.cfg.predict_tau,
+            tau_pred_start=self.cfg.tau_pred_start,
+            tau_pred_min=self.cfg.tau_pred_min,
+            tau_pred_max=self.cfg.tau_pred_max,
             predict_height=(self.cfg.fixed_height is None),
             use_gating=self.cfg.use_gating,
-            predict_boundary_width=self.cfg.predict_boundary_width,
-            freeze_w=freeze_w,
-            gate_bias_init=self.cfg.gate_bias_init,
+            freeze_w=self.cfg.freeze_w,
+            w_const=self.cfg.w_const,   
+            w_head_bias_init=(
+                float(self.cfg.decoder_raw_temp)
+                * math.log(
+                    max(min(float(self.cfg.width_target_frac), 1.0 - 1e-4), 1e-4)
+                    / max(1.0 - min(float(self.cfg.width_target_frac), 1.0 - 1e-4), 1e-4)
+                )
+                if self.cfg.w_head_bias_init is None
+                else float(self.cfg.w_head_bias_init)
+            ),
+            gate_bias_init=gate_bias_init,
         ).to(device)
 
         return decoder, ppnet
@@ -938,9 +1273,6 @@ class NN_Trainer:
                 boundary_idx_ring1=ft["boundary_idx_ring1"],
                 u_periodic=ft.get("u_periodic", False),
                 v_periodic=ft.get("v_periodic", False),
-                use_Metric_anisotropy=cfg.use_Metric_anisotropy,
-                context_vector_size=cfg.context_vector_size,
-                freeze_w=cfg.freeze_w,
             )
             decoders.append(decoder)
             ppnets.append(ppnet)
@@ -973,10 +1305,27 @@ class NN_Trainer:
                 if hasattr(ppnet, "a_head"):
                     param_groups.append({"params": ppnet.a_head.parameters(), "lr": cfg.lr_mlp})
 
-            if cfg.predict_boundary_width and hasattr(ppnet, "boundary_width_head"):
+            if cfg.predict_boundary_params:
+                if hasattr(ppnet, "boundary_width_head"):
+                    param_groups.append({
+                        "params": ppnet.boundary_width_head.parameters(),
+                        "lr": cfg.lr_boundary_heads,
+                    })
+                if hasattr(ppnet, "boundary_alpha_head"):
+                    param_groups.append({
+                        "params": ppnet.boundary_alpha_head.parameters(),
+                        "lr": cfg.lr_boundary_heads,
+                    })
+                if hasattr(ppnet, "boundary_beta_head"):
+                    param_groups.append({
+                        "params": ppnet.boundary_beta_head.parameters(),
+                        "lr": cfg.lr_boundary_heads,
+                    })
+
+            if cfg.predict_tau and hasattr(ppnet, "tau_head"):
                 param_groups.append({
-                    "params": ppnet.boundary_width_head.parameters(),
-                    "lr": cfg.lr_boundary_heads,
+                    "params": ppnet.tau_head.parameters(),
+                    "lr": cfg.lr_mlp,
                 })
 
         return torch.optim.Adam(param_groups)
@@ -1063,10 +1412,47 @@ class NN_Trainer:
         import numpy as np
         return np.concatenate(xyz_parts, axis=0)
 
-    def _finite_or_default(self, x: torch.Tensor, default: float = float("nan")) -> float:
+    def _finite_or_default(self, x: torch.Tensor | float | int, default: float = float("nan")) -> float:
         if self._scalar_tensor_is_finite(x):
-            return float(x.detach().item())
+            if isinstance(x, torch.Tensor):
+                return float(x.detach().item())
+            return float(x)
         return default
+
+    @staticmethod
+    def _named_trainable_params(modules):
+        for mi, module in enumerate(modules):
+            for pn, p in module.named_parameters():
+                if p.requires_grad:
+                    yield mi, pn, p
+
+    @classmethod
+    def _nonfinite_grad_info(cls, modules):
+        bad = []
+        for mi, pn, p in cls._named_trainable_params(modules):
+            g = p.grad
+            if g is not None and not torch.isfinite(g).all():
+                bad.append((mi, pn))
+        return bad
+
+    @classmethod
+    def _nonfinite_param_info(cls, modules):
+        bad = []
+        for mi, pn, p in cls._named_trainable_params(modules):
+            if not torch.isfinite(p).all():
+                bad.append((mi, pn))
+        return bad
+
+    @staticmethod
+    def _restore_param_snapshot(snapshot):
+        for p, saved in snapshot.items():
+            p.data.copy_(saved)
+
+    @staticmethod
+    def _clear_optimizer_state_for_params(opt, params):
+        for p in params:
+            if p in opt.state:
+                opt.state.pop(p, None)
 
     def _print_fem_failure(self, step: int):
         print(f"\n=== FEM FAILURE AT STEP {step} ===")
@@ -1319,11 +1705,12 @@ class NN_Trainer:
         return cache
 
     def evaluate_cached_face_fields(self, render_cache, decoder, pred):
+        tau = self._fallback_tau_value() if pred.get("tau") is None else pred["tau"]
         decoder_out = decoder.evaluate_at_uv(
             points_uv=render_cache["uv_dense"],
             Xu=render_cache["Xu_dense"],
             Xv=render_cache["Xv_dense"],
-            tau=self.cfg.tau,
+            tau=tau,
             seeds_raw=pred["seeds_raw"],
             w_raw=pred["w_raw"],
             h_raw=pred.get("h_raw", None),
@@ -1333,9 +1720,9 @@ class NN_Trainer:
             boundary_uv=render_cache["boundary_uv"],
             boundary_face_id=render_cache["boundary_face_id"],
             boundary_width_raw=pred.get("boundary_width_raw", None),
-            boundary_alpha_raw=None,
-            boundary_beta_raw=None,
-            seed_gates=pred.get("gate_probs", None),
+            boundary_alpha_raw=pred.get("boundary_alpha_raw", None),
+            boundary_beta_raw=pred.get("boundary_beta_raw", None),
+            seed_gates=pred.get("gate_probs_decoder", None),
         )
 
         return {
@@ -1806,12 +2193,55 @@ class NN_Trainer:
         }
 
     @staticmethod
+    def _gate_role_stats(
+        gate_probs_raw: torch.Tensor | None,
+        gate_probs_struct: torch.Tensor | None,
+        gate_probs_decoder: torch.Tensor | None,
+        selected_threshold: float,
+        eps: float,
+        seed_count: int | None = None,
+    ) -> dict[str, float]:
+        if gate_probs_decoder is None and gate_probs_raw is None:
+            total = max(int(seed_count or 0), 1)
+            active_count = float(seed_count or 0)
+            active_frac = 0.0 if total <= 0 else active_count / float(total)
+            return {
+                "selected_count": active_count,
+                "selected_frac": active_frac,
+                "participating_count": active_count,
+                "participating_frac": active_frac,
+                "inactive_count": 0.0,
+                "inactive_frac": 0.0,
+            }
+
+        g_dec = gate_probs_decoder if gate_probs_decoder is not None else gate_probs_struct
+        g_sel = gate_probs_struct if gate_probs_struct is not None else gate_probs_raw
+        if g_dec is None or g_sel is None:
+            raise ValueError("gate role stats require at least one gate tensor")
+
+        g_dec = g_dec.detach()
+        g_sel = g_sel.detach()
+        participating = g_dec > float(eps)
+        selected = (g_sel > float(selected_threshold)) & participating
+        inactive = ~participating
+        total = max(int(g_dec.numel()), 1)
+
+        return {
+            "selected_count": float(selected.sum().item()),
+            "selected_frac": float(selected.sum().item()) / float(total),
+            "participating_count": float(participating.sum().item()),
+            "participating_frac": float(participating.sum().item()) / float(total),
+            "inactive_count": float(inactive.sum().item()),
+            "inactive_frac": float(inactive.sum().item()) / float(total),
+        }
+
+    @staticmethod
     def _gate_stats(gates: torch.Tensor | None) -> dict[str, float]:
         if gates is None:
             return {
-                "min": 0.0,
-                "mean": 0.0,
-                "max": 0.0,
+                "min": 1.0,
+                "mean": 1.0,
+                "max": 1.0,
             }
 
         g = gates.detach()
@@ -1821,7 +2251,14 @@ class NN_Trainer:
             "max": float(g.max().item()),
         }
 
-    def _use_hard_gate_mask(self, step: int, steps_since_improve: int) -> bool:
+    def _use_hard_gate_mask(
+        self,
+        step: int,
+        steps_since_improve: int,
+        gate_raw_mean: float | None = None,
+        gate_raw_min: float | None = None,
+        gate_raw_max: float | None = None,
+    ) -> bool:
         cfg = self.cfg
         if not getattr(cfg, "use_hard_gate_mask", False):
             return False
@@ -1837,26 +2274,49 @@ class NN_Trainer:
         if step < min_step:
             return False
 
-        return steps_since_improve >= int(cfg.hard_gate_stability_patience)
+        if steps_since_improve < int(cfg.hard_gate_stability_patience):
+            return False
+
+        if gate_raw_mean is None or gate_raw_min is None or gate_raw_max is None:
+            return False
+
+        target_frac = float(cfg.gate_target_count) / max(int(cfg.seed_number), 1)
+        target_frac = min(max(target_frac, 0.05), 0.95)
+        mean_close = abs(float(gate_raw_mean) - target_frac) <= 0.08
+        threshold = float(cfg.gate_active_threshold)
+        spread_ready = float(gate_raw_min) < (threshold - 0.06) and float(gate_raw_max) > (threshold + 0.06)
+        return mean_close and spread_ready
+
+    def _use_hard_refine_phase(
+        self,
+        step: int,
+        use_hard_gate_mask: bool,
+    ) -> bool:
+        if not use_hard_gate_mask:
+            return False
+        start_step = int(round(float(self.cfg.hard_refine_start_frac) * float(self.cfg.num_steps)))
+        return step >= start_step
 
     def _decoder_gate_values(
         self,
+        gate_probs_raw: torch.Tensor | None,
         gates_struct: torch.Tensor | None,
         use_hard_gate_mask: bool,
         threshold: float,
     ) -> torch.Tensor | None:
-        if gates_struct is None:
+        if gate_probs_raw is None:
             return None
 
         if not use_hard_gate_mask:
-            return gates_struct
+            return gates_struct if gates_struct is not None else gate_probs_raw
 
-        active = (gates_struct >= threshold)
+        source = gates_struct if gates_struct is not None else gate_probs_raw
+        active = source >= threshold
         if not bool(active.any()):
             active = torch.zeros_like(active, dtype=torch.bool)
-            active[torch.argmax(gates_struct)] = True
+            active[torch.argmax(source)] = True
 
-        return active.to(dtype=gates_struct.dtype)
+        return active.to(dtype=gate_probs_raw.dtype)
 
     def _seed_points_xyz_and_gates_all_faces(self, seeds_list, pred_list, face_tensors):
         xyz_active = []
@@ -1864,7 +2324,7 @@ class NN_Trainer:
         gate_active = []
         gate_inactive = []
 
-        thr = self.cfg.Gating_binirize_limit
+        eps = float(self.cfg.gate_eps)
 
         for seeds, pred, ft in zip(seeds_list, pred_list, face_tensors):
             xyz_i = self.generator.seeds_uv_to_xyz_nearest(
@@ -1873,25 +2333,27 @@ class NN_Trainer:
                 ft["points_xyz"],
             )
 
-            gates_i = pred.get("gate_probs", None)
+            gates_raw_i = pred.get("gate_probs_raw", None)
+            gates_dec_i = pred.get("gate_probs_decoder", None)
 
-            if gates_i is None:
+            if gates_dec_i is None and gates_raw_i is None:
                 xyz_active.append(xyz_i)
                 continue
 
-            g = gates_i.detach().cpu()
-            active_mask = (g > thr).cpu().numpy()
+            g_dec = gates_dec_i.detach().cpu() if gates_dec_i is not None else gates_raw_i.detach().cpu()
+            participating_mask = (g_dec > eps).cpu().numpy()
+            inactive_mask = ~participating_mask
 
-            xyz_i_active = xyz_i[active_mask]
-            xyz_i_inactive = xyz_i[~active_mask]
+            xyz_i_active = xyz_i[participating_mask]
+            xyz_i_inactive = xyz_i[inactive_mask]
 
             if len(xyz_i_active) > 0:
                 xyz_active.append(xyz_i_active)
-                gate_active.append(g[active_mask].numpy())
+                gate_active.append(g_dec[participating_mask].numpy())
 
             if len(xyz_i_inactive) > 0:
                 xyz_inactive.append(xyz_i_inactive)
-                gate_inactive.append(g[~active_mask].numpy())
+                gate_inactive.append(g_dec[inactive_mask].numpy())
 
         import numpy as np
 
@@ -1950,13 +2412,12 @@ class NN_Trainer:
                 render_points_as_spheres=True,
                 point_size=10,
                 opacity=0.4,
-                label="Vanished seeds",
+                label="Inactive seeds",
             )
 
         plotter.add_legend()
         plotter.show()
     
-
     # ------------------------------------------------------------------
     # Visualization
     # ------------------------------------------------------------------
@@ -2125,7 +2586,7 @@ class NN_Trainer:
         theta = pred.get("theta", None)
         a_raw = pred.get("a_raw", None)
 
-        gates_i = pred.get("gate_probs", None)
+        gates_i = pred.get("gate_probs_decoder", None)
         boundary_width_raw = pred.get("boundary_width_raw", None)
         boundary_alpha_raw = pred.get("boundary_alpha_raw", None)
         boundary_beta_raw = pred.get("boundary_beta_raw", None)
@@ -2133,11 +2594,12 @@ class NN_Trainer:
         # ------------------------------------------------------------
         # 6) Evaluate decoder on CAD-native dense query points
         # ------------------------------------------------------------
+        tau = self._fallback_tau_value() if pred.get("tau") is None else pred["tau"]
         decoder_out = decoder.evaluate_at_uv(
             points_uv=uv_dense,
             Xu=Xu_dense,
             Xv=Xv_dense,
-            tau=self.cfg.tau,
+            tau=tau,
             seeds_raw=seeds_raw,
             w_raw=w_raw,
             h_raw=h_raw,
@@ -2567,61 +3029,6 @@ class NN_Trainer:
     def visualize_result_final_fiber_direction_2d(self, *args, **kwargs):
         return self.Visualize_fresult_final_fiber_Direction_2D(*args, **kwargs)
 
-    def _trace_fiber_path_on_vertices(
-        self,
-        start_idx,
-        adjacency,
-        points_np,
-        fiber_np,
-        keep_mask_np,
-        sign=1.0,
-        max_steps=80,
-        min_align=0.15,
-    ):
-        path = [int(start_idx)]
-        used = {int(start_idx)}
-        prev = None
-
-        for _ in range(int(max_steps)):
-            cur = path[-1]
-            cur_dir = fiber_np[cur]
-            cur_nrm = np.linalg.norm(cur_dir)
-            if cur_nrm <= 1e-12:
-                break
-
-            cur_dir = (float(sign) * cur_dir) / cur_nrm
-            best_j = None
-            best_score = -np.inf
-
-            for nb in adjacency[cur]:
-                nb = int(nb)
-                if not keep_mask_np[nb]:
-                    continue
-                if prev is not None and nb == prev:
-                    continue
-                if nb in used:
-                    continue
-
-                edge = points_np[nb] - points_np[cur]
-                edge_nrm = np.linalg.norm(edge)
-                if edge_nrm <= 1e-12:
-                    continue
-
-                edge_hat = edge / edge_nrm
-                score = float(np.dot(cur_dir, edge_hat))
-                if score > best_score:
-                    best_score = score
-                    best_j = nb
-
-            if best_j is None or best_score < float(min_align):
-                break
-
-            prev = cur
-            path.append(best_j)
-            used.add(best_j)
-
-        return path
-
     @staticmethod
     def _fiber3d_to_uv_direction(Xu_np, Xv_np, fiber_np, eps=1e-12):
         a11 = np.sum(Xu_np * Xu_np, axis=1)
@@ -2696,236 +3103,6 @@ class NN_Trainer:
             path_xyz.append(xyz_np[next_idx])
 
         return np.asarray(path_uv, dtype=np.float32), np.asarray(path_xyz, dtype=np.float32)
-
-    def Visualize_fresult_final_fiber_Paths(
-        self,
-        result,
-        points_xyz,
-        faces_ijk,
-        thr: float = 0.5,
-        shape_or_path=None,
-        grid_res_u: int = 120,
-        grid_res_v: int = 120,
-        uv_mask_tol: float | None = None,
-        max_paths: int = 120,
-        max_steps: int = 80,
-        min_align: float = 0.20,
-        line_width: float = 3.0,
-        dense_factor: float = 1.0,
-    ):
-        import numpy as np
-        import pyvista as pv
-        from scipy.spatial import cKDTree
-
-        if result.get("Final_shape_fiber_direction", None) is None:
-            raise ValueError(
-                "result['Final_shape_fiber_direction'] is missing. "
-                "Run training with the updated trainer result output."
-            )
-
-        density = result["Final_shape_density"].detach().cpu()
-        fiber = result["Final_shape_fiber_direction"].detach().cpu()
-        points_xyz_cpu = points_xyz.detach().cpu()
-        pv_faces_fixed = self.generator.faces_ijk_to_pv_faces(faces_ijk)
-
-        keep = torch.isfinite(density)
-        keep = keep & torch.isfinite(fiber).all(dim=1)
-        keep = keep & (density >= float(thr))
-        keep = keep & (torch.linalg.norm(fiber, dim=1) > 1e-10)
-
-        keep_idx = torch.nonzero(keep, as_tuple=False).squeeze(1)
-        if keep_idx.numel() == 0:
-            print(f"No fiber paths to display for threshold {thr:.3f}.")
-            return {
-                "points_xyz": points_xyz_cpu.numpy(),
-                "rho": density.numpy(),
-                "fiber3d": fiber.numpy(),
-                "keep_mask": keep.numpy(),
-                "paths_vertex_idx": [],
-            }
-
-        density_np = density.numpy().astype(np.float32)
-        points_np = points_xyz_cpu.numpy().astype(np.float32)
-
-        grid_res_u, grid_res_v = self._resolve_visualization_grid_resolution(
-            grid_res_u=grid_res_u,
-            grid_res_v=grid_res_v,
-            dense_factor=dense_factor,
-        )
-        dense = self.sample_result_field_dense_for_visualization(
-            result=result,
-            shape_or_path=shape_or_path,
-            grid_res_u=grid_res_u,
-            grid_res_v=grid_res_v,
-            uv_mask_tol=uv_mask_tol,
-            use_best_pred=True,
-        )
-
-        paths_xyz = []
-        path_rho = []
-
-        for face_data in dense["per_face"]:
-            uv_face = face_data["uv_dense"].detach().cpu().numpy().astype(np.float32)
-            xyz_face = face_data["xyz_dense"].detach().cpu().numpy().astype(np.float32)
-            Xu_face = face_data["Xu_dense"].detach().cpu().numpy().astype(np.float32)
-            Xv_face = face_data["Xv_dense"].detach().cpu().numpy().astype(np.float32)
-            fiber_face = face_data["fiber3d_dense"].detach().cpu().numpy().astype(np.float32)
-            rho_face = face_data["rho_dense"].detach().cpu().numpy().astype(np.float32)
-
-            keep_face = (
-                np.isfinite(rho_face)
-                & np.isfinite(fiber_face).all(axis=1)
-                & (rho_face >= float(thr))
-                & (np.linalg.norm(fiber_face, axis=1) > 1e-10)
-            )
-            valid_idx = np.flatnonzero(keep_face)
-            if valid_idx.size < 2:
-                continue
-
-            uv_keep = uv_face[keep_face]
-            xyz_keep = xyz_face[keep_face]
-            rho_keep = rho_face[keep_face]
-            t_uv_keep = self._fiber3d_to_uv_direction(
-                Xu_np=Xu_face[keep_face],
-                Xv_np=Xv_face[keep_face],
-                fiber_np=fiber_face[keep_face],
-            )
-            good_t = np.linalg.norm(t_uv_keep, axis=1) > 1e-10
-            if np.count_nonzero(good_t) < 2:
-                continue
-
-            uv_keep = uv_keep[good_t]
-            xyz_keep = xyz_keep[good_t]
-            rho_keep = rho_keep[good_t]
-            t_uv_keep = t_uv_keep[good_t]
-
-            tree = cKDTree(uv_keep)
-            if uv_keep.shape[0] > 1:
-                nn_d, _ = tree.query(uv_keep, k=2)
-                step_uv = float(np.median(nn_d[:, 1]))
-            else:
-                step_uv = 0.0
-            if not np.isfinite(step_uv) or step_uv <= 1e-8:
-                continue
-
-            n_seed_face = min(
-                max(4, int(round(max_paths / max(1, len(dense["per_face"]))))),
-                uv_keep.shape[0],
-            )
-            seed_pick = np.linspace(0, uv_keep.shape[0] - 1, num=n_seed_face).round().astype(np.int64)
-            covered = np.zeros(uv_keep.shape[0], dtype=bool)
-
-            for seed_local in seed_pick.tolist():
-                if covered[seed_local]:
-                    continue
-
-                back_uv, back_xyz = self._trace_streamline_on_dense_face(
-                    uv_np=uv_keep,
-                    xyz_np=xyz_keep,
-                    t_uv_np=t_uv_keep,
-                    rho_np=rho_keep,
-                    start_idx=seed_local,
-                    step_uv=step_uv,
-                    max_steps=max_steps,
-                    kdtree=tree,
-                    align_thresh=min_align,
-                    min_rho=thr,
-                    sign=-1.0,
-                )
-                fwd_uv, fwd_xyz = self._trace_streamline_on_dense_face(
-                    uv_np=uv_keep,
-                    xyz_np=xyz_keep,
-                    t_uv_np=t_uv_keep,
-                    rho_np=rho_keep,
-                    start_idx=seed_local,
-                    step_uv=step_uv,
-                    max_steps=max_steps,
-                    kdtree=tree,
-                    align_thresh=min_align,
-                    min_rho=thr,
-                    sign=1.0,
-                )
-
-                path_xyz = np.vstack([back_xyz[:0:-1], fwd_xyz])
-                path_uv = np.vstack([back_uv[:0:-1], fwd_uv])
-                if path_xyz.shape[0] < 3:
-                    continue
-
-                qd, qi = tree.query(path_uv, k=1)
-                covered[qi[np.isfinite(qd)]] = True
-                paths_xyz.append(path_xyz.astype(np.float32))
-                path_rho.append(float(np.mean(rho_keep[qi[np.isfinite(qd)]])))
-
-                if len(paths_xyz) >= int(max_paths):
-                    break
-
-            if len(paths_xyz) >= int(max_paths):
-                break
-
-        if len(paths_xyz) == 0:
-            print(f"No valid fiber paths could be traced for threshold {thr:.3f}.")
-            return {
-                "points_xyz": points_np,
-                "rho": density_np,
-                "fiber3d": fiber.numpy(),
-                "keep_mask": keep.numpy(),
-                "paths_xyz": [],
-            }
-
-        line_points = []
-        line_cells = []
-        offset = 0
-        for coords in paths_xyz:
-            line_points.append(coords)
-            line_cells.append(
-                np.concatenate((
-                    np.array([coords.shape[0]], dtype=np.int64),
-                    np.arange(offset, offset + coords.shape[0], dtype=np.int64),
-                ))
-            )
-            offset += coords.shape[0]
-
-        line_points = np.vstack(line_points).astype(np.float32)
-        line_cells = np.concatenate(line_cells).astype(np.int64)
-        path_rho = np.asarray(path_rho, dtype=np.float32)
-
-        plotter = pv.Plotter()
-        surface = pv.PolyData(points_np, pv_faces_fixed)
-        surface["rho"] = density_np
-        plotter.add_mesh(
-            surface,
-            scalars="rho",
-            cmap="Greys",
-            opacity=0.20,
-            show_edges=False,
-        )
-
-        lines = pv.PolyData()
-        lines.points = line_points
-        lines.lines = line_cells
-        lines.cell_data["rho"] = path_rho
-        plotter.add_mesh(lines, scalars="rho", cmap="plasma", line_width=float(line_width))
-        plotter.show_axes()
-        plotter.show()
-
-        print(
-            f"Fiber-path visualization: showing {len(paths_xyz)} paths "
-            f"with threshold {thr:.3f}"
-        )
-
-        return {
-            "paths_xyz": paths_xyz,
-            "path_points": line_points,
-            "path_rho": path_rho,
-            "points_xyz": points_np,
-            "rho": density_np,
-            "fiber3d": fiber.numpy(),
-            "keep_mask": keep.numpy(),
-        }
-
-    def visualize_result_final_fiber_paths(self, *args, **kwargs):
-        return self.Visualize_fresult_final_fiber_Paths(*args, **kwargs)
-    
 
     def visualize_result_final_smooth_surface_pyvista(
         self,
@@ -3075,286 +3252,7 @@ class NN_Trainer:
             "dense": dense,
             "per_face": per_face,
         }
-
-    def visualize_boundary_attachment_debug(
-        self,
-        result: dict,
-        shape_or_path=None,
-        face_index: int = 0,
-        grid_res_u: int = 180,
-        grid_res_v: int = 180,
-        uv_mask_tol: float | None = None,
-        dense_factor: float = 1.0,
-    ):
-        """
-        Debug boundary attachment on a single face:
-        1) boundary samples in UV
-        2) dmin to boundary samples
-        3) decoder boundary field rho_b
-        """
-        import matplotlib.pyplot as plt
-
-        grid_res_u, grid_res_v = self._resolve_visualization_grid_resolution(
-            grid_res_u=grid_res_u,
-            grid_res_v=grid_res_v,
-            dense_factor=dense_factor,
-        )
-
-        face_tensors = result["face_tensors"]
-        decoders = result["decoders"]
-        pred_list = result["best_pred"]
-
-        if not (0 <= face_index < len(face_tensors)):
-            raise IndexError(f"face_index out of range: {face_index} not in [0, {len(face_tensors)-1}]")
-
-        if shape_or_path is None:
-            shape_or_path = result.get("shape_path", None)
-        if shape_or_path is None:
-            raise ValueError("shape_or_path is required (pass explicitly or store in result['shape_path']).")
-
-        ft = face_tensors[face_index]
-        decoder = decoders[face_index]
-        face_id = ft["face_id"]
-
-        pred_by_face_id = {p["face_id"]: p for p in pred_list}
-        if face_id not in pred_by_face_id:
-            raise KeyError(f"Missing best_pred for face_id={face_id}")
-        pred = pred_by_face_id[face_id]
-
-        sampled = self.sample_face_field_for_visualization(
-            ft=ft,
-            decoder=decoder,
-            pred=pred,
-            shape_or_path=shape_or_path,
-            grid_res_u=grid_res_u,
-            grid_res_v=grid_res_v,
-            uv_mask_tol=uv_mask_tol,
-            use_boundary_attachment=True,
-        )
-
-        uv_dense = sampled["uv_dense"]
-        rho_b = sampled["rho_b_dense"]
-
-        bidx = self._true_open_boundary_idx(ft)
-        if bidx.numel() > 0:
-            boundary_uv = ft["uv"][bidx]
-            dmin = torch.cdist(uv_dense, boundary_uv).amin(dim=1)
-        else:
-            boundary_uv = None
-            dmin = torch.full(
-                (uv_dense.shape[0],),
-                float("nan"),
-                dtype=uv_dense.dtype,
-                device=uv_dense.device,
-            )
-
-        uv_np = uv_dense.detach().cpu().numpy()
-        rho_b_np = rho_b.detach().cpu().numpy()
-        dmin_np = dmin.detach().cpu().numpy()
-        bnd_np = None if boundary_uv is None else boundary_uv.detach().cpu().numpy()
-
-        fig, axes = plt.subplots(1, 3, figsize=(15, 4.8), constrained_layout=True)
-
-        axes[0].scatter(uv_np[:, 0], uv_np[:, 1], s=2, c="lightgray", alpha=0.7)
-        if bnd_np is not None and len(bnd_np) > 0:
-            axes[0].scatter(bnd_np[:, 0], bnd_np[:, 1], s=10, c="red")
-        axes[0].set_title(f"Face {face_id}: Boundary UV samples")
-        axes[0].set_xlabel("u")
-        axes[0].set_ylabel("v")
-        axes[0].set_aspect("equal")
-
-        sc1 = axes[1].scatter(uv_np[:, 0], uv_np[:, 1], c=dmin_np, s=3, cmap="viridis")
-        axes[1].set_title("dmin to boundary")
-        axes[1].set_xlabel("u")
-        axes[1].set_ylabel("v")
-        axes[1].set_aspect("equal")
-        fig.colorbar(sc1, ax=axes[1], fraction=0.046, pad=0.04)
-
-        sc2 = axes[2].scatter(uv_np[:, 0], uv_np[:, 1], c=rho_b_np, s=3, cmap="magma", vmin=0.0, vmax=1.0)
-        axes[2].set_title("rho_b (boundary field)")
-        axes[2].set_xlabel("u")
-        axes[2].set_ylabel("v")
-        axes[2].set_aspect("equal")
-        fig.colorbar(sc2, ax=axes[2], fraction=0.046, pad=0.04)
-
-        # Robust display across notebook/non-interactive backends.
-        shown = False
-        try:
-            from IPython.display import display
-            display(fig)
-            shown = True
-        except Exception:
-            shown = False
-
-        if not shown:
-            import os
-            os.makedirs("debug_plots", exist_ok=True)
-            out_path = os.path.join("debug_plots", f"boundary_debug_face_{face_id}.png")
-            fig.savefig(out_path, dpi=180, bbox_inches="tight")
-            print(f"Saved debug figure to: {out_path}")
-
-        plt.close(fig)
-
-        finite_dmin = torch.isfinite(dmin)
-        dmin_min = float(dmin[finite_dmin].min().item()) if bool(finite_dmin.any().item()) else float("nan")
-        dmin_mean = float(dmin[finite_dmin].mean().item()) if bool(finite_dmin.any().item()) else float("nan")
-        dmin_max = float(dmin[finite_dmin].max().item()) if bool(finite_dmin.any().item()) else float("nan")
-
-        print(
-            f"[Face {face_id}] "
-            f"boundary_pts={0 if boundary_uv is None else int(boundary_uv.shape[0])} | "
-            f"dmin(min/mean/max)=({dmin_min:.3e}/{dmin_mean:.3e}/{dmin_max:.3e}) | "
-            f"rho_b(min/mean/max)=({float(rho_b.min().item()):.3e}/{float(rho_b.mean().item()):.3e}/{float(rho_b.max().item()):.3e}) | "
-            f"grid=({grid_res_u} x {grid_res_v})"
-        )
-
-        return {
-            "face_id": face_id,
-            "uv_dense": uv_dense,
-            "boundary_uv": boundary_uv,
-            "dmin": dmin,
-            "rho_b": rho_b,
-            "sampled": sampled,
-        }
-
-    def report_threshold_sweep(
-        self,
-        result: dict,
-        shape_or_path=None,
-        thr_values=None,
-        target_volfrac: float | None = None,
-        volfrac_tol: float = 0.03,
-        min_boundary_coverage: float = 0.95,
-    ):
-        """
-        Sweep thresholds and report:
-        - binary volume fraction (area-weighted)
-        - boundary coverage (fraction of boundary samples classified solid)
-
-        Selection rule:
-        - among thresholds with boundary_coverage >= min_boundary_coverage and
-          abs(volfrac_thr - target) <= volfrac_tol, pick the smallest threshold.
-        - if none satisfies both, pick threshold with boundary coverage >= minimum
-          and closest volume to target.
-        - if still none, pick closest-volume threshold overall.
-        """
-        import numpy as np
-
-        if thr_values is None:
-            thr_values = np.linspace(0.05, 0.50, 19)
-        thr_values = [float(t) for t in thr_values]
-
-        dense = self.sample_result_field_dense_for_visualization(
-            result=result,
-            shape_or_path=shape_or_path,
-            grid_res_u=300,
-            grid_res_v=300,
-            uv_mask_tol=None,
-            use_best_pred=True,
-        )
-
-        face_tensors = result["face_tensors"]
-        eps = float(self.cfg.eps)
-
-        # global area-weighted continuous volume fraction
-        rho_all = []
-        area_all = []
-        for face_data in dense["per_face"]:
-            rho_i = face_data["rho_dense"]
-            Xu_i = face_data["Xu_dense"]
-            Xv_i = face_data["Xv_dense"]
-            area_i = torch.linalg.norm(torch.cross(Xu_i, Xv_i, dim=1), dim=1).clamp_min(self.cfg.eps)
-            rho_all.append(rho_i.detach().cpu().numpy())
-            area_all.append(area_i.detach().cpu().numpy())
-        rho_all = np.concatenate(rho_all, axis=0)
-        area_all = np.concatenate(area_all, axis=0)
-        area_sum = float(area_all.sum()) + eps
-        volfrac_cont = float((rho_all * area_all).sum() / area_sum)
-
-        target = self.cfg.target_volfrac if target_volfrac is None else float(target_volfrac)
-
-        rows = []
-        for thr in thr_values:
-            # area-weighted binary volume fraction
-            volfrac_thr = float(area_all[rho_all >= thr].sum() / area_sum)
-
-            # boundary coverage: nearest dense point to each boundary sample
-            bcov_faces = []
-            for ft, face_data in zip(face_tensors, dense["per_face"]):
-                bidx = self._true_open_boundary_idx(ft)
-                if bidx.numel() == 0:
-                    continue
-
-                boundary_uv = ft["uv"][bidx]
-                uv_dense = face_data["uv_dense"]
-                rho_dense = face_data["rho_dense"]
-
-                if uv_dense.numel() == 0:
-                    continue
-
-                d = torch.cdist(boundary_uv, uv_dense)
-                nn = d.argmin(dim=1)
-                cov = (rho_dense[nn] >= thr).float().mean()
-                bcov_faces.append(float(cov.detach().item()))
-
-            boundary_cov = float(np.mean(bcov_faces)) if len(bcov_faces) > 0 else float("nan")
-            vol_err = abs(volfrac_thr - target)
-
-            rows.append({
-                "thr": float(thr),
-                "volfrac_thr": volfrac_thr,
-                "vol_err": float(vol_err),
-                "boundary_cov": boundary_cov,
-            })
-
-        # Acceptable candidates
-        acceptable = [
-            r for r in rows
-            if (not np.isnan(r["boundary_cov"]))
-            and (r["boundary_cov"] >= min_boundary_coverage)
-            and (r["vol_err"] <= volfrac_tol)
-        ]
-
-        if len(acceptable) > 0:
-            best = min(acceptable, key=lambda r: r["thr"])
-            reason = "smallest thr meeting boundary+volume criteria"
-        else:
-            boundary_ok = [
-                r for r in rows
-                if (not np.isnan(r["boundary_cov"])) and (r["boundary_cov"] >= min_boundary_coverage)
-            ]
-            if len(boundary_ok) > 0:
-                best = min(boundary_ok, key=lambda r: (r["vol_err"], r["thr"]))
-                reason = "closest volume among boundary-acceptable thresholds"
-            else:
-                best = min(rows, key=lambda r: (r["vol_err"], r["thr"]))
-                reason = "closest volume overall (boundary criterion unmet)"
-
-        print(
-            f"[thr_sweep] target={target:.4f} | volfrac_cont={volfrac_cont:.4f} | "
-            f"min_boundary_cov={min_boundary_coverage:.3f} | vol_tol={volfrac_tol:.3f}"
-        )
-        print("thr\tvolfrac_thr\tvol_err\tboundary_cov")
-        for r in rows:
-            bc = r["boundary_cov"]
-            bc_s = "nan" if np.isnan(bc) else f"{bc:.4f}"
-            print(f"{r['thr']:.4f}\t{r['volfrac_thr']:.4f}\t{r['vol_err']:.4f}\t{bc_s}")
-        print(
-            f"[thr_sweep] selected_thr={best['thr']:.4f} | "
-            f"volfrac_thr={best['volfrac_thr']:.4f} | "
-            f"boundary_cov={best['boundary_cov']:.4f} | reason={reason}"
-        )
-
-        return {
-            "rows": rows,
-            "selected": best,
-            "reason": reason,
-            "target_volfrac": float(target),
-            "volfrac_cont": float(volfrac_cont),
-            "min_boundary_coverage": float(min_boundary_coverage),
-            "volfrac_tol": float(volfrac_tol),
-        }
-
+  
     def train(self, shape_path, face_tensors):
         cfg = self.cfg
 
@@ -3370,17 +3268,17 @@ class NN_Trainer:
         # Total number of points used for training
         all_global_idx = torch.cat([ft["global_vertex_idx"] for ft in face_tensors], dim=0)
         vertices_number = int(all_global_idx.max().item()) + 1
-
-        Gating_binirize_sharpness = cfg.Gating_binirize_sharpness
-        Gating_binirize_limit = cfg.Gating_binirize_limit
-
+        # Defining gating parameters for binarization
+        Gating_binirize_sharpness = cfg.Gating_binirize_sharpness 
+        Gating_binirize_limit = cfg.Gating_binirize_limit 
         # ------------------------------------------------------------
         # Build global vertex areas
-        # ------------------------------------------------------------
         A_v = torch.zeros((vertices_number,), dtype=dtype, device=device)
         local_vertex_areas = []
         local_face_weights = []
 
+
+        # in this for loop, we compute the lumped vertex areas for each face and accumulate them into a global vertex area tensor A_v.
         for ft in face_tensors:
             gidx = ft["global_vertex_idx"]
             A_local = self.generator.vertex_area_lumped(
@@ -3397,20 +3295,24 @@ class NN_Trainer:
         # Build models / optimizer / scheduler
         # ------------------------------------------------------------
         decoders, ppnets = self._build_face_models(face_tensors=face_tensors, device=device)
-
+        # Build initial seeds from face tensors for all faces, which will be optimized during training. Output shape is (n_faces, n_seeds_per_face, 2).
         uv_init_list = self._init_face_seeds(face_tensors)
+        uv_anchor_list = [uv_i.clone() for uv_i in uv_init_list]
 
         contexts = [
             torch.zeros(1, cfg.context_vector_size, device=device, dtype=dtype)
             for _ in face_tensors
         ]
-
+        # Build the optimizer for all ppnet parameters. It includes the learning parameters,  optimizer type and learning rate are determined by the configuration (cfg).
         opt = self._build_optimizer(ppnets, decoders)
-
+        # getatt(A,"S",None) is try to reach attribute "S" in object A, if it doesn't exist, it will return None instead of raising an error. 
+        # here we are trying to get the "scheduler_milestones" attribute from the configuration (cfg). I
+        #these milestones are specific training steps at which the learning rate will be adjusted according to a predefined schedule. 
         raw_milestones = getattr(cfg, "scheduler_milestones", None)
         if raw_milestones is None:
             milestones = []
         else:
+            # isinstance(raw_milestones, (int, float)) checks if raw_milestones is a single number (int or float). 
             raw_seq = [raw_milestones] if isinstance(raw_milestones, (int, float)) else list(raw_milestones)
             milestones = []
             for m in raw_seq:
@@ -3421,7 +3323,7 @@ class NN_Trainer:
                     milestones.append(step_m)
             milestones = sorted(set(milestones))
 
-        print(f"scheduler_milestones: {milestones}")
+        #print(f"scheduler_milestones: {milestones}")
 
         scheduler = None
         if getattr(cfg, "scheduler_milestones", None):
@@ -3438,11 +3340,17 @@ class NN_Trainer:
         render_cache = None
         if cfg.MakeTimelaps:
             case_name = shape_path.stem
+            # defining the timelapse recorder, which will save the training progress as a video. 
+            # The output directory for the frames is "timelapse_frames", 
+            # the video will be saved with the name "{case_name}_timelapse.avi". 
+            # The frames per second (fps) for the video is set to 8.
             recorder = TimelapseRecorder(
                 out_dir="timelapse_frames",
                 video_path=case_name + "_timelapse.avi",
                 fps=8,
             )
+            # building a cache for rendering the timelapse, which likely includes precomputing certain data or settings that will be used 
+            # repeatedly during the rendering of each frame in the timelapse video. 
             render_cache = self.build_timelapse_render_cache(
                 face_tensors=face_tensors,
             )
@@ -3450,6 +3358,8 @@ class NN_Trainer:
         # ------------------------------------------------------------
         # Loss normalizers
         # ------------------------------------------------------------
+        # These RunningNorm instances are used to keep track of the running mean and standard deviation of various loss components during training.
+        # if on , it will normalize the loss components to have a more stable training process, especially when the scales of different loss terms vary significantly.
         norm_vol = RunningNorm()
         norm_rep = RunningNorm()
         norm_bnd = RunningNorm()
@@ -3464,21 +3374,33 @@ class NN_Trainer:
         best_comp = None
         best_w_geo = None
         best_step = -1
+        best_active_count = None
+        best_inactive_count = None
         best_rho = None
         best_fiber_surface = None
         best_seeds = None
         best_pred = None
-        steps_since_improve = 0
+        best_hard_score = float("inf")
+        best_hard_vol_frac = None
+        best_hard_comp = None
+        best_hard_w_geo = None
+        best_hard_step = -1
+        best_hard_active_count = None
+        best_hard_inactive_count = None
+        best_hard_rho = None
+        best_hard_fiber_surface = None
+        best_hard_seeds = None
+        best_hard_pred = None
+        # ------------------------------------------------------------
 
+        steps_since_improve = 0
         initial_shape_density = None
         mid_shape_density = None
         final_shape_density = None
         final_shape_fiber_direction = None
-
         seed_points_init = None
         seed_points_mid = None
         seed_points_final = None
-
         rho0 = None
         seeds0 = None
         history = []
@@ -3488,6 +3410,10 @@ class NN_Trainer:
         # ------------------------------------------------------------
         # Training loop
         # ------------------------------------------------------------
+        # The main traiing loop iterates for a number of steps defined in the configuration (cfg.num_steps).
+        # To have a progress bar for training, it uses the tqdm library, which provides a visual representation of the training progress in the console.
+        # It is equal to for step in training_steps, but with an added progress bar that shows the current step and other relevant information during training.
+        # desc="Training" sets the description of the progress bar to "Training", leave=True keeps the progress bar displayed after completion, and dynamic_ncols=True allows the progress bar to adjust its width dynamically based on the terminal size.
         with tqdm(
             range(cfg.num_steps),
             desc="Training",
@@ -3495,9 +3421,32 @@ class NN_Trainer:
             dynamic_ncols=True,
         ) as pbar:
             for step in pbar:
+                # if cfg.predict_tau is none , always use cfg.tau as the tau value.
+                # if cfg.predict_tau is true,  it returns  cfg.tau_predic_start
+                # if Cfg.predict_tau is false, it returns annealed value.
+                tau_step = self._tau_for_step(step)
+                # Geting previous gate statistics from the history to determine whether to use hard gating or hard refine phase in the current step.
+                prev_gate_raw_mean = history[-1]["gate_raw_mean"] if history else None
+                prev_gate_raw_min = history[-1]["gate_raw_min"] if history else None
+                prev_gate_raw_max = history[-1]["gate_raw_max"] if history else None
+                # Enable hard gating if the feature is on and either:
+                # (1) training has reached the configured hard-gate start step, or
+                # (2) early hard gating is allowed and training is stable enough:
+                #     past a minimum step, no improvement for long enough, and gate stats
+                #     indicate the average activation is near target and values are clearly
+                #     separated around the active threshold.
                 use_hard_gate_mask_step = self._use_hard_gate_mask(
                     step=step,
                     steps_since_improve=steps_since_improve,
+                    gate_raw_mean=prev_gate_raw_mean,
+                    gate_raw_min=prev_gate_raw_min,
+                    gate_raw_max=prev_gate_raw_max,
+                )
+                # Enable the hard refine phase only when hard gating is already active
+                # and the current step has reached the configured refine start step.
+                use_hard_refine_step = self._use_hard_refine_phase(
+                    step=step,
+                    use_hard_gate_mask=use_hard_gate_mask_step,
                 )
                 rho_acc = torch.zeros((vertices_number,), dtype=dtype, device=device)
                 rho_wgt = torch.zeros((vertices_number,), dtype=dtype, device=device)
@@ -3534,10 +3483,17 @@ class NN_Trainer:
 
                 gate_terms = []
                 gate_binary_terms = []
+                gate_usage_terms = []
+                gate_weak_contrib_terms = []
+                width_active_terms = []
                 face_weights_this_step = []
 
-                active_count_total = 0.0
-                active_frac_sum = 0.0
+                selected_count_total = 0.0
+                selected_frac_sum = 0.0
+                participating_count_total = 0.0
+                participating_frac_sum = 0.0
+                inactive_count_total = 0.0
+                inactive_frac_sum = 0.0
                 gate_raw_min_list = []
                 gate_raw_mean_sum = 0.0
                 gate_raw_max_list = []
@@ -3552,16 +3508,31 @@ class NN_Trainer:
                 # ----------------------------------------------------
                 # Per-face forward pass
                 # ----------------------------------------------------
-                for ft, decoder, ppnet, uv_init_i, context_i, A_local, face_weight_i in zip(
+                compute_rep_loss = cfg.lam_rep != 0.0
+                compute_bnd_loss = cfg.lam_bnd != 0.0
+                compute_strut_loss = cfg.lam_strut != 0.0
+                compute_vol_loss = cfg.lam_vol != 0.0
+                compute_gate_count_loss = cfg.use_gating and cfg.lam_gate_count != 0.0
+                compute_gate_binary_loss = cfg.use_gating and cfg.lam_gate_binary != 0.0
+                compute_gate_usage_loss = cfg.use_gating and cfg.lam_gate_usage != 0.0
+                compute_gate_weak_contrib_loss = cfg.use_gating and cfg.lam_gate_weak_contrib != 0.0
+                compute_width_active_loss = cfg.lam_width_active != 0.0
+                update_seed_anchors = (
+                    cfg.use_rolling_seed_anchors
+                    and step >= int(round(float(cfg.seed_anchor_warmup_frac) * float(cfg.num_steps)))
+                )
+                uv_anchor_next_list = []
+
+                for ft, decoder, ppnet, uv_anchor_i, context_i, A_local, face_weight_i in zip(
                     face_tensors,
                     decoders,
                     ppnets,
-                    uv_init_list,
+                    uv_anchor_list,
                     contexts,
                     local_vertex_areas,
                     local_face_weights,
                 ):
-                    pred_i = ppnet(context_i, uv_init_i, offset_scale=cfg.Offset_scale)
+                    pred_i = ppnet(context_i, uv_anchor_i, offset_scale=cfg.Offset_scale)
 
                     seeds_raw_i = pred_i["seeds_raw"][0]
                     w_raw_i = pred_i["w_raw"][0]
@@ -3573,7 +3544,7 @@ class NN_Trainer:
                     gate_logits_i = pred_i.get("gate_logits", None)
                     gate_logits_i = gate_logits_i[0] if gate_logits_i is not None else None
 
-                    gate_probs_raw_i = pred_i.get("gate_probs", None)
+                    gate_probs_raw_i = pred_i.get("seed_gates", None)
                     gate_probs_raw_i = gate_probs_raw_i[0] if gate_probs_raw_i is not None else None
 
                     gates_struct_i = self.sharpen_gate_probs(
@@ -3583,48 +3554,67 @@ class NN_Trainer:
                         eps=cfg.gate_eps,
                     )
                     gates_decoder_i = self._decoder_gate_values(
+                        gate_probs_raw=gate_probs_raw_i,
                         gates_struct=gates_struct_i,
                         use_hard_gate_mask=use_hard_gate_mask_step,
-                        threshold=Gating_binirize_limit,
+                        threshold=cfg.gate_active_threshold,
                     )
 
-                    theta_i = pred_i["theta"][0] if (cfg.use_Metric_anisotropy and "theta" in pred_i) else None
-                    a_raw_i = pred_i["a_raw"][0] if (cfg.use_Metric_anisotropy and "a_raw" in pred_i) else None
+                    theta_pred_i = pred_i.get("theta", None)
+                    theta_i = theta_pred_i[0] if (cfg.use_Metric_anisotropy and theta_pred_i is not None) else None
+                    a_raw_pred_i = pred_i.get("a_raw", None)
+                    a_raw_i = a_raw_pred_i[0] if (cfg.use_Metric_anisotropy and a_raw_pred_i is not None) else None
 
-                    boundary_width_raw_i = pred_i["boundary_width_raw"][0] if ("boundary_width_raw" in pred_i) else None
-                    boundary_alpha_raw_i = None
-                    boundary_beta_raw_i = None
+                    boundary_width_pred_i = pred_i.get("boundary_width_raw", None)
+                    boundary_width_raw_i = boundary_width_pred_i[0] if boundary_width_pred_i is not None else None
+                    boundary_alpha_pred_i = pred_i.get("boundary_alpha_raw", None)
+                    boundary_alpha_raw_i = boundary_alpha_pred_i[0] if boundary_alpha_pred_i is not None else None
+                    boundary_beta_pred_i = pred_i.get("boundary_beta_raw", None)
+                    boundary_beta_raw_i = boundary_beta_pred_i[0] if boundary_beta_pred_i is not None else None
+                    tau_pred_i = pred_i.get("tau", None)
+                    tau_step = tau_pred_i[0] if tau_pred_i is not None else tau_step
 
-                    if gates_decoder_i is not None:
-                        gate_stats_i = self._gate_activity_stats(
-                            gate_probs=gates_decoder_i,
-                            threshold=Gating_binirize_limit,
-                        )
-                        gate_raw_stats_i = self._gate_stats(gate_probs_raw_i)
-                        gate_sharp_stats_i = self._gate_stats(gates_struct_i)
-                        gate_decoder_stats_i = self._gate_stats(gates_decoder_i)
-                        active_count_total += gate_stats_i["active_count"]
-                        active_frac_sum += gate_stats_i["active_frac"]
-                        gate_raw_min_list.append(gate_raw_stats_i["min"])
-                        gate_raw_mean_sum += gate_raw_stats_i["mean"]
-                        gate_raw_max_list.append(gate_raw_stats_i["max"])
-                        gate_sharp_min_list.append(gate_sharp_stats_i["min"])
-                        gate_sharp_mean_sum += gate_sharp_stats_i["mean"]
-                        gate_sharp_max_list.append(gate_sharp_stats_i["max"])
-                        gate_decoder_min_list.append(gate_decoder_stats_i["min"])
-                        gate_decoder_mean_sum += gate_decoder_stats_i["mean"]
-                        gate_decoder_max_list.append(gate_decoder_stats_i["max"])
-                        gate_face_count += 1
+                    gate_role_stats_i = self._gate_role_stats(
+                        gate_probs_raw=gate_probs_raw_i,
+                        gate_probs_struct=gates_struct_i,
+                        gate_probs_decoder=gates_decoder_i,
+                        selected_threshold=cfg.gate_active_threshold,
+                        eps=cfg.gate_eps,
+                        seed_count=int(seeds_raw_i.shape[0]),
+                    )
+                    gate_raw_stats_i = self._gate_stats(gate_probs_raw_i)
+                    gate_sharp_stats_i = self._gate_stats(gates_struct_i)
+                    gate_decoder_stats_i = self._gate_stats(gates_decoder_i)
+                    selected_count_total += gate_role_stats_i["selected_count"]
+                    selected_frac_sum += gate_role_stats_i["selected_frac"]
+                    participating_count_total += gate_role_stats_i["participating_count"]
+                    participating_frac_sum += gate_role_stats_i["participating_frac"]
+                    inactive_count_total += gate_role_stats_i["inactive_count"]
+                    inactive_frac_sum += gate_role_stats_i["inactive_frac"]
+                    gate_raw_min_list.append(gate_raw_stats_i["min"])
+                    gate_raw_mean_sum += gate_raw_stats_i["mean"]
+                    gate_raw_max_list.append(gate_raw_stats_i["max"])
+                    gate_sharp_min_list.append(gate_sharp_stats_i["min"])
+                    gate_sharp_mean_sum += gate_sharp_stats_i["mean"]
+                    gate_sharp_max_list.append(gate_sharp_stats_i["max"])
+                    gate_decoder_min_list.append(gate_decoder_stats_i["min"])
+                    gate_decoder_mean_sum += gate_decoder_stats_i["mean"]
+                    gate_decoder_max_list.append(gate_decoder_stats_i["max"])
+                    gate_face_count += 1
 
-                        #gate_count_loss_i = torch.zeros((), dtype=gate_probs_raw_i.dtype, device=gate_probs_raw_i.device)
-                        gate_count_loss_i = self.gate_count_loss(
-                            gates=gate_probs_raw_i,
-                            target_count=cfg.gate_target_count,
-                        )
-                        gate_terms.append(gate_count_loss_i)
+                    if gates_decoder_i is not None and (compute_gate_count_loss or compute_gate_binary_loss):
+                        gate_loss_source_i = gates_struct_i if gates_struct_i is not None else gate_probs_raw_i
 
-                        gate_binary_loss_i = self.gate_binary_loss(gates_decoder_i)
-                        gate_binary_terms.append(gate_binary_loss_i)
+                        if compute_gate_count_loss:
+                            gate_count_loss_i = self.gate_count_loss(
+                                gates=gate_loss_source_i,
+                                target_count=cfg.gate_target_count,
+                            )
+                            gate_terms.append(gate_count_loss_i)
+
+                        if compute_gate_binary_loss:
+                            gate_binary_loss_i = self.gate_binary_loss(gate_loss_source_i)
+                            gate_binary_terms.append(gate_binary_loss_i)
 
 
 
@@ -3645,7 +3635,7 @@ class NN_Trainer:
                         points_uv=ft["uv"],
                         Xu=ft["Xu"],
                         Xv=ft["Xv"],
-                        tau=cfg.tau,
+                        tau=tau_step,
                         seeds_raw=seeds_raw_i,
                         w_raw=w_raw_i,
                         h_raw=h_raw_i,
@@ -3681,6 +3671,7 @@ class NN_Trainer:
                     rho_i = decoder_out["rho"]
                     rho_s_i = decoder_out["rho_s"]
                     w_geo_i = decoder_out["w_geo"]
+                    w_soft_i = decoder_out["w_soft"]
                     fiber3d_i = decoder_out["fiber3d"]
                     rho_v_i = decoder_out["rho_v"]
                     rho_b_i = decoder_out["rho_b"]
@@ -3710,6 +3701,48 @@ class NN_Trainer:
                     gidx = ft["global_vertex_idx"]
                     w_local = A_local.clamp_min(cfg.eps)
 
+                    if gate_probs_raw_i is not None and (compute_gate_usage_loss or compute_gate_weak_contrib_loss):
+                        seed_usage_i = (w_soft_i * w_local.unsqueeze(1)).sum(dim=0) / w_local.sum().clamp_min(cfg.eps)
+                        weak_threshold = (
+                            cfg.gate_active_threshold
+                            if cfg.weak_contrib_threshold is None
+                            else float(cfg.weak_contrib_threshold)
+                        )
+                        gate_loss_source_i = gates_struct_i if gates_struct_i is not None else gate_probs_raw_i
+                        if compute_gate_usage_loss:
+                            gate_usage_loss_i = self.gate_usage_loss(
+                                gates=gate_loss_source_i,
+                                usage=seed_usage_i,
+                                target_count=cfg.gate_target_count,
+                                eps=cfg.gate_eps,
+                            )
+                            gate_usage_terms.append(gate_usage_loss_i)
+                        if compute_gate_weak_contrib_loss:
+                            gate_weak_contrib_loss_i = self.weak_contributor_loss(
+                                gates=gate_loss_source_i,
+                                usage=seed_usage_i,
+                                threshold=weak_threshold,
+                                power=cfg.weak_contrib_power,
+                                eps=cfg.gate_eps,
+                            )
+                            gate_weak_contrib_terms.append(gate_weak_contrib_loss_i)
+
+                    if compute_width_active_loss:
+                        width_active_terms.append(
+                            self.active_width_loss(
+                                w_raw=w_raw_i,
+                                seeds=seeds_i,
+                                gates_decoder=gates_decoder_i,
+                                width_target_frac=cfg.width_target_frac,
+                                width_target_sparse_boost=cfg.width_target_sparse_boost,
+                                width_target_frac_max=cfg.width_target_frac_max,
+                                active_threshold=cfg.gate_active_threshold,
+                                raw_temp=cfg.decoder_raw_temp,
+                                w_min=cfg.w_min,
+                                eps=cfg.eps,
+                            )
+                        )
+
                     rho_acc[gidx] += rho_i * w_local
                     rho_wgt[gidx] += w_local
 
@@ -3726,6 +3759,14 @@ class NN_Trainer:
                     fiber_wgt[gidx] += w_local
 
                     seeds_list.append(seeds_i)
+                    if update_seed_anchors:
+                        anchor_alpha = float(cfg.seed_anchor_momentum)
+                        uv_anchor_next_i = (
+                            (1.0 - anchor_alpha) * uv_anchor_i + anchor_alpha * seeds_i.detach()
+                        )
+                    else:
+                        uv_anchor_next_i = uv_anchor_i.detach().clone()
+                    uv_anchor_next_list.append(uv_anchor_next_i)
 
                     pred_list.append({
                         "face_id": ft["face_id"],
@@ -3736,9 +3777,9 @@ class NN_Trainer:
                         "gate_probs_raw": None if gate_probs_raw_i is None else gate_probs_raw_i.detach().clone(),
                         "gate_probs_sharp": None if gates_struct_i is None else gates_struct_i.detach().clone(),
                         "gate_probs_decoder": None if gates_decoder_i is None else gates_decoder_i.detach().clone(),
-                        "gate_probs": None if gates_decoder_i is None else gates_decoder_i.detach().clone(),
                         "theta": None if theta_i is None else theta_i.detach().clone(),
                         "a_raw": None if a_raw_i is None else a_raw_i.detach().clone(),
+                        "tau": None if tau_pred_i is None else tau_pred_i.detach().clone(),
 
                         "boundary_width": boundary_width_i.detach().clone() if isinstance(boundary_width_i, torch.Tensor) else boundary_width_i,
                         "boundary_alpha": boundary_alpha_i.detach().clone() if isinstance(boundary_alpha_i, torch.Tensor) else boundary_alpha_i,
@@ -3748,8 +3789,8 @@ class NN_Trainer:
                         "h": h_i.detach().clone() if isinstance(h_i, torch.Tensor) else h_i,
 
                         "boundary_width_raw": None if boundary_width_raw_i is None else boundary_width_raw_i.detach().clone(),
-                        "boundary_alpha_raw": None,
-                        "boundary_beta_raw": None,
+                        "boundary_alpha_raw": None if boundary_alpha_raw_i is None else boundary_alpha_raw_i.detach().clone(),
+                        "boundary_beta_raw": None if boundary_beta_raw_i is None else boundary_beta_raw_i.detach().clone(),
 
                         "theta_mean": None if theta_i is None else theta_i.mean().detach().clone(),
                         "a_metric": None if a_raw_i is None else (
@@ -3757,24 +3798,26 @@ class NN_Trainer:
                         ).mean().detach().clone(),
                     })
 
-                    rep_terms.append(
-                        self.seed_repulsion_term(
-                            seeds=seeds_i,
-                            gates=gates_decoder_i,
-                            sigma=cfg.seed_repulsion_sigma,
-                            eps=cfg.eps,
+                    if compute_rep_loss:
+                        rep_terms.append(
+                            self.seed_repulsion_term(
+                                seeds=seeds_i,
+                                gates=gates_decoder_i,
+                                sigma=cfg.seed_repulsion_sigma,
+                                eps=cfg.eps,
+                            )
                         )
-                    )
 
-                    bnd_terms.append(
-                        self.boundary_repulsion_term(
-                            seeds=seeds_i,
-                            boundary_uv=boundary_uv_i,
-                            gates=gates_decoder_i,
-                            margin=cfg.boundary_margin,
-                            eps=cfg.eps,
+                    if compute_bnd_loss:
+                        bnd_terms.append(
+                            self.boundary_repulsion_term(
+                                seeds=seeds_i,
+                                boundary_uv=boundary_uv_i,
+                                gates=gates_decoder_i,
+                                margin=cfg.boundary_margin,
+                                eps=cfg.eps,
+                            )
                         )
-                    )
 
                     w_geo_terms.append(self._pair_upper_values(w_geo_i).mean().reshape(()))
                     h_terms.append(h_i.reshape(()))
@@ -3793,25 +3836,42 @@ class NN_Trainer:
                         a_metric_terms.append(a_metric_i.mean().reshape(()))
 
                     face_weights_this_step.append(face_weight_i.reshape(()))
-
-                    if cfg.lam_strut != 0.0:
-                        loss_strut_i, loss_strut_edge_i, loss_strut_void_i = self.strutness_loss_from_edge_field(
-                            rho=rho_v_i,
-                            edge_field=edge_field_i,
+                    if compute_strut_loss:
+                        (
+                            loss_strut_i,
+                            loss_strut_edge_i,
+                            loss_strut_void_i,
+                            edge_mask_i,
+                            void_mask_i,
+                        ) = self.hollow_cell_loss(
+                            rho=rho_i,
+                            w_soft=w_soft_i,
+                            rho_b=rho_b_i,
+                            void_threshold=cfg.hollow_void_threshold,
+                            edge_threshold=cfg.hollow_edge_threshold,
+                            temp=cfg.hollow_temp,
+                            rho_edge_min=cfg.hollow_rho_edge_min,
                             lam_edge=cfg.lam_strut_edge,
                             lam_void=cfg.lam_strut_void,
                             eps=cfg.eps,
                         )
+
                         strut_terms.append(loss_strut_i)
                         strut_edge_terms.append(loss_strut_edge_i)
                         strut_void_terms.append(loss_strut_void_i)
+
+                uv_anchor_list = uv_anchor_next_list
 
                 # ----------------------------------------------------
                 # Aggregate face outputs
                 # ----------------------------------------------------
                 if gate_face_count > 0:
-                    active_count_mean = active_count_total / gate_face_count
-                    active_frac_mean = active_frac_sum / gate_face_count
+                    selected_count_mean = selected_count_total / gate_face_count
+                    selected_frac_mean = selected_frac_sum / gate_face_count
+                    participating_count_mean = participating_count_total / gate_face_count
+                    participating_frac_mean = participating_frac_sum / gate_face_count
+                    inactive_count_mean = inactive_count_total / gate_face_count
+                    inactive_frac_mean = inactive_frac_sum / gate_face_count
                     gate_raw_min_global = min(gate_raw_min_list)
                     gate_raw_mean_global = gate_raw_mean_sum / gate_face_count
                     gate_raw_max_global = max(gate_raw_max_list)
@@ -3822,8 +3882,12 @@ class NN_Trainer:
                     gate_decoder_mean_global = gate_decoder_mean_sum / gate_face_count
                     gate_decoder_max_global = max(gate_decoder_max_list)
                 else:
-                    active_count_mean = 0.0
-                    active_frac_mean = 0.0
+                    selected_count_mean = 0.0
+                    selected_frac_mean = 0.0
+                    participating_count_mean = 0.0
+                    participating_frac_mean = 0.0
+                    inactive_count_mean = 0.0
+                    inactive_frac_mean = 0.0
                     gate_raw_min_global = 0.0
                     gate_raw_mean_global = 0.0
                     gate_raw_max_global = 0.0
@@ -3843,11 +3907,13 @@ class NN_Trainer:
                 fiber_norm = fiber_surface.norm(dim=1, keepdim=True).clamp_min(cfg.eps)
                 fiber_surface = fiber_surface / fiber_norm
 
-                loss_rep = self._safe_weighted_mean(rep_terms, face_weights_this_step, dtype, device, cfg.eps)
-                loss_bnd = self._safe_weighted_mean(bnd_terms, face_weights_this_step, dtype, device, cfg.eps)
-                loss_strut = self._safe_weighted_mean(strut_terms, face_weights_this_step, dtype, device, cfg.eps)
-                loss_strut_edge = self._safe_weighted_mean(strut_edge_terms, face_weights_this_step, dtype, device, cfg.eps)
-                loss_strut_void = self._safe_weighted_mean(strut_void_terms, face_weights_this_step, dtype, device, cfg.eps)
+                zero = torch.zeros((), dtype=dtype, device=device)
+
+                loss_rep = self._safe_weighted_mean(rep_terms, face_weights_this_step, dtype, device, cfg.eps) if compute_rep_loss else zero
+                loss_bnd = self._safe_weighted_mean(bnd_terms, face_weights_this_step, dtype, device, cfg.eps) if compute_bnd_loss else zero
+                loss_strut = self._safe_weighted_mean(strut_terms, face_weights_this_step, dtype, device, cfg.eps) if compute_strut_loss else zero
+                loss_strut_edge = self._safe_weighted_mean(strut_edge_terms, face_weights_this_step, dtype, device, cfg.eps) if compute_strut_loss else zero
+                loss_strut_void = self._safe_weighted_mean(strut_void_terms, face_weights_this_step, dtype, device, cfg.eps) if compute_strut_loss else zero
 
                 w_geo_mean = self._safe_weighted_mean(w_geo_terms, face_weights_this_step, dtype, device, cfg.eps)
                 h_mean = self._safe_weighted_mean(h_terms, face_weights_this_step, dtype, device, cfg.eps)
@@ -3859,84 +3925,96 @@ class NN_Trainer:
                 theta_mean = self._safe_weighted_mean(theta_mean_terms, face_weights_this_step, dtype, device, cfg.eps)
                 a_metric_mean = self._safe_weighted_mean(a_metric_terms, face_weights_this_step, dtype, device, cfg.eps)
 
-                loss_gate = self._safe_weighted_mean(gate_terms, face_weights_this_step, dtype, device, cfg.eps)
-                loss_gate_binary = self._safe_weighted_mean(gate_binary_terms, face_weights_this_step, dtype, device, cfg.eps)
+                loss_gate = self._safe_weighted_mean(gate_terms, face_weights_this_step, dtype, device, cfg.eps) if compute_gate_count_loss else zero
+                loss_gate_binary = self._safe_weighted_mean(gate_binary_terms, face_weights_this_step, dtype, device, cfg.eps) if compute_gate_binary_loss else zero
+                loss_gate_usage = self._safe_weighted_mean(gate_usage_terms, face_weights_this_step, dtype, device, cfg.eps) if compute_gate_usage_loss else zero
+                loss_gate_weak_contrib = self._safe_weighted_mean(gate_weak_contrib_terms, face_weights_this_step, dtype, device, cfg.eps) if compute_gate_weak_contrib_loss else zero
+                loss_width_active = self._safe_weighted_mean(width_active_terms, face_weights_this_step, dtype, device, cfg.eps) if compute_width_active_loss else zero
 
                 # ----------------------------------------------------
                 # Volume loss
                 # ----------------------------------------------------
                 vol_frac_total = (rho * A_v).sum() / (A_v.sum() + cfg.eps)
                 vol_frac_v = (rho_v_all * A_v).sum() / (A_v.sum() + cfg.eps)
-                loss_vol_v = self.volume_loss_constant_height(
-                    rho=rho_v_all,
-                    A_v=A_v,
-                    target_volfrac=cfg.target_volfrac,
-                    eps=cfg.eps,
-                )
-                loss_vol_total = self.volume_loss_constant_height(
-                    rho=rho,
-                    A_v=A_v,
-                    target_volfrac=cfg.target_volfrac,
-                    eps=cfg.eps,
-                )
+                vol_frac_eff = vol_frac_v
+                sharp_vol_ramp = 0.0
+                loss_vol_sharp = zero
+                loss_vol = zero
 
-                loss_vol_eff_v, vol_frac_eff = self.volume_loss_powered(
-                    rho=rho_v_all,
-                    A_v=A_v,
-                    target_volfrac=cfg.target_volfrac,
-                    power=cfg.effective_volume_power,
-                    eps=cfg.eps,
-                )
-                sharp_vol_ramp = self.ramp_weight(
-                    step=step,
-                    total_steps=cfg.num_steps,
-                    start_frac=cfg.sharp_vol_start_frac,
-                    ramp_frac=cfg.sharp_vol_ramp_frac,
-                )
-                loss_vol_sharp, vol_frac_sharp = self.volume_loss_constant_height(
-                    rho=rho_s_all,
-                    A_v=A_v,
-                    target_volfrac=cfg.target_volfrac,
-                    eps=cfg.eps,
-                ), (rho_s_all * A_v).sum() / (A_v.sum() + cfg.eps)
-
-                loss_vol = (
-                    loss_vol_v
-                    + cfg.boundary_volume_assist * loss_vol_total
-                    + cfg.lam_vol_effective * loss_vol_eff_v
-                    + (cfg.lam_vol_sharp * sharp_vol_ramp) * loss_vol_sharp
-                )
-
-                if cfg.use_boundary_weighted_volume:
-                    loss_vol_base, vol_frac_weighted = self.volume_loss_with_boundary_discount(
-                        rho=rho,
+                if compute_vol_loss:
+                    loss_vol_v = self.volume_loss_constant_height(
+                        rho=rho_v_all,
                         A_v=A_v,
-                        rho_boundary=rho_boundary,
                         target_volfrac=cfg.target_volfrac,
-                        boundary_weight=cfg.boundary_vol_weight,
                         eps=cfg.eps,
                     )
-                    loss_vol_eff_weighted, vol_frac_eff = self.volume_loss_powered(
+                    loss_vol_total = self.volume_loss_constant_height(
                         rho=rho,
-                        A_v=(1.0 - rho_boundary + cfg.boundary_vol_weight * rho_boundary) * A_v,
+                        A_v=A_v,
+                        target_volfrac=cfg.target_volfrac,
+                        eps=cfg.eps,
+                    )
+
+                    loss_vol_eff_v, vol_frac_eff = self.volume_loss_powered(
+                        rho=rho_v_all,
+                        A_v=A_v,
                         target_volfrac=cfg.target_volfrac,
                         power=cfg.effective_volume_power,
                         eps=cfg.eps,
                     )
-                    sharp_weights = (1.0 - rho_boundary + cfg.boundary_vol_weight * rho_boundary) * A_v
+                    sharp_vol_ramp = self.ramp_weight(
+                        step=step,
+                        total_steps=cfg.num_steps,
+                        start_frac=cfg.sharp_vol_start_frac,
+                        ramp_frac=cfg.sharp_vol_ramp_frac,
+                    )
                     loss_vol_sharp, vol_frac_sharp = self.volume_loss_constant_height(
                         rho=rho_s_all,
-                        A_v=sharp_weights,
+                        A_v=A_v,
                         target_volfrac=cfg.target_volfrac,
                         eps=cfg.eps,
-                    ), (rho_s_all * sharp_weights).sum() / (sharp_weights.sum() + cfg.eps)
+                    ), (rho_s_all * A_v).sum() / (A_v.sum() + cfg.eps)
+
                     loss_vol = (
-                        loss_vol_base
-                        + cfg.lam_vol_effective * loss_vol_eff_weighted
+                        loss_vol_v
+                        + cfg.boundary_volume_assist * loss_vol_total
+                        + cfg.lam_vol_effective * loss_vol_eff_v
                         + (cfg.lam_vol_sharp * sharp_vol_ramp) * loss_vol_sharp
                     )
-                    vol_frac_weighted_cont = vol_frac_weighted
+
+                    if cfg.use_boundary_weighted_volume:
+                        loss_vol_base, vol_frac_weighted = self.volume_loss_with_boundary_discount(
+                            rho=rho,
+                            A_v=A_v,
+                            rho_boundary=rho_boundary,
+                            target_volfrac=cfg.target_volfrac,
+                            boundary_weight=cfg.boundary_vol_weight,
+                            eps=cfg.eps,
+                        )
+                        loss_vol_eff_weighted, vol_frac_eff = self.volume_loss_powered(
+                            rho=rho,
+                            A_v=(1.0 - rho_boundary + cfg.boundary_vol_weight * rho_boundary) * A_v,
+                            target_volfrac=cfg.target_volfrac,
+                            power=cfg.effective_volume_power,
+                            eps=cfg.eps,
+                        )
+                        sharp_weights = (1.0 - rho_boundary + cfg.boundary_vol_weight * rho_boundary) * A_v
+                        loss_vol_sharp, vol_frac_sharp = self.volume_loss_constant_height(
+                            rho=rho_s_all,
+                            A_v=sharp_weights,
+                            target_volfrac=cfg.target_volfrac,
+                            eps=cfg.eps,
+                        ), (rho_s_all * sharp_weights).sum() / (sharp_weights.sum() + cfg.eps)
+                        loss_vol = (
+                            loss_vol_base
+                            + cfg.lam_vol_effective * loss_vol_eff_weighted
+                            + (cfg.lam_vol_sharp * sharp_vol_ramp) * loss_vol_sharp
+                        )
+                        vol_frac_weighted_cont = vol_frac_weighted
+                    else:
+                        vol_frac_weighted_cont = vol_frac_v
                 else:
+                    vol_frac_sharp = (rho_s_all * A_v).sum() / (A_v.sum() + cfg.eps)
                     vol_frac_weighted_cont = vol_frac_v
 
 
@@ -3983,18 +4061,42 @@ class NN_Trainer:
                 # ----------------------------------------------------
                 # Total loss
                 # ----------------------------------------------------
-                if cfg.gate_warmup_steps > 0:
-                    gate_warmup = min(float(step) / float(cfg.gate_warmup_steps), 1.0)
-                else:
-                    gate_warmup = 1.0
+                gate_warmup = self.ramp_weight(
+                    step=step,
+                    total_steps=cfg.num_steps,
+                    start_frac=0.0,
+                    ramp_frac=cfg.gate_warmup_frac,
+                )
 
-                if cfg.gate_binary_warmup_steps > 0:
-                    gate_binary_warmup = min(float(step) / float(cfg.gate_binary_warmup_steps), 1.0)
-                else:
-                    gate_binary_warmup = 1.0
+                gate_binary_warmup = self.ramp_weight(
+                    step=step,
+                    total_steps=cfg.num_steps,
+                    start_frac=0.0,
+                    ramp_frac=cfg.gate_binary_warmup_frac,
+                )
 
                 lam_gate_binary_eff = cfg.lam_gate_binary * gate_binary_warmup
                 lam_gate_eff = cfg.lam_gate_count * gate_warmup
+                lam_gate_usage_eff = cfg.lam_gate_usage * gate_warmup
+                lam_gate_weak_contrib_eff = cfg.lam_gate_weak_contrib * gate_warmup
+                lam_width_active_eff = cfg.lam_width_active * self.ramp_weight(
+                    step=step,
+                    total_steps=cfg.num_steps,
+                    start_frac=cfg.width_warmup_start_frac,
+                    ramp_frac=cfg.width_warmup_ramp_frac,
+                )
+                if use_hard_gate_mask_step:
+                    lam_width_active_eff = lam_width_active_eff * float(cfg.lam_width_active_hard_multiplier)
+                if use_hard_refine_step:
+                    lam_width_active_eff = lam_width_active_eff * float(cfg.hard_refine_width_multiplier)
+                    if cfg.disable_gate_count_loss_during_hard_refine:
+                        lam_gate_eff = 0.0
+                    if cfg.disable_gate_binary_loss_during_hard_refine:
+                        lam_gate_binary_eff = 0.0
+                    if cfg.disable_gate_usage_loss_during_hard_refine:
+                        lam_gate_usage_eff = 0.0
+                    if cfg.disable_gate_weak_contrib_during_hard_refine:
+                        lam_gate_weak_contrib_eff = 0.0
 
                 L_total = (
                     cfg.lam_vol * (loss_vol / n_vol)
@@ -4010,6 +4112,15 @@ class NN_Trainer:
 
                 if cfg.use_gating and lam_gate_binary_eff != 0.0:
                     L_total = L_total + lam_gate_binary_eff * loss_gate_binary
+
+                if cfg.use_gating and lam_gate_usage_eff != 0.0:
+                    L_total = L_total + lam_gate_usage_eff * loss_gate_usage
+
+                if cfg.use_gating and lam_gate_weak_contrib_eff != 0.0:
+                    L_total = L_total + lam_gate_weak_contrib_eff * loss_gate_weak_contrib
+
+                if lam_width_active_eff != 0.0:
+                    L_total = L_total + lam_width_active_eff * loss_width_active
 
                 if cfg.lam_fem != 0.0:
                     if fem_is_valid:
@@ -4028,25 +4139,77 @@ class NN_Trainer:
                 if total_is_finite:
                     L_total.backward()
 
-                    grad_clip_norm = getattr(cfg, "grad_clip_norm", None)
-                    if grad_clip_norm is not None and grad_clip_norm > 0:
-                        params = []
-                        for ppnet in ppnets:
-                            params.extend([p for p in ppnet.parameters() if p.requires_grad])
-                        if params:
-                            torch.nn.utils.clip_grad_norm_(params, max_norm=grad_clip_norm)
+                    bad_grad_info = self._nonfinite_grad_info(ppnets)
+                    if bad_grad_info:
+                        bad_grad_desc = ", ".join(
+                            f"face={mi}:{pn}" for mi, pn in bad_grad_info[:8]
+                        )
+                        tqdm.write(
+                            f"[step {step}] Non-finite gradients detected, optimizer step skipped. "
+                            f"Examples: {bad_grad_desc}"
+                        )
+                        for _mi, _pn, p in self._named_trainable_params(ppnets):
+                            if p.grad is not None:
+                                p.grad = None
+                    else:
+                        pre_step_snapshot = {
+                            p: p.detach().clone()
+                            for _mi, _pn, p in self._named_trainable_params(ppnets)
+                        }
 
-                    opt.step()
+                        grad_clip_norm = getattr(cfg, "grad_clip_norm", None)
+                        if grad_clip_norm is not None and grad_clip_norm > 0:
+                            params = []
+                            for ppnet in ppnets:
+                                params.extend([p for p in ppnet.parameters() if p.requires_grad])
+                            if params:
+                                torch.nn.utils.clip_grad_norm_(params, max_norm=grad_clip_norm)
 
-                    for fi, ppnet in enumerate(ppnets):
-                        for pn, p in ppnet.named_parameters():
-                            if not torch.isfinite(p).all():
-                                raise RuntimeError(
-                                    f"Non-finite parameter after opt.step(): face={fi}, param={pn}"
+                        bad_grad_info = self._nonfinite_grad_info(ppnets)
+                        if bad_grad_info:
+                            bad_grad_desc = ", ".join(
+                                f"face={mi}:{pn}" for mi, pn in bad_grad_info[:8]
+                            )
+                            tqdm.write(
+                                f"[step {step}] Non-finite gradients remained after clipping, "
+                                f"optimizer step skipped. Examples: {bad_grad_desc}"
+                            )
+                            for _mi, _pn, p in self._named_trainable_params(ppnets):
+                                if p.grad is not None:
+                                    p.grad = None
+                        else:
+                            if use_hard_refine_step:
+                                for ppnet in ppnets:
+                                    if cfg.freeze_gate_head_during_hard_refine and hasattr(ppnet, "gate_head"):
+                                        for p in ppnet.gate_head.parameters():
+                                            p.grad = None
+                                    if cfg.freeze_tau_head_during_hard_refine and hasattr(ppnet, "tau_head"):
+                                        for p in ppnet.tau_head.parameters():
+                                            p.grad = None
+
+                            opt.step()
+
+                            bad_param_info = self._nonfinite_param_info(ppnets)
+                            if bad_param_info:
+                                bad_param_desc = ", ".join(
+                                    f"face={mi}:{pn}" for mi, pn in bad_param_info[:8]
                                 )
-
-                    if scheduler is not None:
-                        scheduler.step()
+                                self._restore_param_snapshot(pre_step_snapshot)
+                                bad_param_set = set(bad_param_info)
+                                affected_params = [
+                                    p for mi, pn, p in self._named_trainable_params(ppnets)
+                                    if (mi, pn) in bad_param_set
+                                ]
+                                self._clear_optimizer_state_for_params(opt, affected_params)
+                                for _mi, _pn, p in self._named_trainable_params(ppnets):
+                                    if p.grad is not None:
+                                        p.grad = None
+                                tqdm.write(
+                                    f"[step {step}] Non-finite parameters after opt.step(); restored previous "
+                                    f"parameters and cleared optimizer state. Examples: {bad_param_desc}"
+                                )
+                            elif scheduler is not None:
+                                scheduler.step()
                 else:
                     tqdm.write(f"[step {step}] L_total is non-finite, optimizer step skipped.")
 
@@ -4078,35 +4241,12 @@ class NN_Trainer:
                         best_vol_frac = float(vol_frac_eff.detach().item())
                         best_comp = float(comp_val.detach().item())
                         best_w_geo = float(w_geo_mean.detach().item())
+                        best_active_count = float(participating_count_total)
+                        best_inactive_count = float(inactive_count_total)
                         best_rho = rho.detach().clone()
                         best_fiber_surface = fiber_surface.detach().clone()
                         best_seeds = [s.detach().clone() for s in seeds_list]
-                        best_pred = [
-                            {
-                                "face_id": p["face_id"],
-                                "seeds_raw": p["seeds_raw"].detach().clone(),
-                                "w_raw": p["w_raw"].detach().clone(),
-                                "h_raw": None if p["h_raw"] is None else p["h_raw"].detach().clone(),
-                                "gate_logits": None if p.get("gate_logits") is None else p["gate_logits"].detach().clone(),
-                                "gate_probs_raw": None if p.get("gate_probs_raw") is None else p["gate_probs_raw"].detach().clone(),
-                                "gate_probs_sharp": None if p.get("gate_probs_sharp") is None else p["gate_probs_sharp"].detach().clone(),
-                                "gate_probs_decoder": None if p.get("gate_probs_decoder") is None else p["gate_probs_decoder"].detach().clone(),
-                                "gate_probs": None if p["gate_probs"] is None else p["gate_probs"].detach().clone(),
-                                "theta": None if p["theta"] is None else p["theta"].detach().clone(),
-                                "a_raw": None if p["a_raw"] is None else p["a_raw"].detach().clone(),
-                                "boundary_width_raw": None if p["boundary_width_raw"] is None else p["boundary_width_raw"].detach().clone(),
-                                "boundary_alpha_raw": None if p["boundary_alpha_raw"] is None else p["boundary_alpha_raw"].detach().clone(),
-                                "boundary_beta_raw": None if p["boundary_beta_raw"] is None else p["boundary_beta_raw"].detach().clone(),
-                                "w_geo": p["w_geo"].detach().clone(),
-                                "h": None if p["h"] is None else p["h"].detach().clone(),
-                                "boundary_width": None if p["boundary_width"] is None else p["boundary_width"].detach().clone(),
-                                "boundary_alpha": None if p["boundary_alpha"] is None else p["boundary_alpha"].detach().clone(),
-                                "boundary_beta": None if p["boundary_beta"] is None else p["boundary_beta"].detach().clone(),
-                                "theta_mean": None if p["theta_mean"] is None else p["theta_mean"].detach().clone(),
-                                "a_metric": None if p["a_metric"] is None else p["a_metric"].detach().clone(),
-                            }
-                            for p in pred_list
-                        ]
+                        best_pred = self._clone_pred_list(pred_list)
 
                         if improvement_gap is None or improvement_gap > 50:
                             tqdm.write(
@@ -4119,6 +4259,26 @@ class NN_Trainer:
                         steps_since_improve = 0
                     elif best_candidate_is_valid:
                         steps_since_improve += 1
+
+                    if use_hard_gate_mask_step and best_candidate_is_valid and score < (best_hard_score - cfg.min_delta):
+                        best_hard_score = score
+                        best_hard_step = step
+                        best_hard_vol_frac = float(vol_frac_eff.detach().item())
+                        best_hard_comp = float(comp_val.detach().item())
+                        best_hard_w_geo = float(w_geo_mean.detach().item())
+                        best_hard_active_count = float(participating_count_total)
+                        best_hard_inactive_count = float(inactive_count_total)
+                        best_hard_rho = rho.detach().clone()
+                        best_hard_fiber_surface = fiber_surface.detach().clone()
+                        best_hard_seeds = [s.detach().clone() for s in seeds_list]
+                        best_hard_pred = self._clone_pred_list(pred_list)
+                        tqdm.write(
+                            f"New best_hard_step={best_hard_step} | "
+                            f"best_hard_score={best_hard_score:.6f} | "
+                            f"vol_eff={best_hard_vol_frac:.6f} | "
+                            f"comp={best_hard_comp:.6e} | "
+                            f"w={best_hard_w_geo:.6e}"
+                        )
 
                     if rho0 is None:
                         rho0 = rho.detach().clone()
@@ -4166,12 +4326,17 @@ class NN_Trainer:
                         "lam_gate_eff": lam_gate_eff,
                         "loss_gate_binary": self._finite_or_default(loss_gate_binary),
                         "lam_gate_binary_eff": lam_gate_binary_eff,
+                        "loss_gate_usage": self._finite_or_default(loss_gate_usage),
+                        "lam_gate_usage_eff": lam_gate_usage_eff,
+                        "loss_gate_weak_contrib": self._finite_or_default(loss_gate_weak_contrib),
+                        "lam_gate_weak_contrib_eff": lam_gate_weak_contrib_eff,
                         "comp": self._finite_or_default(comp_val),
                         "vol_frac": float(vol_frac.detach().item()),
                         "vol_frac_eff": float(vol_frac_eff.detach().item()),
                         "vol_frac_sharp": float(vol_frac_sharp.detach().item()),
                         "vol_dev": float(vol_dev.detach().item()),
                         "vol_dev_eff": float(vol_dev_eff.detach().item()),
+                        "tau": float(tau_step),
                         "rho_min": rho_min,
                         "rho_mean": rho_mean,
                         "rho_max": rho_max,
@@ -4186,6 +4351,8 @@ class NN_Trainer:
                         "grad_mean": g_mean,
                         "best_score": best_score,
                         "best_step": best_step,
+                        "best_hard_score": self._finite_or_default(best_hard_score),
+                        "best_hard_step": float(best_hard_step),
                         "fem_valid": fem_is_valid,
                         "fem_failure_reason": fem_failure_reason,
                         "optimizer_step_skipped": not total_is_finite,
@@ -4202,9 +4369,15 @@ class NN_Trainer:
                         "theta_mean": self._finite_or_default(theta_mean),
                         "a_metric_mean": self._finite_or_default(a_metric_mean),
 
-                        "active_count_total": active_count_total,
-                        "active_count_mean": active_count_mean,
-                        "active_frac_mean": active_frac_mean,
+                        "selected_count_total": selected_count_total,
+                        "selected_count_mean": selected_count_mean,
+                        "selected_frac_mean": selected_frac_mean,
+                        "active_count_total": participating_count_total,
+                        "active_count_mean": participating_count_mean,
+                        "active_frac_mean": participating_frac_mean,
+                        "inactive_count_total": inactive_count_total,
+                        "inactive_count_mean": inactive_count_mean,
+                        "inactive_frac_mean": inactive_frac_mean,
                         "gate_raw_min": gate_raw_min_global,
                         "gate_raw_mean": gate_raw_mean_global,
                         "gate_raw_max": gate_raw_max_global,
@@ -4215,6 +4388,9 @@ class NN_Trainer:
                         "gate_decoder_mean": gate_decoder_mean_global,
                         "gate_decoder_max": gate_decoder_max_global,
                         "hard_gate_mask_on": 1.0 if use_hard_gate_mask_step else 0.0,
+                        "hard_refine_on": 1.0 if use_hard_refine_step else 0.0,
+                        "loss_width_active": self._finite_or_default(loss_width_active),
+                        "lam_width_active_eff": lam_width_active_eff,
                     }
                     history.append(row)
 
@@ -4222,9 +4398,11 @@ class NN_Trainer:
                         loss=f"{row['L_total']:.3e}",
                         vol=f"{row['vol_frac_eff']:.3f}",
                         comp=f"{row['comp']:.2e}",
+                        tau=f"{row['tau']:.2e}",
                         w=f"{row['w_geo_mean']:.3e}",
                         bw=f"{row['boundary_width_mean']:.3e}",
-                        act=f"{active_count_mean:.1f}",
+                        sel=f"{selected_count_mean:.1f}",
+                        part=f"{participating_count_mean:.1f}",
                         fem="OK" if fem_is_valid else "BAD",
                         refresh=False,
                     )
@@ -4239,12 +4417,13 @@ class NN_Trainer:
                         )
 
                         loss_dict = {
-                            "total": row["L_total"],
-                            "vol": row["loss_vol"],
-                            "rep": row["loss_rep"],
-                            "bnd": row["loss_bnd"],
-                            "strut": row["loss_strut"],
-                            "fem": row["loss_fem"],
+                            "L_Total": row["L_total"],
+                            "L_Volume": row["loss_vol"],
+                            "L_FEM": row["loss_fem"],
+                            "L_St": row["loss_strut"],
+                            "L_Gate": row["loss_gate"],
+                            "L_Bnd": row["loss_bnd"],
+                            "L_Rep": row["loss_rep"],
                         }
 
                         recorder.add_frame(
@@ -4254,7 +4433,11 @@ class NN_Trainer:
                             title_text=(
                                 f"vol={row['vol_frac']:.4f} | "
                                 f"W={row['w_geo_mean']:.4g} | "
+                                f"tau={row['tau']:.4g} | "
                                 f"bw={row['boundary_width_mean']:.4g} | "
+                                f"ba={row['boundary_alpha_mean']:.4g} | "
+                                f"bb={row['boundary_beta_mean']:.4g} | "
+                                f"act={row['active_count_total']:.0f} inact={row['inactive_count_total']:.0f} | "
                                 f"Δrho={drho:.2e} Δseed={dseed:.2e} grad_mean={g_mean:.2e} | "
                             ),
                         )
@@ -4277,11 +4460,8 @@ class NN_Trainer:
                         fem_status = "OK" if fem_is_valid else f"BAD({fem_failure_reason})"
                         tqdm.write(
                             f"[{step:05d}] | "
-                            f"active(total/mean)={active_count_total:.0f}/{active_count_mean:.2f} | "
-                            f"hard_gate={'ON' if use_hard_gate_mask_step else 'off'} | "
-                            f"gate_raw(min/mean/max)={gate_raw_min_global:.3f}/{gate_raw_mean_global:.3f}/{gate_raw_max_global:.3f} | "
-                            f"gate_sharp(min/mean/max)={gate_sharp_min_global:.3f}/{gate_sharp_mean_global:.3f}/{gate_sharp_max_global:.3f} | "
-                            f"gate_dec(min/mean/max)={gate_decoder_min_global:.3f}/{gate_decoder_mean_global:.3f}/{gate_decoder_max_global:.3f} | "
+                            f"selected(total/mean)={selected_count_total:.0f}/{selected_count_mean:.2f} | "
+                            f"participating(total/mean)={participating_count_total:.0f}/{participating_count_mean:.2f} | "
                             f"L_total={row['L_total']:.4e} | "
                             f"L_vol={row['loss_vol']:.3e} "
                             f"L_fem={row['loss_fem']:.3e} "
@@ -4289,11 +4469,17 @@ class NN_Trainer:
                             f"L_rep={row['loss_rep']:.3e} "
                             f"L_bnd={row['loss_bnd']:.3e} "
                             f"L_gate={row['loss_gate']:.3e} "
-                            f"L_gbin={row['loss_gate_binary']:.3e} | "
+                            f"L_gbin={row['loss_gate_binary']:.3e} "
+                            f"L_guse={row['loss_gate_usage']:.3e} "
+                            f"L_gweak={row['loss_gate_weak_contrib']:.3e} "
+                            f"L_wact={row['loss_width_active']:.3e} | "
                             f"vol={row['vol_frac']:.3f} "
                             f"vol_eff={row['vol_frac_eff']:.3f} "
                             f"(/{cfg.target_volfrac:.3f}) "
+                            f"tau={row['tau']:.3e} "
                             f"comp={row['comp']:.3e} | "
+                            f"hard_gate={'ON' if use_hard_gate_mask_step else 'off'} "
+                            f"hard_refine={'ON' if use_hard_refine_step else 'off'} | "
                             f"w={row['w_geo_mean']:.3e} "
                             f"h={row['h_mean']:.3e} | "
                             f"bw={row['boundary_width_mean']:.3e} "
@@ -4306,15 +4492,19 @@ class NN_Trainer:
                             f"rho(min/mean/max)={rho_min:.3f}/{rho_mean:.3f}/{rho_max:.3f} "
                             f"rho_b(min/mean/max)={rho_boundary_min:.3f}/{rho_boundary_mean:.3f}/{rho_boundary_max:.3f} "
                             f"rho_v(min/mean/max)={rho_v_min:.3f}/{rho_v_mean:.3f}/{rho_v_max:.3f} | "
+                            f"gate_raw(min/mean/max)={gate_raw_min_global:.3f}/{gate_raw_mean_global:.3f}/{gate_raw_max_global:.3f} | "
+                            f"gate_sharp(min/mean/max)={gate_sharp_min_global:.3f}/{gate_sharp_mean_global:.3f}/{gate_sharp_max_global:.3f} | "
+                            f"gate_dec(min/mean/max)={gate_decoder_min_global:.3f}/{gate_decoder_mean_global:.3f}/{gate_decoder_max_global:.3f} | "
                             f"Δrho={drho:.2e} Δseed={dseed:.2e} grad_mean={g_mean:.2e} | "
                             f"fem={fem_status} | "
-                            f"best={best_score:.4e}@{best_step}"
+                            f"best={best_score:.4e}@{best_step} | "
+                            f"best_hard={best_hard_score:.4e}@{best_hard_step}"
                         )
 
                     if step >= cfg.early_stop_start and steps_since_improve >= cfg.patience:
                         tqdm.write(
                             f"Early stopping at step {step} | "
-                            f"best_step={best_step} | best_score={best_score:.6f}"
+                            f"best_step={best_step} | best_score={best_score:.6f} |"
                         )
                         break
 
@@ -4325,32 +4515,7 @@ class NN_Trainer:
             with torch.no_grad():
                 best_rho = rho.detach().clone()
                 best_seeds = [s.detach().clone() for s in seeds_list]
-                best_pred = [
-                    {
-                        "face_id": p["face_id"],
-                        "seeds_raw": p["seeds_raw"].detach().clone(),
-                        "w_raw": p["w_raw"].detach().clone(),
-                        "h_raw": None if p["h_raw"] is None else p["h_raw"].detach().clone(),
-                        "gate_logits": None if p.get("gate_logits") is None else p["gate_logits"].detach().clone(),
-                        "gate_probs_raw": None if p.get("gate_probs_raw") is None else p["gate_probs_raw"].detach().clone(),
-                        "gate_probs_sharp": None if p.get("gate_probs_sharp") is None else p["gate_probs_sharp"].detach().clone(),
-                        "gate_probs_decoder": None if p.get("gate_probs_decoder") is None else p["gate_probs_decoder"].detach().clone(),
-                        "gate_probs": None if p["gate_probs"] is None else p["gate_probs"].detach().clone(),
-                        "theta": None if p["theta"] is None else p["theta"].detach().clone(),
-                        "a_raw": None if p["a_raw"] is None else p["a_raw"].detach().clone(),
-                        "boundary_width_raw": None if p["boundary_width_raw"] is None else p["boundary_width_raw"].detach().clone(),
-                        "boundary_alpha_raw": None if p["boundary_alpha_raw"] is None else p["boundary_alpha_raw"].detach().clone(),
-                        "boundary_beta_raw": None if p["boundary_beta_raw"] is None else p["boundary_beta_raw"].detach().clone(),
-                        "w_geo": p["w_geo"].detach().clone(),
-                        "h": None if p["h"] is None else p["h"].detach().clone(),
-                        "boundary_width": None if p["boundary_width"] is None else p["boundary_width"].detach().clone(),
-                        "boundary_alpha": None if p["boundary_alpha"] is None else p["boundary_alpha"].detach().clone(),
-                        "boundary_beta": None if p["boundary_beta"] is None else p["boundary_beta"].detach().clone(),
-                        "theta_mean": None if p["theta_mean"] is None else p["theta_mean"].detach().clone(),
-                        "a_metric": None if p["a_metric"] is None else p["a_metric"].detach().clone(),
-                    }
-                    for p in pred_list
-                ]
+                best_pred = self._clone_pred_list(pred_list)
                 best_step = step
                 best_score = float("inf") if not self._scalar_tensor_is_finite(L_total) else float(L_total.detach().item())
 
@@ -4360,6 +4525,29 @@ class NN_Trainer:
                     best_comp = float(comp_val.detach().item())
                 if best_w_geo is None:
                     best_w_geo = float(w_geo_mean.detach().item())
+                if best_active_count is None:
+                    best_active_count = float(participating_count_total)
+                if best_inactive_count is None:
+                    best_inactive_count = float(inactive_count_total)
+
+        use_hard_result = (
+            bool(cfg.prefer_hard_gate_result)
+            and best_hard_rho is not None
+            and best_hard_pred is not None
+            and best_hard_seeds is not None
+        )
+        if use_hard_result:
+            best_score = best_hard_score
+            best_step = best_hard_step
+            best_vol_frac = best_hard_vol_frac
+            best_comp = best_hard_comp
+            best_w_geo = best_hard_w_geo
+            best_active_count = best_hard_active_count
+            best_inactive_count = best_hard_inactive_count
+            best_rho = best_hard_rho
+            best_fiber_surface = best_hard_fiber_surface
+            best_seeds = best_hard_seeds
+            best_pred = best_hard_pred
 
         # ------------------------------------------------------------
         # Final outputs
@@ -4377,7 +4565,9 @@ class NN_Trainer:
 
         tqdm.write(
             f"FINAL RETURNED: best_step={best_step}, best_score={best_score:.6f} | "
-            f"vol_eff={best_vol_frac:.3e}, comp={best_comp:.3e}, w_geo={best_w_geo:.3e}"
+            f"vol_eff={best_vol_frac:.3e}, comp={best_comp:.3e}, w_geo={best_w_geo:.3e} | "
+            f"active={float(best_active_count or 0.0):.0f}, inactive={float(best_inactive_count or 0.0):.0f} | "
+            f"source={'hard' if use_hard_result else 'global'}"
         )
 
         if self.writer is not None:
@@ -4385,9 +4575,100 @@ class NN_Trainer:
             self.writer.close()
             self.writer = None
 
+        best_row = None
+        if history and best_step >= 0:
+            for row in reversed(history):
+                if int(row["step"]) == int(best_step):
+                    best_row = row
+                    break
+
         if cfg.MakeTimelaps:
             try:
-                recorder.build_video()
+                total_seed_slots = int(cfg.seed_number) * max(len(best_pred) if best_pred else len(face_tensors), 1)
+                active_seed_count = int(round(float(best_active_count or 0.0)))
+                tuned_param_summary = {
+                    "best_step": f"{int(best_step)}",
+                    "source": "hard" if use_hard_result else "global",
+                    "active_seeds": f"{active_seed_count}/{total_seed_slots}",
+                    "w": f"{float(best_w_geo):.6g}",
+                    "tau": f"{self._fallback_tau_value():.6g}",
+                    "h": "nan",
+                    "bw": "nan",
+                    "ba": "nan",
+                    "bb": "nan",
+                    "theta": "nan",
+                    "a": "nan",
+                }
+                if best_pred:
+                    def _mean_from_best_pred(key):
+                        vals = []
+                        for p in best_pred:
+                            v = p.get(key)
+                            if isinstance(v, torch.Tensor):
+                                vals.append(float(v.detach().mean().item()))
+                        if vals:
+                            return float(sum(vals) / len(vals))
+                        return float("nan")
+
+                    tau_mean = _mean_from_best_pred("tau")
+                    h_mean = _mean_from_best_pred("h")
+                    bw_mean = _mean_from_best_pred("boundary_width")
+                    ba_mean = _mean_from_best_pred("boundary_alpha")
+                    bb_mean = _mean_from_best_pred("boundary_beta")
+                    theta_mean_best = _mean_from_best_pred("theta_mean")
+                    a_mean_best = _mean_from_best_pred("a_metric")
+
+                    tuned_param_summary = {
+                        "best_step": f"{int(best_step)}",
+                        "source": "hard" if use_hard_result else "global",
+                        "active_seeds": f"{active_seed_count}/{total_seed_slots}",
+                        "w": f"{float(best_w_geo):.6g}",
+                        "tau": (
+                            f"{(tau_mean if math.isfinite(tau_mean) else self._fallback_tau_value()):.6g}"
+                        ),
+                        "h": f"{h_mean:.6g}" if math.isfinite(h_mean) else "nan",
+                        "bw": f"{bw_mean:.6g}" if math.isfinite(bw_mean) else "nan",
+                        "ba": f"{ba_mean:.6g}" if math.isfinite(ba_mean) else "nan",
+                        "bb": f"{bb_mean:.6g}" if math.isfinite(bb_mean) else "nan",
+                        "theta": f"{theta_mean_best:.6g}" if math.isfinite(theta_mean_best) else "nan",
+                        "a": f"{a_mean_best:.6g}" if math.isfinite(a_mean_best) else "nan",
+                    }
+
+                best_loss_dict = {
+                    "L_Total": float(best_score),
+                    "L_Volume": float(best_row["loss_vol"]) if best_row is not None else float("nan"),
+                    "L_FEM": float(best_row["loss_fem"]) if best_row is not None else float("nan"),
+                    "L_Strut": float(best_row["loss_strut"]) if best_row is not None else float("nan"),
+                    "L_Gate": float(best_row["loss_gate"]) if best_row is not None else float("nan"),
+                    "L_Bnd": float(best_row["loss_bnd"]) if best_row is not None else float("nan"),
+                    "L_Rep": float(best_row["loss_rep"]) if best_row is not None else float("nan"),
+                }
+                results_text = (
+                    f"volume={float(best_vol_frac):.6g} | "
+                    f"fem={float(best_comp):.6g}"
+                )
+                tuned_param_title = " | ".join(f"{key}={value}" for key, value in tuned_param_summary.items())
+
+                best_cad_img = self._render_current_cad_frame_cached(
+                    seeds_list=best_seeds,
+                    decoders=decoders,
+                    pred_list=best_pred,
+                    render_cache=render_cache,
+                    thr=getattr(cfg, "vis_thr", cfg.TM_laps_Thr),
+                )
+                recorder.add_frame(
+                    step=cfg.num_steps + 1,
+                    cad_img=best_cad_img,
+                    loss_dict=best_loss_dict,
+                    title_text=tuned_param_title,
+                    highlight_best=True,
+                    chart_title="Best Result Losses",
+                    summary_title="Tuned Parameters",
+                    prefix_step_in_summary=False,
+                    results_title="Results",
+                    results_text=results_text,
+                )
+                recorder.build_video(hold_last_seconds=10.0)
             except Exception as e:
                 tqdm.write(f"Failed to build timelapse video: {e}")
 
@@ -4398,6 +4679,13 @@ class NN_Trainer:
             "history": history,
             "best_score": best_score,
             "best_step": best_step,
+            "best_active_count": float(best_active_count or 0.0),
+            "best_inactive_count": float(best_inactive_count or 0.0),
+            "best_hard_score": best_hard_score,
+            "best_hard_step": best_hard_step,
+            "best_hard_active_count": float(best_hard_active_count or 0.0),
+            "best_hard_inactive_count": float(best_hard_inactive_count or 0.0),
+            "returned_best_source": "hard" if use_hard_result else "global",
             "best_rho": best_rho,
             "best_seeds": best_seeds,
             "best_pred": best_pred,
@@ -4410,6 +4698,7 @@ class NN_Trainer:
             "seed_points_final": seed_points_final,
             "A_v": A_v,
             "uv_init_list": uv_init_list,
+            "uv_anchor_list": uv_anchor_list,
             "face_tensors": face_tensors,
             "fem_debug_history": self.fem_debug_history,
             "last_fem_debug": self.last_fem_debug,
