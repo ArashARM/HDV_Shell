@@ -10,10 +10,19 @@ import re
 
 
 class TimelapseRecorder:
-    def __init__(self, out_dir="timelapse_frames", video_path="timelapse.mp4", fps=10):
+    def __init__(
+        self,
+        out_dir="timelapse_frames",
+        video_path="timelapse.mp4",
+        fps=10,
+        header_title="",
+        header_subtitle="",
+    ):
         self.out_dir = out_dir
         self.video_path = video_path
         self.fps = fps
+        self.header_title = str(header_title or "")
+        self.header_subtitle = str(header_subtitle or "")
         self.frame_width = 2560
         self.frame_height = 1440
         os.makedirs(out_dir, exist_ok=True)
@@ -91,6 +100,12 @@ class TimelapseRecorder:
         label_map = {
             "iter": "Iteration",
             "vol": "Vol. Fraction",
+            "vol_total": "Tot_VolFrac",
+            "vol_internal": "HVD_VolFrac",
+            "vol_eff": "Eff_VolFrac",
+            "Vol_total": "Tot_VolFrac",
+            "Vol_internal": "HVD_VolFrac",
+            "Vol_eff": "Eff_VolFrac",
             "W": "Mean Width",
             "bw": "Bw",
             "Δrho": "Delta Rho",
@@ -114,6 +129,76 @@ class TimelapseRecorder:
         white = np.full_like(rgb, 255.0)
         out = rgb * alpha + white * (1.0 - alpha)
         return np.clip(out, 0.0, 255.0).astype(np.uint8)
+
+    @staticmethod
+    def _wrap_cv2_text(text, max_width, font, font_scale, thickness):
+        words = str(text or "").split()
+        lines = []
+        current = ""
+        for word in words:
+            candidate = word if not current else f"{current} {word}"
+            text_width = cv2.getTextSize(candidate, font, font_scale, thickness)[0][0]
+            if current and text_width > max_width:
+                lines.append(current)
+                current = word
+            else:
+                current = candidate
+        if current:
+            lines.append(current)
+        return lines or [""]
+
+    def _draw_header(self, canvas, highlight_best=False):
+        if not self.header_title and not self.header_subtitle:
+            return 0
+
+        header_h = 132
+        bg = (230, 247, 234) if highlight_best else (244, 247, 251)
+        accent = (34, 139, 34) if highlight_best else (37, 99, 235)
+        text = (17, 24, 39)
+        muted = (75, 85, 99)
+
+        cv2.rectangle(canvas, (0, 0), (self.frame_width, header_h), bg, thickness=-1)
+        cv2.rectangle(canvas, (0, header_h - 4), (self.frame_width, header_h), accent, thickness=-1)
+
+        x = 44
+        title_y = 48
+        subtitle_y = 88
+        font = cv2.FONT_HERSHEY_SIMPLEX
+
+        if self.header_title:
+            cv2.putText(
+                canvas,
+                self.header_title,
+                (x, title_y),
+                font,
+                1.0,
+                text,
+                2,
+                cv2.LINE_AA,
+            )
+
+        if self.header_subtitle:
+            max_width = self.frame_width - (2 * x)
+            lines = self._wrap_cv2_text(
+                self.header_subtitle,
+                max_width=max_width,
+                font=font,
+                font_scale=0.62,
+                thickness=1,
+            )
+            for line_idx, line in enumerate(lines[:2]):
+                cv2.putText(
+                    canvas,
+                    line,
+                    (x, subtitle_y + line_idx * 26),
+                    font,
+                    0.62,
+                    muted,
+                    1,
+                    cv2.LINE_AA,
+                )
+
+        return header_h
 
     def _make_loss_chart(
         self,
@@ -444,16 +529,21 @@ class TimelapseRecorder:
                 thickness=8,
             )
 
+        header_h = self._draw_header(canvas, highlight_best=highlight_best)
+        bottom_pad = 28
+        content_top = header_h + (24 if header_h else 20)
+        content_h = max(self.frame_height - content_top - bottom_pad, 1)
+
         scale = min(
             (self.frame_width - 40) / combined.shape[1],
-            (self.frame_height - 40) / combined.shape[0],
+            content_h / combined.shape[0],
         )
         scale = max(scale, 1e-6)
         new_w = max(1, int(round(combined.shape[1] * scale)))
         new_h = max(1, int(round(combined.shape[0] * scale)))
         combined = cv2.resize(combined, (new_w, new_h), interpolation=cv2.INTER_AREA)
 
-        y0 = (self.frame_height - new_h) // 2
+        y0 = content_top + max((content_h - new_h) // 2, 0)
         x0 = (self.frame_width - new_w) // 2
         canvas[y0:y0 + new_h, x0:x0 + new_w] = combined
 

@@ -23,6 +23,7 @@ import matplotlib.pyplot as plt
 @dataclass
 class TrainingConfig:
     seed_number: int = 15
+    LoadingCasee: str = "Unspecified loading case"
     use_Metric_anisotropy: bool = True
     fixed_height: float | None = None
     target_volfrac: float = 0.5
@@ -45,6 +46,7 @@ class TrainingConfig:
 
     boundary_attach_width_min: float = 0.005
     boundary_attach_width_max: float = 0.10
+    duplicate_merge_sigma:float = 0.05
 
     boundary_attach_alpha_min: float = 0.05
     boundary_attach_alpha_max: float = 1.00
@@ -52,7 +54,6 @@ class TrainingConfig:
     boundary_attach_beta_min: float = 0.003
     boundary_attach_beta_max: float = 0.05
 
-    gate_sharpen_gamma: float = 4.0
     predict_tau: bool = None
 
     w_min: float = 0.005
@@ -117,6 +118,10 @@ class TrainingConfig:
     seed_repair_iters: int = 8
     project_seed_spacing_each_step: bool = True
     seed_projection_iters: int = 4
+    allow_seed_outside_domain: bool = False
+    seed_domain_margin: float = 0.25
+    respawn_inactive_seeds_on_collapse: bool = True
+    seed_respawn_margin: float = 0.04
 
     lr_seed_refine: float = 1e-1
     lr_delta_head: float = 2e-4
@@ -129,42 +134,11 @@ class TrainingConfig:
     early_stop_start: int = 300
     patience: int = 300
     min_delta: float = 1e-4
-    best_score_vol_tolerance: float = 0.04
-    best_score_vol_penalty: float = 100.0
 
-    use_gating: bool = True
-    lr_gate_head: float = 5e-5
-    gate_active_threshold: float = 0.22
-    gate_eps: float = 1e-8
-    gate_bias_init: float | None = None
-    Gating_binirize_sharpness: float = 12.0
-    Gating_binirize_limit: float = 0.45
-    use_hard_gate_mask: bool = True
-    hard_gate_start_frac: float = 0.85
-    hard_gate_allow_early_stability: bool = True
-    hard_gate_stability_patience: int = 180
-    hard_gate_min_frac_for_stability: float = 0.25
+    min_active_seeds: int | None = None
     hard_refine_start_frac: float = 0.85
-    freeze_gate_head_during_hard_refine: bool = True
     freeze_tau_head_during_hard_refine: bool = True
-    disable_gate_count_loss_during_hard_refine: bool = True
-    disable_gate_binary_loss_during_hard_refine: bool = True
-    disable_gate_usage_loss_during_hard_refine: bool = True
-    disable_gate_weak_contrib_during_hard_refine: bool = True
     hard_refine_width_multiplier: float = 2.0
-
-    lam_gate_count: float = 0.2
-    gate_target_count: float = 14.0
-    lam_gate_binary: float = 0.5
-    lam_gate_usage: float = 2.0
-    lam_gate_weak_contrib: float = 1.0
-    weak_contrib_power: float = 2.0
-    weak_contrib_threshold: float | None = None
-    gate_binary_warmup_frac: float = 0.10
-    gate_warmup_frac: float = 0.08
-    gate_binary_warmup_steps: int | None = None
-    gate_warmup_steps: int | None = None
-    prefer_hard_gate_result: bool = True
 
     predict_boundary_params: bool = True
 
@@ -207,12 +181,6 @@ class TrainingConfig:
 
         # Backward compatibility: allow legacy absolute-step warmup settings,
         # but prefer the new fraction-based controls.
-        if self.num_steps > 0:
-            if self.gate_warmup_steps is not None:
-                self.gate_warmup_frac = float(self.gate_warmup_steps) / float(self.num_steps)
-            if self.gate_binary_warmup_steps is not None:
-                self.gate_binary_warmup_frac = float(self.gate_binary_warmup_steps) / float(self.num_steps)
-
         if self.tau <= 0.0:
             raise ValueError(f"tau must be > 0, got {self.tau}")
         if self.tau_pred_start <= 0.0:
@@ -282,6 +250,13 @@ class TrainingConfig:
             raise ValueError(f"seed_repair_iters must be >= 0, got {self.seed_repair_iters}")
         if self.seed_projection_iters < 0:
             raise ValueError(f"seed_projection_iters must be >= 0, got {self.seed_projection_iters}")
+        if self.seed_domain_margin < 0.0:
+            raise ValueError(f"seed_domain_margin must be >= 0, got {self.seed_domain_margin}")
+        if not (0.0 <= self.seed_respawn_margin < 0.5):
+            raise ValueError(
+                "seed_respawn_margin must be in [0, 0.5), "
+                f"got {self.seed_respawn_margin}"
+            )
         if self.seed_offset_scale_start is not None and self.seed_offset_scale_start <= 0.0:
             raise ValueError(
                 f"seed_offset_scale_start must be > 0, got {self.seed_offset_scale_start}"
@@ -295,14 +270,8 @@ class TrainingConfig:
                 "seed_offset_scale_ramp_frac must be in (0,1], "
                 f"got {self.seed_offset_scale_ramp_frac}"
             )
-        if not (0.0 <= self.gate_warmup_frac <= 1.0):
-            raise ValueError(
-                f"gate_warmup_frac must be in [0,1], got {self.gate_warmup_frac}"
-            )
-        if not (0.0 <= self.gate_binary_warmup_frac <= 1.0):
-            raise ValueError(
-                f"gate_binary_warmup_frac must be in [0,1], got {self.gate_binary_warmup_frac}"
-            )
+        if self.min_active_seeds is not None and self.min_active_seeds < 1:
+            raise ValueError(f"min_active_seeds must be >= 1, got {self.min_active_seeds}")
 
 class RunningNorm:
     def __init__(self, momentum: float = 0.99, eps: float = 1e-12):
@@ -516,34 +485,16 @@ class NN_Trainer:
         self._tb_add_scalar("Metric/AMean", row["a_metric_mean"], step)
         self._tb_add_scalar("Train/Tau", row["tau"], step)
 
-        self._tb_add_scalar("gate/selected_count_total", row["selected_count_total"], step)
-        self._tb_add_scalar("gate/selected_count_mean", row["selected_count_mean"], step)
-        self._tb_add_scalar("gate/selected_frac_mean", row["selected_frac_mean"], step)
-        self._tb_add_scalar("gate/active_count_total", row["active_count_total"], step)
-        self._tb_add_scalar("gate/active_count_mean", row["active_count_mean"], step)
-        self._tb_add_scalar("gate/active_frac_mean", row["active_frac_mean"], step)
-        self._tb_add_scalar("gate/inactive_count_total", row["inactive_count_total"], step)
-        self._tb_add_scalar("gate/inactive_count_mean", row["inactive_count_mean"], step)
-        self._tb_add_scalar("gate/inactive_frac_mean", row["inactive_frac_mean"], step)
-        self._tb_add_scalar("gate/raw/min", row["gate_raw_min"], step)
-        self._tb_add_scalar("gate/raw/mean", row["gate_raw_mean"], step)
-        self._tb_add_scalar("gate/raw/max", row["gate_raw_max"], step)
-        self._tb_add_scalar("gate/sharp/min", row["gate_sharp_min"], step)
-        self._tb_add_scalar("gate/sharp/mean", row["gate_sharp_mean"], step)
-        self._tb_add_scalar("gate/sharp/max", row["gate_sharp_max"], step)
-        self._tb_add_scalar("gate/decoder/min", row["gate_decoder_min"], step)
-        self._tb_add_scalar("gate/decoder/mean", row["gate_decoder_mean"], step)
-        self._tb_add_scalar("gate/decoder/max", row["gate_decoder_max"], step)
-        self._tb_add_scalar("gate/hard_mask_on", row["hard_gate_mask_on"], step)
-        self._tb_add_scalar("gate/hard_refine_on", row["hard_refine_on"], step)
-        self._tb_add_scalar("Loss/Gate", row["loss_gate"], step)
-        self._tb_add_scalar("gate/lam_eff", row["lam_gate_eff"], step)
-        self._tb_add_scalar("Loss/GateBinary", row["loss_gate_binary"], step)
-        self._tb_add_scalar("gate/lam_binary_eff", row["lam_gate_binary_eff"], step)
-        self._tb_add_scalar("Loss/GateUsage", row["loss_gate_usage"], step)
-        self._tb_add_scalar("gate/lam_usage_eff", row["lam_gate_usage_eff"], step)
-        self._tb_add_scalar("Loss/GateWeakContributor", row["loss_gate_weak_contrib"], step)
-        self._tb_add_scalar("gate/lam_weak_contrib_eff", row["lam_gate_weak_contrib_eff"], step)
+        self._tb_add_scalar("seed_activation/active_count_total", row["active_count_total"], step)
+        self._tb_add_scalar("seed_activation/active_count_mean", row["active_count_mean"], step)
+        self._tb_add_scalar("seed_activation/active_frac_mean", row["active_frac_mean"], step)
+        self._tb_add_scalar("seed_activation/inactive_count_total", row["inactive_count_total"], step)
+        self._tb_add_scalar("seed_activation/inactive_count_mean", row["inactive_count_mean"], step)
+        self._tb_add_scalar("seed_activation/inactive_frac_mean", row["inactive_frac_mean"], step)
+        self._tb_add_scalar("seed_activation/weight_min", row["seed_active_weight_min"], step)
+        self._tb_add_scalar("seed_activation/weight_mean", row["seed_active_weight_mean"], step)
+        self._tb_add_scalar("seed_activation/weight_max", row["seed_active_weight_max"], step)
+        self._tb_add_scalar("seed_activation/hard_refine_on", row["hard_refine_on"], step)
         self._tb_add_scalar("Loss/WidthActive", row["loss_width_active"], step)
         self._tb_add_scalar("Geometry/lam_width_active_eff", row["lam_width_active_eff"], step)
         self._tb_add_scalar("Train/BestHardScore", row["best_hard_score"], step)
@@ -604,31 +555,16 @@ class NN_Trainer:
             if theta_vals: self._tb_add_histogram("Metric/ThetaHist", torch.cat(theta_vals, dim=0), step)
             if a_vals: self._tb_add_histogram("Metric/AHist", torch.cat(a_vals, dim=0), step)
 
-            gate_logit_vals = []
-            gate_raw_vals = []
-            gate_sharp_vals = []
-            gate_decoder_vals = []
+            seed_active_weight_vals = []
             tau_vals = []
             for p in pred_list:
-                if p.get("gate_logits") is not None:
-                    gate_logit_vals.append(p["gate_logits"].reshape(-1))
-                if p.get("gate_probs_raw") is not None:
-                    gate_raw_vals.append(p["gate_probs_raw"].reshape(-1))
-                if p.get("gate_probs_sharp") is not None:
-                    gate_sharp_vals.append(p["gate_probs_sharp"].reshape(-1))
-                if p.get("gate_probs_decoder") is not None:
-                    gate_decoder_vals.append(p["gate_probs_decoder"].reshape(-1))
+                if p.get("seed_active_weights") is not None:
+                    seed_active_weight_vals.append(p["seed_active_weights"].reshape(-1))
                 if p.get("tau") is not None:
                     tau_vals.append(p["tau"].reshape(-1))
 
-            if gate_logit_vals:
-                self._tb_add_histogram("gate/logits", torch.cat(gate_logit_vals, dim=0), step)
-            if gate_raw_vals:
-                self._tb_add_histogram("gate/raw", torch.cat(gate_raw_vals, dim=0), step)
-            if gate_sharp_vals:
-                self._tb_add_histogram("gate/sharp", torch.cat(gate_sharp_vals, dim=0), step)
-            if gate_decoder_vals:
-                self._tb_add_histogram("gate/decoder", torch.cat(gate_decoder_vals, dim=0), step)
+            if seed_active_weight_vals:
+                self._tb_add_histogram("seed_activation/weights", torch.cat(seed_active_weight_vals, dim=0), step)
             if tau_vals:
                 self._tb_add_histogram("Train/TauHist", torch.cat(tau_vals, dim=0), step)
 
@@ -744,6 +680,7 @@ class NN_Trainer:
         iters: int = 8,
         eps_uv: float = 1e-4,
         detach: bool = True,
+        clamp_to_domain: bool = True,
     ) -> list[torch.Tensor]:
         repaired = [(s.detach() if detach else s).clone() for s in seeds_list]
         if min_dist <= 0.0 or iters <= 0:
@@ -774,88 +711,79 @@ class NN_Trainer:
                         step = 0.5 * shortfall * direction
                         seeds[i] = seeds[i] + step
                         seeds[j] = seeds[j] - step
-                seeds.clamp_(float(eps_uv), 1.0 - float(eps_uv))
+                if clamp_to_domain:
+                    seeds.clamp_(float(eps_uv), 1.0 - float(eps_uv))
         return repaired
 
     @staticmethod
-    def gate_target_loss(
-        gates: torch.Tensor | None,
-        target_mean: float,
-    ):
-        if gates is None:
-            return None
-        target = torch.as_tensor(target_mean, device=gates.device, dtype=gates.dtype)
-        return (gates.mean() - target) ** 2
-    
-    @staticmethod
-    def gate_count_loss(gates: torch.Tensor | None, target_count: float):
-        if gates is None:
-            return None
-        target = torch.as_tensor(target_count, device=gates.device, dtype=gates.dtype)
-        return (gates.sum() - target) ** 2
-    @staticmethod
-    def gate_binary_loss(gates: torch.Tensor | None):
-        if gates is None:
-            return None
-        one = torch.ones((), device=gates.device, dtype=gates.dtype)
-        return (gates * (one - gates)).mean()
+    def respawn_inactive_seed_anchors(
+        seeds_list: list[torch.Tensor],
+        pred_list: list[dict] | None,
+        margin: float = 0.04,
+        grid_res: int = 17,
+    ) -> tuple[list[torch.Tensor], int]:
+        repaired = [s.detach().clone() for s in seeds_list]
+        if pred_list is None:
+            return repaired, 0
 
-    @staticmethod
-    def gate_usage_targets(
-        usage: torch.Tensor | None,
-        target_count: float,
-    ) -> torch.Tensor | None:
-        if usage is None:
-            return None
-        if usage.ndim != 1:
-            raise ValueError(f"usage must be 1D, got shape {tuple(usage.shape)}")
+        margin = min(max(float(margin), 0.0), 0.49)
+        grid_res = max(int(grid_res), 3)
+        respawned = 0
 
-        s = int(usage.shape[0])
-        k = max(1, min(int(round(float(target_count))), s))
-        topk = torch.topk(usage.detach(), k=k, largest=True, sorted=False).indices
-        target = torch.zeros_like(usage)
-        target[topk] = 1.0
-        return target
+        for face_idx, seeds in enumerate(repaired):
+            if face_idx >= len(pred_list):
+                continue
+            active_mask = pred_list[face_idx].get("seed_active_mask", None)
+            if active_mask is None:
+                continue
 
-    @staticmethod
-    def gate_usage_loss(
-        gates: torch.Tensor | None,
-        usage: torch.Tensor | None,
-        target_count: float,
-        eps: float = 1e-8,
-    ) -> torch.Tensor | None:
-        if gates is None or usage is None:
-            return None
-        target = NN_Trainer.gate_usage_targets(usage=usage, target_count=target_count)
-        gates_clamped = gates.clamp(eps, 1.0 - eps)
-        return torch.nn.functional.binary_cross_entropy(gates_clamped, target)
+            active_mask = active_mask.detach().to(device=seeds.device, dtype=torch.bool).reshape(-1)
+            if active_mask.numel() != seeds.shape[0]:
+                continue
 
-    @staticmethod
-    def weak_contributor_loss(
-        gates: torch.Tensor | None,
-        usage: torch.Tensor | None,
-        threshold: float,
-        power: float = 2.0,
-        eps: float = 1e-8,
-    ) -> torch.Tensor | None:
-        if gates is None or usage is None:
-            return None
-        if gates.ndim != 1 or usage.ndim != 1 or gates.shape != usage.shape:
-            raise ValueError(
-                f"gates and usage must be 1D with same shape, got {tuple(gates.shape)} and {tuple(usage.shape)}"
+            inactive_idx = torch.nonzero(~active_mask, as_tuple=False).flatten()
+            if inactive_idx.numel() == 0:
+                continue
+
+            coords = torch.linspace(
+                margin,
+                1.0 - margin,
+                grid_res,
+                device=seeds.device,
+                dtype=seeds.dtype,
             )
+            uu, vv = torch.meshgrid(coords, coords, indexing="ij")
+            candidates = torch.stack((uu.reshape(-1), vv.reshape(-1)), dim=-1)
 
-        gates = gates.clamp(0.0, 1.0)
-        usage = usage.clamp_min(0.0)
-        shortfall = torch.relu(torch.as_tensor(threshold, device=gates.device, dtype=gates.dtype) - gates)
-        penalty = shortfall.pow(float(power))
-        return (usage * penalty).sum() / (usage.sum() + eps)
+            keep_points = seeds[active_mask]
+            for local_rank, seed_idx_t in enumerate(inactive_idx):
+                if keep_points.numel() == 0:
+                    chosen = candidates[(local_rank * 37) % candidates.shape[0]]
+                else:
+                    d = torch.cdist(candidates, keep_points)
+                    min_d = d.min(dim=1).values
+                    # Tiny deterministic bias prevents every respawn from choosing
+                    # the same symmetric point when distances tie.
+                    bias = torch.linspace(
+                        0.0,
+                        1e-6,
+                        candidates.shape[0],
+                        device=seeds.device,
+                        dtype=seeds.dtype,
+                    )
+                    chosen = candidates[torch.argmax(min_d + bias)]
+                seed_idx = int(seed_idx_t.item())
+                seeds[seed_idx] = chosen
+                keep_points = torch.cat([keep_points, chosen.reshape(1, 2)], dim=0)
+                respawned += 1
+
+        return repaired, respawned
 
     @staticmethod
     def active_width_loss(
         w_raw: torch.Tensor,
         seeds: torch.Tensor,
-        gates_decoder: torch.Tensor | None,
+        seed_active_weights: torch.Tensor | None,
         width_target_frac: float,
         width_target_sparse_boost: float,
         width_target_frac_max: float,
@@ -874,11 +802,11 @@ class NN_Trainer:
             return torch.zeros((), dtype=w_raw.dtype, device=w_raw.device)
 
         tri_mask = torch.triu(torch.ones((s, s), dtype=torch.bool, device=w_raw.device), diagonal=1)
-        if gates_decoder is None:
+        if seed_active_weights is None:
             target_frac_eff = float(width_target_frac)
             active_pair = tri_mask
         else:
-            g = gates_decoder.to(device=w_raw.device, dtype=w_raw.dtype).reshape(-1)
+            g = seed_active_weights.to(device=w_raw.device, dtype=w_raw.dtype).reshape(-1)
             active_seed_mask = g >= float(active_threshold)
             if not bool(active_seed_mask.any()):
                 active_seed_mask = g > eps
@@ -925,6 +853,33 @@ class NN_Trainer:
             return float(cfg.tau_pred_start)
         return float(cfg.tau)
 
+    def _timelapse_optimized_parameter_summary(self) -> str:
+        cfg = self.cfg
+        params = [
+            f"seed positions ({int(cfg.seed_number)})",
+            "pairwise width" if not cfg.freeze_w else f"width fixed={float(cfg.w_const):.6g}",
+        ]
+
+        if cfg.fixed_height is None:
+            params.append("height")
+        else:
+            params.append(f"height fixed={float(cfg.fixed_height):.6g}")
+
+        if cfg.predict_tau:
+            params.append("tau")
+        else:
+            params.append(f"tau fixed/annealed={self._fallback_tau_value():.6g}")
+
+        if cfg.predict_boundary_params:
+            params.append("boundary width/alpha/beta")
+        elif cfg.use_boundary_attachment:
+            params.append("boundary attachment fixed")
+
+        if cfg.use_Metric_anisotropy:
+            params.append("metric anisotropy theta/a")
+
+        return "Optimized: " + ", ".join(params)
+
     @staticmethod
     def _clone_pred_list(pred_list: list[dict]) -> list[dict]:
         return [
@@ -933,10 +888,9 @@ class NN_Trainer:
                 "seeds_raw": p["seeds_raw"].detach().clone(),
                 "w_raw": p["w_raw"].detach().clone(),
                 "h_raw": None if p["h_raw"] is None else p["h_raw"].detach().clone(),
-                "gate_logits": None if p.get("gate_logits") is None else p["gate_logits"].detach().clone(),
-                "gate_probs_raw": None if p.get("gate_probs_raw") is None else p["gate_probs_raw"].detach().clone(),
-                "gate_probs_sharp": None if p.get("gate_probs_sharp") is None else p["gate_probs_sharp"].detach().clone(),
-                "gate_probs_decoder": None if p.get("gate_probs_decoder") is None else p["gate_probs_decoder"].detach().clone(),
+                "seed_active_weights": p["seed_active_weights"].detach().clone(),
+                "seed_active_mask": p["seed_active_mask"].detach().clone(),
+                "inactive_seed_indices": p["inactive_seed_indices"].detach().clone(),
                 "theta": None if p["theta"] is None else p["theta"].detach().clone(),
                 "a_raw": None if p["a_raw"] is None else p["a_raw"].detach().clone(),
                 "tau": None if p.get("tau") is None else p["tau"].detach().clone(),
@@ -970,7 +924,7 @@ class NN_Trainer:
     @staticmethod
     def seed_repulsion_term(
         seeds: torch.Tensor,
-        gates: torch.Tensor | None = None,
+        seed_active_weights: torch.Tensor | None = None,
         sigma: float = 0.08,
         min_dist: float | None = None,
         eps: float = 1e-12,
@@ -991,10 +945,10 @@ class NN_Trainer:
         else:
             penalty = torch.exp(-d.pow(2) / (sigma**2 + eps))
 
-        if gates is None:
+        if seed_active_weights is None:
             return penalty[pair_mask].max()
 
-        g = gates.view(-1).clamp(0.0, 1.0)
+        g = seed_active_weights.view(-1).clamp(0.0, 1.0)
         G = g[:, None] * g[None, :]
         active_pair = pair_mask & (G > eps)
         if not bool(active_pair.any()):
@@ -1005,7 +959,7 @@ class NN_Trainer:
     def boundary_repulsion_term(
         seeds: torch.Tensor,
         boundary_uv: torch.Tensor | None,
-        gates: torch.Tensor | None = None,
+        seed_active_weights: torch.Tensor | None = None,
         margin: float = 0.05,
         eps: float = 1e-12,
     ) -> torch.Tensor:
@@ -1015,10 +969,10 @@ class NN_Trainer:
         dmin = torch.cdist(seeds, boundary_uv).amin(dim=1)
         penalty = torch.exp(-dmin / (margin + eps))
 
-        if gates is None:
+        if seed_active_weights is None:
             return penalty.mean()
 
-        g = gates.view(-1)
+        g = seed_active_weights.view(-1)
         penalty =(g * penalty).sum() / (g.sum() + eps)
         penalty =torch.zeros((), dtype=seeds.dtype, device=seeds.device) 
         return penalty
@@ -1249,7 +1203,7 @@ class NN_Trainer:
         seeds: torch.Tensor,
         boundary_uv: torch.Tensor | None = None,
         fiber_surface: torch.Tensor | None = None,
-        gates: torch.Tensor | None = None,
+        seed_active_weights: torch.Tensor | None = None,
         w_vol: float = 1.0,
         w_seed: float = 1.0,
         w_boundary: float = 1.0,
@@ -1277,7 +1231,7 @@ class NN_Trainer:
         if w_seed != 0.0:
             loss_seed = self.seed_repulsion_term(
                 seeds=seeds,
-                gates=gates,
+                seed_active_weights=seed_active_weights,
                 sigma=sigma,
                 eps=eps,
             )
@@ -1288,7 +1242,7 @@ class NN_Trainer:
             loss_boundary = self.boundary_repulsion_term(
                 seeds=seeds,
                 boundary_uv=boundary_uv,
-                gates=gates,
+                seed_active_weights=seed_active_weights,
                 margin=margin,
                 eps=eps,
             )
@@ -1355,12 +1309,6 @@ class NN_Trainer:
         u_periodic,
         v_periodic,
     ):
-        gate_bias_init = self.cfg.gate_bias_init
-        if gate_bias_init is None:
-            target_frac = float(self.cfg.gate_target_count) / max(int(seed_number), 1)
-            target_frac = min(max(target_frac, 1e-4), 1.0 - 1e-4)
-            gate_bias_init = math.log(target_frac / (1.0 - target_frac))
-
         face_u_periodic = torch.tensor([bool(u_periodic)], dtype=torch.bool, device=device)
         face_v_periodic = torch.tensor([bool(v_periodic)], dtype=torch.bool, device=device)
         seed_face_id = torch.zeros(seed_number, dtype=torch.long, device=device)
@@ -1374,6 +1322,7 @@ class NN_Trainer:
             face_v_periodic=face_v_periodic,
             w_min=self.cfg.w_min,
             w_max_ratio=self.cfg.w_max_ratio,
+            duplicate_merge_sigma=self.cfg.duplicate_merge_sigma,
             raw_temp=self.cfg.decoder_raw_temp,
             fixed_height=self.cfg.fixed_height,
 
@@ -1400,7 +1349,6 @@ class NN_Trainer:
             tau_pred_min=self.cfg.tau_pred_min,
             tau_pred_max=self.cfg.tau_pred_max,
             predict_height=(self.cfg.fixed_height is None),
-            use_gating=self.cfg.use_gating,
             freeze_w=self.cfg.freeze_w,
             w_const=self.cfg.w_const,   
             w_head_bias_init=(
@@ -1412,7 +1360,8 @@ class NN_Trainer:
                 if self.cfg.w_head_bias_init is None
                 else float(self.cfg.w_head_bias_init)
             ),
-            gate_bias_init=gate_bias_init,
+            allow_seed_outside_domain=self.cfg.allow_seed_outside_domain,
+            seed_domain_margin=self.cfg.seed_domain_margin,
         ).to(device)
 
         return decoder, ppnet
@@ -1440,8 +1389,12 @@ class NN_Trainer:
         param_groups = []
 
         for ppnet in ppnets:
+            seed_refine_params = list(ppnet.seed_refine.parameters())
+            if getattr(ppnet, "seed_id_embed", None) is not None:
+                seed_refine_params.extend(ppnet.seed_id_embed.parameters())
+
             param_groups.extend([
-                {"params": ppnet.seed_refine.parameters(), "lr": cfg.lr_seed_refine},
+                {"params": seed_refine_params, "lr": cfg.lr_seed_refine},
                 {"params": ppnet.delta_head.parameters(), "lr": cfg.lr_delta_head},
                 {"params": ppnet.mlp.parameters(), "lr": cfg.lr_mlp},
             ])
@@ -1451,9 +1404,6 @@ class NN_Trainer:
 
             if (self.cfg.fixed_height is None) and hasattr(ppnet, "h_head"):
                 param_groups.append({"params": ppnet.h_head.parameters(), "lr": cfg.lr_h_head})
-
-            if hasattr(ppnet, "gate_head"):
-                param_groups.append({"params": ppnet.gate_head.parameters(), "lr": cfg.lr_gate_head})
 
             if cfg.use_Metric_anisotropy:
                 if hasattr(ppnet, "theta_head"):
@@ -1878,7 +1828,6 @@ class NN_Trainer:
             boundary_width_raw=pred.get("boundary_width_raw", None),
             boundary_alpha_raw=pred.get("boundary_alpha_raw", None),
             boundary_beta_raw=pred.get("boundary_beta_raw", None),
-            seed_gates=pred.get("gate_probs_decoder", None),
         )
 
         return {
@@ -2183,7 +2132,7 @@ class NN_Trainer:
                 fiber_vectors = fiber_vectors[::stride]
                 fiber_rho = fiber_rho[::stride]
 
-        seed_vis = self._seed_points_xyz_and_gates_all_faces(
+        seed_vis = self._seed_points_xyz_and_activity_all_faces(
             seeds_list=seeds_list,
             pred_list=pred_list,
             face_tensors=self.current_face_tensors,
@@ -2193,6 +2142,28 @@ class NN_Trainer:
         seed_point_size = max(6.0, 0.006 * max(diag, 1.0) * 100.0)
         show_seed_points = True
         show_axes_widget = True
+
+        first_face_density_img = None
+        if render_cache:
+            first_cache = render_cache[0]
+            first_face_id = first_cache["face_id"]
+            first_out = self.evaluate_cached_face_fields(
+                first_cache,
+                dec_by_face_id[first_face_id],
+                pred_by_face_id[first_face_id],
+            )
+            first_seed_idx = 0
+            for idx, ft in enumerate(self.current_face_tensors):
+                if ft["face_id"] == first_face_id:
+                    first_seed_idx = idx
+                    break
+            first_face_density_img = self._render_first_face_density_2d(
+                cache_i=first_cache,
+                out_i=first_out,
+                seeds_i=seeds_list[first_seed_idx],
+                pred_i=pred_by_face_id[first_face_id],
+                window_size=(820, 820),
+            )
 
         def make_plotter(title, mode, window_size):
             pl = pv.Plotter(off_screen=True, window_size=window_size)
@@ -2284,13 +2255,12 @@ class NN_Trainer:
             return pl
 
         top_specs = [
-            ("Material Distribution | Front View", "density", "xz"),
-            ("Material Distribution | Side View", "density", "yz"),
-            ("Material Distribution | Top View", "density", "xy"),
+            ("3D Material Distribution | Front View", "density", "xz"),
+            ("3D Material Distribution | Side View", "density", "yz"),
+            ("3D Material Distribution | Top View", "density", "xy"),
         ]
         bottom_specs = [
-            ("Material Distribution | Perspective View", "density", "iso"),
-            (f"Hollowed Model | Perspective View | thr={thr:.2f}", "solid", "iso"),
+            ("3D Material Distribution | Perspective View", "density", "iso"),
         ]
 
         top_imgs = []
@@ -2306,6 +2276,15 @@ class NN_Trainer:
             img = self._render_offscreen_plotter(pl, view)
             bottom_imgs.append(self._add_panel_border(self._add_image_title(img, title)))
             pl.close()
+        if first_face_density_img is not None:
+            bottom_imgs.append(
+                self._add_panel_border(
+                    self._add_image_title(
+                        first_face_density_img,
+                        f"UV Domain Density Distribution"
+                        )
+                )
+            )
 
         col_gap = 22
         row_gap = 28
@@ -2323,164 +2302,103 @@ class NN_Trainer:
             value=(255, 255, 255),
         )
         return cad_panel
-    def _gate_activity_stats(
-    self,
-    gate_probs: torch.Tensor | None,
-    threshold: float,
-) -> dict[str, float]:
-        if gate_probs is None:
-            return {
-                "active_count": 0.0,
-                "active_frac": 0.0,
-                "gate_min": 0.0,
-                "gate_mean": 0.0,
-                "gate_max": 0.0,
-            }
 
-        g = gate_probs.detach()
-        active = (g > threshold)
-
-        return {
-            "active_count": float(active.sum().item()),
-            "active_frac": float(active.float().mean().item()),
-            "gate_min": float(g.min().item()),
-            "gate_mean": float(g.mean().item()),
-            "gate_max": float(g.max().item()),
-        }
-
-    @staticmethod
-    def _gate_role_stats(
-        gate_probs_raw: torch.Tensor | None,
-        gate_probs_struct: torch.Tensor | None,
-        gate_probs_decoder: torch.Tensor | None,
-        selected_threshold: float,
-        eps: float,
-        seed_count: int | None = None,
-    ) -> dict[str, float]:
-        if gate_probs_decoder is None and gate_probs_raw is None:
-            total = max(int(seed_count or 0), 1)
-            active_count = float(seed_count or 0)
-            active_frac = 0.0 if total <= 0 else active_count / float(total)
-            return {
-                "selected_count": active_count,
-                "selected_frac": active_frac,
-                "participating_count": active_count,
-                "participating_frac": active_frac,
-                "inactive_count": 0.0,
-                "inactive_frac": 0.0,
-            }
-
-        g_dec = gate_probs_decoder if gate_probs_decoder is not None else gate_probs_struct
-        g_sel = gate_probs_struct if gate_probs_struct is not None else gate_probs_raw
-        if g_dec is None or g_sel is None:
-            raise ValueError("gate role stats require at least one gate tensor")
-
-        g_dec = g_dec.detach()
-        g_sel = g_sel.detach()
-        participating = g_dec > float(eps)
-        selected = (g_sel > float(selected_threshold)) & participating
-        inactive = ~participating
-        total = max(int(g_dec.numel()), 1)
-
-        return {
-            "selected_count": float(selected.sum().item()),
-            "selected_frac": float(selected.sum().item()) / float(total),
-            "participating_count": float(participating.sum().item()),
-            "participating_frac": float(participating.sum().item()) / float(total),
-            "inactive_count": float(inactive.sum().item()),
-            "inactive_frac": float(inactive.sum().item()) / float(total),
-        }
-
-    @staticmethod
-    def _gate_stats(gates: torch.Tensor | None) -> dict[str, float]:
-        if gates is None:
-            return {
-                "min": 1.0,
-                "mean": 1.0,
-                "max": 1.0,
-            }
-
-        g = gates.detach()
-        return {
-            "min": float(g.min().item()),
-            "mean": float(g.mean().item()),
-            "max": float(g.max().item()),
-        }
-
-    def _use_hard_gate_mask(
+    def _render_first_face_density_2d(
         self,
-        step: int,
-        steps_since_improve: int,
-        gate_raw_mean: float | None = None,
-        gate_raw_min: float | None = None,
-        gate_raw_max: float | None = None,
-    ) -> bool:
-        cfg = self.cfg
-        if not getattr(cfg, "use_hard_gate_mask", False):
-            return False
+        cache_i,
+        out_i,
+        seeds_i,
+        pred_i,
+        window_size=(820, 820),
+    ):
+        width, height = int(window_size[0]), int(window_size[1])
+        uv = cache_i["uv_dense"].detach().cpu().numpy().astype(np.float64)
+        rho = out_i["rho_dense"].detach().cpu().numpy().astype(np.float64)
+        faces = cache_i["faces_ijk"].detach().cpu().numpy().astype(np.int64)
+        seeds = seeds_i.detach().cpu().numpy().astype(np.float64)
 
-        start_step = int(round(float(cfg.hard_gate_start_frac) * float(cfg.num_steps)))
-        if step >= start_step:
-            return True
+        fig = plt.figure(figsize=(width / 100.0, height / 100.0), dpi=100, facecolor="white")
+        ax = fig.add_axes([0.08, 0.08, 0.78, 0.84])
 
-        if not getattr(cfg, "hard_gate_allow_early_stability", True):
-            return False
+        if faces.size > 0:
+            tpc = ax.tripcolor(
+                uv[:, 0],
+                uv[:, 1],
+                faces,
+                rho,
+                shading="gouraud",
+                cmap="viridis",
+                vmin=0.0,
+                vmax=max(1.0, float(np.nanquantile(rho, 0.995)) if rho.size else 1.0),
+            )
+        else:
+            tpc = ax.scatter(
+                uv[:, 0],
+                uv[:, 1],
+                c=rho,
+                s=10,
+                cmap="viridis",
+                vmin=0.0,
+                vmax=max(1.0, float(np.nanquantile(rho, 0.995)) if rho.size else 1.0),
+                linewidths=0,
+            )
 
-        min_step = int(round(float(cfg.hard_gate_min_frac_for_stability) * float(cfg.num_steps)))
-        if step < min_step:
-            return False
+        active_values = pred_i.get("seed_active_mask", None)
+        if active_values is not None:
+            active = active_values.detach().cpu().numpy().reshape(-1).astype(bool)
+        else:
+            active = np.ones((seeds.shape[0],), dtype=bool)
 
-        if steps_since_improve < int(cfg.hard_gate_stability_patience):
-            return False
+        if seeds.shape[0] > 0:
+            if np.any(~active):
+                ax.scatter(
+                    seeds[~active, 0],
+                    seeds[~active, 1],
+                    s=72,
+                    c="#6b7280",
+                    edgecolors="white",
+                    linewidths=1.4,
+                    alpha=0.55,
+                    zorder=5,
+                )
+            if np.any(active):
+                ax.scatter(
+                    seeds[active, 0],
+                    seeds[active, 1],
+                    s=92,
+                    c="#ef4444",
+                    edgecolors="white",
+                    linewidths=1.6,
+                    zorder=6,
+                )
 
-        if gate_raw_mean is None or gate_raw_min is None or gate_raw_max is None:
-            return False
+        ax.set_xlim(float(np.nanmin(uv[:, 0])), float(np.nanmax(uv[:, 0])))
+        ax.set_ylim(float(np.nanmin(uv[:, 1])), float(np.nanmax(uv[:, 1])))
+        ax.set_aspect("equal", adjustable="box")
+        ax.set_xlabel("u", fontsize=11)
+        ax.set_ylabel("v", fontsize=11)
+        ax.tick_params(labelsize=9, colors="#374151")
+        ax.grid(color="white", linewidth=0.6, alpha=0.35)
+        for spine in ax.spines.values():
+            spine.set_color("#9ca3af")
 
-        target_frac = float(cfg.gate_target_count) / max(int(cfg.seed_number), 1)
-        target_frac = min(max(target_frac, 0.05), 0.95)
-        mean_close = abs(float(gate_raw_mean) - target_frac) <= 0.08
-        threshold = float(cfg.gate_active_threshold)
-        spread_ready = float(gate_raw_min) < (threshold - 0.06) and float(gate_raw_max) > (threshold + 0.06)
-        return mean_close and spread_ready
+        cax = fig.add_axes([0.89, 0.12, 0.025, 0.76])
+        cb = fig.colorbar(tpc, cax=cax)
+        cb.set_label("rho", fontsize=10)
+        cb.ax.tick_params(labelsize=9, colors="#374151")
 
-    def _use_hard_refine_phase(
-        self,
-        step: int,
-        use_hard_gate_mask: bool,
-    ) -> bool:
-        if not use_hard_gate_mask:
-            return False
-        start_step = int(round(float(self.cfg.hard_refine_start_frac) * float(self.cfg.num_steps)))
-        return step >= start_step
+        fig.canvas.draw()
+        img = np.frombuffer(fig.canvas.buffer_rgba(), dtype=np.uint8)
+        img = img.reshape(fig.canvas.get_width_height()[::-1] + (4,))
+        img = img[..., :3].copy()
+        plt.close(fig)
+        return img
 
-    def _decoder_gate_values(
-        self,
-        gate_probs_raw: torch.Tensor | None,
-        gates_struct: torch.Tensor | None,
-        use_hard_gate_mask: bool,
-        threshold: float,
-    ) -> torch.Tensor | None:
-        if gate_probs_raw is None:
-            return None
-
-        if not use_hard_gate_mask:
-            return gates_struct if gates_struct is not None else gate_probs_raw
-
-        source = gates_struct if gates_struct is not None else gate_probs_raw
-        active = source >= threshold
-        if not bool(active.any()):
-            active = torch.zeros_like(active, dtype=torch.bool)
-            active[torch.argmax(source)] = True
-
-        return active.to(dtype=gate_probs_raw.dtype)
-
-    def _seed_points_xyz_and_gates_all_faces(self, seeds_list, pred_list, face_tensors):
+    def _seed_points_xyz_and_activity_all_faces(self, seeds_list, pred_list, face_tensors):
         xyz_active = []
         xyz_inactive = []
-        gate_active = []
-        gate_inactive = []
-
-        eps = float(self.cfg.gate_eps)
+        active_weight = []
+        inactive_weight = []
 
         for seeds, pred, ft in zip(seeds_list, pred_list, face_tensors):
             xyz_i = self.generator.seeds_uv_to_xyz_nearest(
@@ -2489,15 +2407,20 @@ class NN_Trainer:
                 ft["points_xyz"],
             )
 
-            gates_raw_i = pred.get("gate_probs_raw", None)
-            gates_dec_i = pred.get("gate_probs_decoder", None)
+            active_mask_i = pred.get("seed_active_mask", None)
+            active_weights_i = pred.get("seed_active_weights", None)
 
-            if gates_dec_i is None and gates_raw_i is None:
+            if active_mask_i is None:
                 xyz_active.append(xyz_i)
                 continue
 
-            g_dec = gates_dec_i.detach().cpu() if gates_dec_i is not None else gates_raw_i.detach().cpu()
-            participating_mask = (g_dec > eps).cpu().numpy()
+            active_mask = active_mask_i.detach().cpu().numpy().astype(bool)
+            weights = (
+                active_weights_i.detach().cpu().numpy()
+                if active_weights_i is not None
+                else active_mask.astype(float)
+            )
+            participating_mask = active_mask
             inactive_mask = ~participating_mask
 
             xyz_i_active = xyz_i[participating_mask]
@@ -2505,39 +2428,32 @@ class NN_Trainer:
 
             if len(xyz_i_active) > 0:
                 xyz_active.append(xyz_i_active)
-                gate_active.append(g_dec[participating_mask].numpy())
+                active_weight.append(weights[participating_mask])
 
             if len(xyz_i_inactive) > 0:
                 xyz_inactive.append(xyz_i_inactive)
-                gate_inactive.append(g_dec[inactive_mask].numpy())
+                inactive_weight.append(weights[inactive_mask])
 
         import numpy as np
 
         xyz_active = np.concatenate(xyz_active, axis=0) if len(xyz_active) > 0 else None
         xyz_inactive = np.concatenate(xyz_inactive, axis=0) if len(xyz_inactive) > 0 else None
-        gate_active = np.concatenate(gate_active, axis=0) if len(gate_active) > 0 else None
-        gate_inactive = np.concatenate(gate_inactive, axis=0) if len(gate_inactive) > 0 else None
+        active_weight = np.concatenate(active_weight, axis=0) if len(active_weight) > 0 else None
+        inactive_weight = np.concatenate(inactive_weight, axis=0) if len(inactive_weight) > 0 else None
 
         return {
             "xyz_active": xyz_active,
             "xyz_inactive": xyz_inactive,
-            "gate_active": gate_active,
-            "gate_inactive": gate_inactive,
+            "active_weight": active_weight,
+            "inactive_weight": inactive_weight,
         }
     
-    @staticmethod
-    def sharpen_gate_probs(gates: torch.Tensor | None, Gating_binirize_sharpness:float = 20.0,Gating_binirize_limit:float = 0.45,eps: float = 1e-8):
-        if gates is None:
-            return None
-        g_raw = gates.clamp(eps, 1.0 - eps)
-        g_soft = torch.sigmoid(Gating_binirize_sharpness* (g_raw - Gating_binirize_limit))
-        return g_soft
     def visualize_best_seed_activity(self, result, points_xyz=None, faces_ijk=None):
         best_seeds = result["best_seeds"]
         best_pred = result["best_pred"]
         face_tensors = result["face_tensors"]
 
-        seed_vis = self._seed_points_xyz_and_gates_all_faces(
+        seed_vis = self._seed_points_xyz_and_activity_all_faces(
             seeds_list=best_seeds,
             pred_list=best_pred,
             face_tensors=face_tensors,
@@ -2742,7 +2658,6 @@ class NN_Trainer:
         theta = pred.get("theta", None)
         a_raw = pred.get("a_raw", None)
 
-        gates_i = pred.get("gate_probs_decoder", None)
         boundary_width_raw = pred.get("boundary_width_raw", None)
         boundary_alpha_raw = pred.get("boundary_alpha_raw", None)
         boundary_beta_raw = pred.get("boundary_beta_raw", None)
@@ -2767,7 +2682,6 @@ class NN_Trainer:
             boundary_width_raw=boundary_width_raw,
             boundary_alpha_raw=None,
             boundary_beta_raw=None,
-            seed_gates=gates_i,
         )
 
         self._require_decoder_keys(
@@ -3424,9 +3338,6 @@ class NN_Trainer:
         # Total number of points used for training
         all_global_idx = torch.cat([ft["global_vertex_idx"] for ft in face_tensors], dim=0)
         vertices_number = int(all_global_idx.max().item()) + 1
-        # Defining gating parameters for binarization
-        Gating_binirize_sharpness = cfg.Gating_binirize_sharpness 
-        Gating_binirize_limit = cfg.Gating_binirize_limit 
         # ------------------------------------------------------------
         # Build global vertex areas
         A_v = torch.zeros((vertices_number,), dtype=dtype, device=device)
@@ -3504,6 +3415,8 @@ class NN_Trainer:
                 out_dir="timelapse_frames",
                 video_path=case_name + "_timelapse.avi",
                 fps=8,
+                header_title=f"File: {shape_path.name} |  Loading case: {cfg.LoadingCasee} | Target volfrac: {cfg.target_volfrac:.3f}",
+                header_subtitle=self._timelapse_optimized_parameter_summary(),
             )
             # building a cache for rendering the timelapse, which likely includes precomputing certain data or settings that will be used 
             # repeatedly during the rendering of each frame in the timelapse video. 
@@ -3586,29 +3499,7 @@ class NN_Trainer:
                 # if cfg.predict_tau is true,  it returns  cfg.tau_predic_start
                 # if Cfg.predict_tau is false, it returns annealed value.
                 tau_step = self._tau_for_step(step)
-                # Geting previous gate statistics from the history to determine whether to use hard gating or hard refine phase in the current step.
-                prev_gate_raw_mean = history[-1]["gate_raw_mean"] if history else None
-                prev_gate_raw_min = history[-1]["gate_raw_min"] if history else None
-                prev_gate_raw_max = history[-1]["gate_raw_max"] if history else None
-                # Enable hard gating if the feature is on and either:
-                # (1) training has reached the configured hard-gate start step, or
-                # (2) early hard gating is allowed and training is stable enough:
-                #     past a minimum step, no improvement for long enough, and gate stats
-                #     indicate the average activation is near target and values are clearly
-                #     separated around the active threshold.
-                use_hard_gate_mask_step = self._use_hard_gate_mask(
-                    step=step,
-                    steps_since_improve=steps_since_improve,
-                    gate_raw_mean=prev_gate_raw_mean,
-                    gate_raw_min=prev_gate_raw_min,
-                    gate_raw_max=prev_gate_raw_max,
-                )
-                # Enable the hard refine phase only when hard gating is already active
-                # and the current step has reached the configured refine start step.
-                use_hard_refine_step = self._use_hard_refine_phase(
-                    step=step,
-                    use_hard_gate_mask=use_hard_gate_mask_step,
-                )
+                use_hard_refine_step = step >= int(round(float(cfg.hard_refine_start_frac) * float(cfg.num_steps)))
                 rho_acc = torch.zeros((vertices_number,), dtype=dtype, device=device)
                 rho_wgt = torch.zeros((vertices_number,), dtype=dtype, device=device)
 
@@ -3642,29 +3533,17 @@ class NN_Trainer:
                 theta_mean_terms = []
                 a_metric_terms = []
 
-                gate_terms = []
-                gate_binary_terms = []
-                gate_usage_terms = []
-                gate_weak_contrib_terms = []
                 width_active_terms = []
                 face_weights_this_step = []
 
-                selected_count_total = 0.0
-                selected_frac_sum = 0.0
                 participating_count_total = 0.0
                 participating_frac_sum = 0.0
                 inactive_count_total = 0.0
                 inactive_frac_sum = 0.0
-                gate_raw_min_list = []
-                gate_raw_mean_sum = 0.0
-                gate_raw_max_list = []
-                gate_sharp_min_list = []
-                gate_sharp_mean_sum = 0.0
-                gate_sharp_max_list = []
-                gate_decoder_min_list = []
-                gate_decoder_mean_sum = 0.0
-                gate_decoder_max_list = []
-                gate_face_count = 0
+                active_weight_min_list = []
+                active_weight_mean_sum = 0.0
+                active_weight_max_list = []
+                active_face_count = 0
 
                 # ----------------------------------------------------
                 # Per-face forward pass
@@ -3673,10 +3552,6 @@ class NN_Trainer:
                 compute_bnd_loss = cfg.lam_bnd != 0.0
                 compute_strut_loss = cfg.lam_strut != 0.0
                 compute_vol_loss = cfg.lam_vol != 0.0
-                compute_gate_count_loss = cfg.use_gating and cfg.lam_gate_count != 0.0
-                compute_gate_binary_loss = cfg.use_gating and cfg.lam_gate_binary != 0.0
-                compute_gate_usage_loss = cfg.use_gating and cfg.lam_gate_usage != 0.0
-                compute_gate_weak_contrib_loss = cfg.use_gating and cfg.lam_gate_weak_contrib != 0.0
                 compute_width_active_loss = cfg.lam_width_active != 0.0
                 update_seed_anchors = (
                     cfg.use_rolling_seed_anchors
@@ -3707,6 +3582,7 @@ class NN_Trainer:
                             min_dist=float(cfg.collapse_min_seed_dist_factor) * float(cfg.w_min),
                             iters=int(cfg.seed_projection_iters),
                             detach=False,
+                            clamp_to_domain=not bool(cfg.allow_seed_outside_domain),
                         )[0]
                         pred_i["seeds_raw"] = pred_i["seeds_raw"].clone()
                         pred_i["seeds_raw"][0] = seeds_raw_i
@@ -3715,25 +3591,6 @@ class NN_Trainer:
                     h_raw_i = None
                     if cfg.fixed_height is None and "h_raw" in pred_i:
                         h_raw_i = pred_i["h_raw"][0]
-
-                    gate_logits_i = pred_i.get("gate_logits", None)
-                    gate_logits_i = gate_logits_i[0] if gate_logits_i is not None else None
-
-                    gate_probs_raw_i = pred_i.get("seed_gates", None)
-                    gate_probs_raw_i = gate_probs_raw_i[0] if gate_probs_raw_i is not None else None
-
-                    gates_struct_i = self.sharpen_gate_probs(
-                        gate_probs_raw_i,
-                        Gating_binirize_sharpness=Gating_binirize_sharpness,
-                        Gating_binirize_limit = Gating_binirize_limit,
-                        eps=cfg.gate_eps,
-                    )
-                    gates_decoder_i = self._decoder_gate_values(
-                        gate_probs_raw=gate_probs_raw_i,
-                        gates_struct=gates_struct_i,
-                        use_hard_gate_mask=use_hard_gate_mask_step,
-                        threshold=cfg.gate_active_threshold,
-                    )
 
                     theta_pred_i = pred_i.get("theta", None)
                     theta_i = theta_pred_i[0] if (cfg.use_Metric_anisotropy and theta_pred_i is not None) else None
@@ -3748,50 +3605,6 @@ class NN_Trainer:
                     boundary_beta_raw_i = boundary_beta_pred_i[0] if boundary_beta_pred_i is not None else None
                     tau_pred_i = pred_i.get("tau", None)
                     tau_step = tau_pred_i[0] if tau_pred_i is not None else tau_step
-
-                    gate_role_stats_i = self._gate_role_stats(
-                        gate_probs_raw=gate_probs_raw_i,
-                        gate_probs_struct=gates_struct_i,
-                        gate_probs_decoder=gates_decoder_i,
-                        selected_threshold=cfg.gate_active_threshold,
-                        eps=cfg.gate_eps,
-                        seed_count=int(seeds_raw_i.shape[0]),
-                    )
-                    gate_raw_stats_i = self._gate_stats(gate_probs_raw_i)
-                    gate_sharp_stats_i = self._gate_stats(gates_struct_i)
-                    gate_decoder_stats_i = self._gate_stats(gates_decoder_i)
-                    selected_count_total += gate_role_stats_i["selected_count"]
-                    selected_frac_sum += gate_role_stats_i["selected_frac"]
-                    participating_count_total += gate_role_stats_i["participating_count"]
-                    participating_frac_sum += gate_role_stats_i["participating_frac"]
-                    inactive_count_total += gate_role_stats_i["inactive_count"]
-                    inactive_frac_sum += gate_role_stats_i["inactive_frac"]
-                    gate_raw_min_list.append(gate_raw_stats_i["min"])
-                    gate_raw_mean_sum += gate_raw_stats_i["mean"]
-                    gate_raw_max_list.append(gate_raw_stats_i["max"])
-                    gate_sharp_min_list.append(gate_sharp_stats_i["min"])
-                    gate_sharp_mean_sum += gate_sharp_stats_i["mean"]
-                    gate_sharp_max_list.append(gate_sharp_stats_i["max"])
-                    gate_decoder_min_list.append(gate_decoder_stats_i["min"])
-                    gate_decoder_mean_sum += gate_decoder_stats_i["mean"]
-                    gate_decoder_max_list.append(gate_decoder_stats_i["max"])
-                    gate_face_count += 1
-
-                    if gates_decoder_i is not None and (compute_gate_count_loss or compute_gate_binary_loss):
-                        gate_loss_source_i = gates_struct_i if gates_struct_i is not None else gate_probs_raw_i
-
-                        if compute_gate_count_loss:
-                            gate_count_loss_i = self.gate_count_loss(
-                                gates=gate_loss_source_i,
-                                target_count=cfg.gate_target_count,
-                            )
-                            gate_terms.append(gate_count_loss_i)
-
-                        if compute_gate_binary_loss:
-                            gate_binary_loss_i = self.gate_binary_loss(gate_loss_source_i)
-                            gate_binary_terms.append(gate_binary_loss_i)
-
-
 
                     local_face_id = torch.zeros(ft["uv"].shape[0], dtype=torch.long, device=device)
 
@@ -3822,7 +3635,6 @@ class NN_Trainer:
                         boundary_width_raw=boundary_width_raw_i,
                         boundary_alpha_raw=boundary_alpha_raw_i,
                         boundary_beta_raw=boundary_beta_raw_i,
-                        seed_gates=gates_decoder_i,
                     )
 
                     self._require_decoder_keys(
@@ -3839,6 +3651,8 @@ class NN_Trainer:
                             "boundary_width",
                             "boundary_alpha",
                             "boundary_beta",
+                            "seed_active_weights",
+                            "seed_active_mask",
                         ],
                     )
 
@@ -3851,6 +3665,20 @@ class NN_Trainer:
                     rho_v_i = decoder_out["rho_v"]
                     rho_b_i = decoder_out["rho_b"]
                     edge_field_i = decoder_out["edge_field"]
+                    seed_active_weights_i = decoder_out["seed_active_weights"]
+                    seed_active_mask_i = decoder_out["seed_active_mask"]
+                    inactive_seed_indices_i = decoder_out["inactive_seed_indices"]
+                    active_count_i = float(seed_active_mask_i.detach().to(torch.float32).sum().item())
+                    inactive_count_i = float((~seed_active_mask_i.detach()).to(torch.float32).sum().item())
+                    total_seed_i = max(int(seed_active_mask_i.numel()), 1)
+                    participating_count_total += active_count_i
+                    participating_frac_sum += active_count_i / float(total_seed_i)
+                    inactive_count_total += inactive_count_i
+                    inactive_frac_sum += inactive_count_i / float(total_seed_i)
+                    active_weight_min_list.append(float(seed_active_weights_i.detach().min().item()))
+                    active_weight_mean_sum += float(seed_active_weights_i.detach().mean().item())
+                    active_weight_max_list.append(float(seed_active_weights_i.detach().max().item()))
+                    active_face_count += 1
 
                     boundary_width_i = decoder_out["boundary_width"]
                     boundary_alpha_i = decoder_out["boundary_alpha"]
@@ -3876,42 +3704,16 @@ class NN_Trainer:
                     gidx = ft["global_vertex_idx"]
                     w_local = A_local.clamp_min(cfg.eps)
 
-                    if gate_probs_raw_i is not None and (compute_gate_usage_loss or compute_gate_weak_contrib_loss):
-                        seed_usage_i = (w_soft_i * w_local.unsqueeze(1)).sum(dim=0) / w_local.sum().clamp_min(cfg.eps)
-                        weak_threshold = (
-                            cfg.gate_active_threshold
-                            if cfg.weak_contrib_threshold is None
-                            else float(cfg.weak_contrib_threshold)
-                        )
-                        gate_loss_source_i = gates_struct_i if gates_struct_i is not None else gate_probs_raw_i
-                        if compute_gate_usage_loss:
-                            gate_usage_loss_i = self.gate_usage_loss(
-                                gates=gate_loss_source_i,
-                                usage=seed_usage_i,
-                                target_count=cfg.gate_target_count,
-                                eps=cfg.gate_eps,
-                            )
-                            gate_usage_terms.append(gate_usage_loss_i)
-                        if compute_gate_weak_contrib_loss:
-                            gate_weak_contrib_loss_i = self.weak_contributor_loss(
-                                gates=gate_loss_source_i,
-                                usage=seed_usage_i,
-                                threshold=weak_threshold,
-                                power=cfg.weak_contrib_power,
-                                eps=cfg.gate_eps,
-                            )
-                            gate_weak_contrib_terms.append(gate_weak_contrib_loss_i)
-
                     if compute_width_active_loss:
                         width_active_terms.append(
                             self.active_width_loss(
                                 w_raw=w_raw_i,
                                 seeds=seeds_i,
-                                gates_decoder=gates_decoder_i,
+                                seed_active_weights=None,
                                 width_target_frac=cfg.width_target_frac,
                                 width_target_sparse_boost=cfg.width_target_sparse_boost,
                                 width_target_frac_max=cfg.width_target_frac_max,
-                                active_threshold=cfg.gate_active_threshold,
+                                active_threshold=0.5,
                                 raw_temp=cfg.decoder_raw_temp,
                                 w_min=cfg.w_min,
                                 eps=cfg.eps,
@@ -3948,10 +3750,9 @@ class NN_Trainer:
                         "seeds_raw": seeds_raw_i.detach().clone(),
                         "w_raw": w_raw_i.detach().clone(),
                         "h_raw": None if h_raw_i is None else h_raw_i.detach().clone(),
-                        "gate_logits": None if gate_logits_i is None else gate_logits_i.detach().clone(),
-                        "gate_probs_raw": None if gate_probs_raw_i is None else gate_probs_raw_i.detach().clone(),
-                        "gate_probs_sharp": None if gates_struct_i is None else gates_struct_i.detach().clone(),
-                        "gate_probs_decoder": None if gates_decoder_i is None else gates_decoder_i.detach().clone(),
+                        "seed_active_weights": seed_active_weights_i.detach().clone(),
+                        "seed_active_mask": seed_active_mask_i.detach().clone(),
+                        "inactive_seed_indices": inactive_seed_indices_i.detach().clone(),
                         "theta": None if theta_i is None else theta_i.detach().clone(),
                         "a_raw": None if a_raw_i is None else a_raw_i.detach().clone(),
                         "tau": None if tau_pred_i is None else tau_pred_i.detach().clone(),
@@ -3977,7 +3778,7 @@ class NN_Trainer:
                         rep_terms.append(
                             self.seed_repulsion_term(
                                 seeds=seeds_i,
-                                gates=gates_decoder_i,
+                                seed_active_weights=None,
                                 sigma=cfg.seed_repulsion_sigma,
                                 min_dist=2.0 * float(cfg.w_min),
                                 eps=cfg.eps,
@@ -3989,7 +3790,7 @@ class NN_Trainer:
                             self.boundary_repulsion_term(
                                 seeds=seeds_i,
                                 boundary_uv=boundary_uv_i,
-                                gates=gates_decoder_i,
+                                seed_active_weights=None,
                                 margin=cfg.boundary_margin,
                                 eps=cfg.eps,
                             )
@@ -4041,38 +3842,22 @@ class NN_Trainer:
                 # ----------------------------------------------------
                 # Aggregate face outputs
                 # ----------------------------------------------------
-                if gate_face_count > 0:
-                    selected_count_mean = selected_count_total / gate_face_count
-                    selected_frac_mean = selected_frac_sum / gate_face_count
-                    participating_count_mean = participating_count_total / gate_face_count
-                    participating_frac_mean = participating_frac_sum / gate_face_count
-                    inactive_count_mean = inactive_count_total / gate_face_count
-                    inactive_frac_mean = inactive_frac_sum / gate_face_count
-                    gate_raw_min_global = min(gate_raw_min_list)
-                    gate_raw_mean_global = gate_raw_mean_sum / gate_face_count
-                    gate_raw_max_global = max(gate_raw_max_list)
-                    gate_sharp_min_global = min(gate_sharp_min_list)
-                    gate_sharp_mean_global = gate_sharp_mean_sum / gate_face_count
-                    gate_sharp_max_global = max(gate_sharp_max_list)
-                    gate_decoder_min_global = min(gate_decoder_min_list)
-                    gate_decoder_mean_global = gate_decoder_mean_sum / gate_face_count
-                    gate_decoder_max_global = max(gate_decoder_max_list)
+                if active_face_count > 0:
+                    participating_count_mean = participating_count_total / active_face_count
+                    participating_frac_mean = participating_frac_sum / active_face_count
+                    inactive_count_mean = inactive_count_total / active_face_count
+                    inactive_frac_mean = inactive_frac_sum / active_face_count
+                    active_weight_min_global = min(active_weight_min_list)
+                    active_weight_mean_global = active_weight_mean_sum / active_face_count
+                    active_weight_max_global = max(active_weight_max_list)
                 else:
-                    selected_count_mean = 0.0
-                    selected_frac_mean = 0.0
                     participating_count_mean = 0.0
                     participating_frac_mean = 0.0
                     inactive_count_mean = 0.0
                     inactive_frac_mean = 0.0
-                    gate_raw_min_global = 0.0
-                    gate_raw_mean_global = 0.0
-                    gate_raw_max_global = 0.0
-                    gate_sharp_min_global = 0.0
-                    gate_sharp_mean_global = 0.0
-                    gate_sharp_max_global = 0.0
-                    gate_decoder_min_global = 0.0
-                    gate_decoder_mean_global = 0.0
-                    gate_decoder_max_global = 0.0
+                    active_weight_min_global = 0.0
+                    active_weight_mean_global = 0.0
+                    active_weight_max_global = 0.0
 
                 rho = rho_acc / rho_wgt.clamp_min(cfg.eps)
                 rho_boundary = rho_b_acc / rho_b_wgt.clamp_min(cfg.eps)
@@ -4101,10 +3886,6 @@ class NN_Trainer:
                 theta_mean = self._safe_weighted_mean(theta_mean_terms, face_weights_this_step, dtype, device, cfg.eps)
                 a_metric_mean = self._safe_weighted_mean(a_metric_terms, face_weights_this_step, dtype, device, cfg.eps)
 
-                loss_gate = self._safe_weighted_mean(gate_terms, face_weights_this_step, dtype, device, cfg.eps) if compute_gate_count_loss else zero
-                loss_gate_binary = self._safe_weighted_mean(gate_binary_terms, face_weights_this_step, dtype, device, cfg.eps) if compute_gate_binary_loss else zero
-                loss_gate_usage = self._safe_weighted_mean(gate_usage_terms, face_weights_this_step, dtype, device, cfg.eps) if compute_gate_usage_loss else zero
-                loss_gate_weak_contrib = self._safe_weighted_mean(gate_weak_contrib_terms, face_weights_this_step, dtype, device, cfg.eps) if compute_gate_weak_contrib_loss else zero
                 loss_width_active = self._safe_weighted_mean(width_active_terms, face_weights_this_step, dtype, device, cfg.eps) if compute_width_active_loss else zero
 
                 # ----------------------------------------------------
@@ -4237,42 +4018,14 @@ class NN_Trainer:
                 # ----------------------------------------------------
                 # Total loss
                 # ----------------------------------------------------
-                gate_warmup = self.ramp_weight(
-                    step=step,
-                    total_steps=cfg.num_steps,
-                    start_frac=0.0,
-                    ramp_frac=cfg.gate_warmup_frac,
-                )
-
-                gate_binary_warmup = self.ramp_weight(
-                    step=step,
-                    total_steps=cfg.num_steps,
-                    start_frac=0.0,
-                    ramp_frac=cfg.gate_binary_warmup_frac,
-                )
-
-                lam_gate_binary_eff = cfg.lam_gate_binary * gate_binary_warmup
-                lam_gate_eff = cfg.lam_gate_count * gate_warmup
-                lam_gate_usage_eff = cfg.lam_gate_usage * gate_warmup
-                lam_gate_weak_contrib_eff = cfg.lam_gate_weak_contrib * gate_warmup
                 lam_width_active_eff = cfg.lam_width_active * self.ramp_weight(
                     step=step,
                     total_steps=cfg.num_steps,
                     start_frac=cfg.width_warmup_start_frac,
                     ramp_frac=cfg.width_warmup_ramp_frac,
                 )
-                if use_hard_gate_mask_step:
-                    lam_width_active_eff = lam_width_active_eff * float(cfg.lam_width_active_hard_multiplier)
                 if use_hard_refine_step:
                     lam_width_active_eff = lam_width_active_eff * float(cfg.hard_refine_width_multiplier)
-                    if cfg.disable_gate_count_loss_during_hard_refine:
-                        lam_gate_eff = 0.0
-                    if cfg.disable_gate_binary_loss_during_hard_refine:
-                        lam_gate_binary_eff = 0.0
-                    if cfg.disable_gate_usage_loss_during_hard_refine:
-                        lam_gate_usage_eff = 0.0
-                    if cfg.disable_gate_weak_contrib_during_hard_refine:
-                        lam_gate_weak_contrib_eff = 0.0
 
                 L_total = (
                     cfg.lam_vol * (loss_vol / n_vol)
@@ -4282,18 +4035,6 @@ class NN_Trainer:
 
                 if cfg.lam_strut != 0.0:
                     L_total = L_total + cfg.lam_strut * (loss_strut / n_strut)
-
-                if cfg.use_gating and lam_gate_eff != 0.0:
-                    L_total = L_total + lam_gate_eff * loss_gate
-
-                if cfg.use_gating and lam_gate_binary_eff != 0.0:
-                    L_total = L_total + lam_gate_binary_eff * loss_gate_binary
-
-                if cfg.use_gating and lam_gate_usage_eff != 0.0:
-                    L_total = L_total + lam_gate_usage_eff * loss_gate_usage
-
-                if cfg.use_gating and lam_gate_weak_contrib_eff != 0.0:
-                    L_total = L_total + lam_gate_weak_contrib_eff * loss_gate_weak_contrib
 
                 if lam_width_active_eff != 0.0:
                     L_total = L_total + lam_width_active_eff * loss_width_active
@@ -4356,9 +4097,6 @@ class NN_Trainer:
                         else:
                             if use_hard_refine_step:
                                 for ppnet in ppnets:
-                                    if cfg.freeze_gate_head_during_hard_refine and hasattr(ppnet, "gate_head"):
-                                        for p in ppnet.gate_head.parameters():
-                                            p.grad = None
                                     if cfg.freeze_tau_head_during_hard_refine and hasattr(ppnet, "tau_head"):
                                         for p in ppnet.tau_head.parameters():
                                             p.grad = None
@@ -4403,23 +4141,15 @@ class NN_Trainer:
                     vol_dev = torch.abs(vol_frac - cfg.target_volfrac)
                     vol_dev_eff = torch.abs(vol_frac_eff - cfg.target_volfrac)
                     min_seed_dist = self.min_pairwise_seed_distance(seeds_list)
-                    min_seed_dist_required = float(cfg.collapse_min_seed_dist_factor) * float(cfg.w_min)
 
                     score = float(L_total.detach().item()) if total_is_finite else float("inf")
-                    if total_is_finite and fem_is_valid:
-                        comp_score = float(comp_val.detach().item())
-                        vol_error = float(vol_dev_eff.detach().item())
-
-                        score = comp_score
-                        vol_tol = float(cfg.best_score_vol_tolerance)
-                        if vol_error > vol_tol:
-                            score += float(cfg.best_score_vol_penalty) * (vol_error - vol_tol) ** 2
-                    else:
+                    if not (total_is_finite and fem_is_valid):
                         score = float("inf")
 
                     best_candidate_is_valid = (
                         ((cfg.lam_fem == 0.0) or fem_is_valid)
-                        and min_seed_dist >= min_seed_dist_required
+                        and total_is_finite
+                        and participating_count_total >= float(cfg.min_active_seeds or 1)
                     )
 
                     prev_best_step = best_step
@@ -4465,26 +4195,6 @@ class NN_Trainer:
                     elif best_candidate_is_valid:
                         steps_since_improve += 1
 
-                    if use_hard_gate_mask_step and best_candidate_is_valid and score < (best_hard_score - cfg.min_delta):
-                        best_hard_score = score
-                        best_hard_step = step
-                        best_hard_vol_frac = float(vol_frac_eff.detach().item())
-                        best_hard_comp = float(comp_val.detach().item())
-                        best_hard_w_geo = float(w_geo_mean.detach().item())
-                        best_hard_active_count = float(participating_count_total)
-                        best_hard_inactive_count = float(inactive_count_total)
-                        best_hard_rho = rho.detach().clone()
-                        best_hard_fiber_surface = fiber_surface.detach().clone()
-                        best_hard_seeds = [s.detach().clone() for s in seeds_list]
-                        best_hard_pred = self._clone_pred_list(pred_list)
-                        tqdm.write(
-                            f"New best_hard_step={best_hard_step} | "
-                            f"best_hard_score={best_hard_score:.6f} | "
-                            f"vol_eff={best_hard_vol_frac:.6f} | "
-                            f"comp={best_hard_comp:.6e} | "
-                            f"w={best_hard_w_geo:.6e}"
-                        )
-
                     if rho0 is None:
                         rho0 = rho.detach().clone()
                     if seeds0 is None:
@@ -4527,16 +4237,10 @@ class NN_Trainer:
                         "loss_strut_void": self._finite_or_default(loss_strut_void),
                         "loss_fem": self._finite_or_default(loss_fem),
                         "loss_comp": self._finite_or_default(loss_comp),
-                        "loss_gate": self._finite_or_default(loss_gate),
-                        "lam_gate_eff": lam_gate_eff,
-                        "loss_gate_binary": self._finite_or_default(loss_gate_binary),
-                        "lam_gate_binary_eff": lam_gate_binary_eff,
-                        "loss_gate_usage": self._finite_or_default(loss_gate_usage),
-                        "lam_gate_usage_eff": lam_gate_usage_eff,
-                        "loss_gate_weak_contrib": self._finite_or_default(loss_gate_weak_contrib),
-                        "lam_gate_weak_contrib_eff": lam_gate_weak_contrib_eff,
+                        "loss_seed_active": 0.0,
                         "comp": self._finite_or_default(comp_val),
                         "vol_frac": float(vol_frac.detach().item()),
+                        "vol_frac_internal": float(vol_frac_v.detach().item()),
                         "vol_frac_eff": float(vol_frac_eff.detach().item()),
                         "vol_frac_sharp": float(vol_frac_sharp.detach().item()),
                         "vol_dev": float(vol_dev.detach().item()),
@@ -4576,25 +4280,15 @@ class NN_Trainer:
                         "theta_mean": self._finite_or_default(theta_mean),
                         "a_metric_mean": self._finite_or_default(a_metric_mean),
 
-                        "selected_count_total": selected_count_total,
-                        "selected_count_mean": selected_count_mean,
-                        "selected_frac_mean": selected_frac_mean,
                         "active_count_total": participating_count_total,
                         "active_count_mean": participating_count_mean,
                         "active_frac_mean": participating_frac_mean,
                         "inactive_count_total": inactive_count_total,
                         "inactive_count_mean": inactive_count_mean,
                         "inactive_frac_mean": inactive_frac_mean,
-                        "gate_raw_min": gate_raw_min_global,
-                        "gate_raw_mean": gate_raw_mean_global,
-                        "gate_raw_max": gate_raw_max_global,
-                        "gate_sharp_min": gate_sharp_min_global,
-                        "gate_sharp_mean": gate_sharp_mean_global,
-                        "gate_sharp_max": gate_sharp_max_global,
-                        "gate_decoder_min": gate_decoder_min_global,
-                        "gate_decoder_mean": gate_decoder_mean_global,
-                        "gate_decoder_max": gate_decoder_max_global,
-                        "hard_gate_mask_on": 1.0 if use_hard_gate_mask_step else 0.0,
+                        "seed_active_weight_min": active_weight_min_global,
+                        "seed_active_weight_mean": active_weight_mean_global,
+                        "seed_active_weight_max": active_weight_max_global,
                         "hard_refine_on": 1.0 if use_hard_refine_step else 0.0,
                         "loss_width_active": self._finite_or_default(loss_width_active),
                         "lam_width_active_eff": lam_width_active_eff,
@@ -4612,8 +4306,7 @@ class NN_Trainer:
                         w=f"{row['w_geo_mean']:.3e}",
                         dmin=f"{row['min_seed_dist']:.3e}",
                         bw=f"{row['boundary_width_mean']:.3e}",
-                        sel=f"{selected_count_mean:.1f}",
-                        part=f"{participating_count_mean:.1f}",
+                        active=f"{participating_count_mean:.1f}",
                         fem="OK" if fem_is_valid else "BAD",
                         refresh=False,
                     )
@@ -4632,7 +4325,6 @@ class NN_Trainer:
                             "L_Volume": row["loss_vol"],
                             "L_FEM": row["loss_fem"],
                             "L_St": row["loss_strut"],
-                            "L_Gate": row["loss_gate"],
                             "L_Bnd": row["loss_bnd"],
                             "L_Rep": row["loss_rep"],
                         }
@@ -4642,7 +4334,9 @@ class NN_Trainer:
                             cad_img=cad_img,
                             loss_dict=loss_dict,
                             title_text=(
-                                f"vol={row['vol_frac']:.4f} | "
+                                f"vol_total={row['vol_frac']:.4f} | "
+                                f"vol_internal={row['vol_frac_internal']:.4f} | "
+                                f"vol_eff={row['vol_frac_eff']:.4f} | "
                                 f"W={row['w_geo_mean']:.4g} | "
                                 f"tau={row['tau']:.4g} | "
                                 f"bw={row['boundary_width_mean']:.4g} | "
@@ -4672,18 +4366,14 @@ class NN_Trainer:
                         fem_status = "OK" if fem_is_valid else f"BAD({fem_failure_reason})"
                         tqdm.write(
                             f"[{step:05d}] | "
-                            f"selected(total/mean)={selected_count_total:.0f}/{selected_count_mean:.2f} | "
-                            f"participating(total/mean)={participating_count_total:.0f}/{participating_count_mean:.2f} | "
+                            f"active(total/mean)={participating_count_total:.0f}/{participating_count_mean:.2f} | "
+                            f"inactive(total/mean)={inactive_count_total:.0f}/{inactive_count_mean:.2f} | "
                             f"L_total={row['L_total']:.4e} | "
                             f"L_vol={row['loss_vol']:.3e} "
                             f"L_fem={row['loss_fem']:.3e} "
                             f"L_strut={row['loss_strut']:.3e} "
                             f"L_rep={row['loss_rep']:.3e} "
                             f"L_bnd={row['loss_bnd']:.3e} "
-                            f"L_gate={row['loss_gate']:.3e} "
-                            f"L_gbin={row['loss_gate_binary']:.3e} "
-                            f"L_guse={row['loss_gate_usage']:.3e} "
-                            f"L_gweak={row['loss_gate_weak_contrib']:.3e} "
                             f"L_wact={row['loss_width_active']:.3e} | "
                             f"vol={row['vol_frac']:.3f} "
                             f"vol_eff={row['vol_frac_eff']:.3f} "
@@ -4691,7 +4381,6 @@ class NN_Trainer:
                             f"tau={row['tau']:.3e} "
                             f"os={row['seed_offset_scale']:.2e} "
                             f"comp={row['comp']:.3e} | "
-                            f"hard_gate={'ON' if use_hard_gate_mask_step else 'off'} "
                             f"hard_refine={'ON' if use_hard_refine_step else 'off'} | "
                             f"w={row['w_geo_mean']:.3e} "
                             f"h={row['h_mean']:.3e} | "
@@ -4705,9 +4394,7 @@ class NN_Trainer:
                             f"rho(min/mean/max)={rho_min:.3f}/{rho_mean:.3f}/{rho_max:.3f} "
                             f"rho_b(min/mean/max)={rho_boundary_min:.3f}/{rho_boundary_mean:.3f}/{rho_boundary_max:.3f} "
                             f"rho_v(min/mean/max)={rho_v_min:.3f}/{rho_v_mean:.3f}/{rho_v_max:.3f} | "
-                            f"gate_raw(min/mean/max)={gate_raw_min_global:.3f}/{gate_raw_mean_global:.3f}/{gate_raw_max_global:.3f} | "
-                            f"gate_sharp(min/mean/max)={gate_sharp_min_global:.3f}/{gate_sharp_mean_global:.3f}/{gate_sharp_max_global:.3f} | "
-                            f"gate_dec(min/mean/max)={gate_decoder_min_global:.3f}/{gate_decoder_mean_global:.3f}/{gate_decoder_max_global:.3f} | "
+                            f"seed_active_w(min/mean/max)={active_weight_min_global:.3f}/{active_weight_mean_global:.3f}/{active_weight_max_global:.3f} | "
                             f"Δrho={drho:.2e} Δseed={dseed:.2e} "
                             f"dmin={min_seed_dist:.2e} grad_mean={g_mean:.2e} | "
                             f"fem={fem_status} | "
@@ -4722,6 +4409,7 @@ class NN_Trainer:
                     min_seed_dist_value = float(row["min_seed_dist"])
                     min_seed_dist_limit = float(cfg.anchor_guard_min_seed_dist_factor) * float(cfg.w_min)
                     collapse_seed_dist_limit = float(cfg.collapse_min_seed_dist_factor) * float(cfg.w_min)
+                    min_active_seed_count = float(cfg.min_active_seeds or 1)
 
                     anchor_update_allowed = (
                         rep_value <= float(cfg.anchor_guard_rep_max)
@@ -4731,17 +4419,11 @@ class NN_Trainer:
                         and min_seed_dist_value >= min_seed_dist_limit
                     )
 
-                    collapsed = (
-                        rep_value >= float(cfg.collapse_rep_threshold)
-                        or bnd_value >= float(cfg.collapse_bnd_threshold)
-                        or vol_eff_value <= float(cfg.collapse_vol_eff_threshold)
-                        or w_geo_value <= float(cfg.collapse_width_factor) * float(cfg.w_min)
-                        or min_seed_dist_value < collapse_seed_dist_limit
-                    )
+                    active_seed_count_collapsed = participating_count_total < min_active_seed_count
                     seed_spacing_collapsed = min_seed_dist_value < collapse_seed_dist_limit
                     can_restore_from_best = (
                         cfg.restore_best_on_collapse
-                        and collapsed
+                        and active_seed_count_collapsed
                         and best_ppnet_state is not None
                         and best_seeds is not None
                         and step > best_step
@@ -4759,12 +4441,23 @@ class NN_Trainer:
                                 seeds_list=best_seeds,
                                 min_dist=collapse_seed_dist_limit,
                                 iters=int(cfg.seed_repair_iters),
+                                clamp_to_domain=not bool(cfg.allow_seed_outside_domain),
                             )
                             repaired_dmin = self.min_pairwise_seed_distance(uv_anchor_list)
                             anchor_source = f"repaired collapsed seeds dmin={repaired_dmin:.3e}"
                         else:
                             uv_anchor_list = [s.detach().clone() for s in best_seeds]
                             anchor_source = "best seeds"
+
+                        if cfg.respawn_inactive_seeds_on_collapse:
+                            uv_anchor_list, respawned_seed_count = self.respawn_inactive_seed_anchors(
+                                seeds_list=uv_anchor_list,
+                                pred_list=best_pred,
+                                margin=float(cfg.seed_respawn_margin),
+                            )
+                            if respawned_seed_count > 0:
+                                anchor_source = f"{anchor_source}; respawned inactive seeds={respawned_seed_count}"
+
                         anchor_update_allowed = False
                         seed_freeze_until_step = step + int(cfg.post_restore_seed_freeze_steps)
                         collapse_restore_count += 1
@@ -4807,12 +4500,7 @@ class NN_Trainer:
                 if best_inactive_count is None:
                     best_inactive_count = float(inactive_count_total)
 
-        use_hard_result = (
-            bool(cfg.prefer_hard_gate_result)
-            and best_hard_rho is not None
-            and best_hard_pred is not None
-            and best_hard_seeds is not None
-        )
+        use_hard_result = False
         if use_hard_result:
             best_score = best_hard_score
             best_step = best_hard_step
@@ -4863,10 +4551,23 @@ class NN_Trainer:
             try:
                 total_seed_slots = int(cfg.seed_number) * max(len(best_pred) if best_pred else len(face_tensors), 1)
                 active_seed_count = int(round(float(best_active_count or 0.0)))
+                best_vol_total = (
+                    float(best_row["vol_frac"])
+                    if best_row is not None and "vol_frac" in best_row
+                    else float(best_vol_frac)
+                )
+                best_vol_internal = (
+                    float(best_row["vol_frac_internal"])
+                    if best_row is not None and "vol_frac_internal" in best_row
+                    else float(best_vol_frac)
+                )
+                best_vol_eff = float(best_vol_frac)
                 tuned_param_summary = {
                     "best_step": f"{int(best_step)}",
-                    "source": "hard" if use_hard_result else "global",
                     "active_seeds": f"{active_seed_count}/{total_seed_slots}",
+                    "Vol_total": f"{best_vol_total:.6g}",
+                    "Vol_internal": f"{best_vol_internal:.6g}",
+                    "Vol_eff": f"{best_vol_eff:.6g}",
                     "w": f"{float(best_w_geo):.6g}",
                     "tau": f"{self._fallback_tau_value():.6g}",
                     "h": "nan",
@@ -4897,8 +4598,10 @@ class NN_Trainer:
 
                     tuned_param_summary = {
                         "best_step": f"{int(best_step)}",
-                        "source": "hard" if use_hard_result else "global",
                         "active_seeds": f"{active_seed_count}/{total_seed_slots}",
+                        "Vol_total": f"{best_vol_total:.6g}",
+                        "Vol_internal": f"{best_vol_internal:.6g}",
+                        "Vol_eff": f"{best_vol_eff:.6g}",
                         "w": f"{float(best_w_geo):.6g}",
                         "tau": (
                             f"{(tau_mean if math.isfinite(tau_mean) else self._fallback_tau_value()):.6g}"
@@ -4916,12 +4619,13 @@ class NN_Trainer:
                     "L_Volume": float(best_row["loss_vol"]) if best_row is not None else float("nan"),
                     "L_FEM": float(best_row["loss_fem"]) if best_row is not None else float("nan"),
                     "L_Strut": float(best_row["loss_strut"]) if best_row is not None else float("nan"),
-                    "L_Gate": float(best_row["loss_gate"]) if best_row is not None else float("nan"),
                     "L_Bnd": float(best_row["loss_bnd"]) if best_row is not None else float("nan"),
                     "L_Rep": float(best_row["loss_rep"]) if best_row is not None else float("nan"),
                 }
                 results_text = (
-                    f"volume={float(best_vol_frac):.6g} | "
+                    f"vol_total={best_vol_total:.6g} | "
+                    f"vol_internal={best_vol_internal:.6g} | "
+                    f"vol_eff={best_vol_eff:.6g} | "
                     f"fem={float(best_comp):.6g}"
                 )
                 tuned_param_title = " | ".join(f"{key}={value}" for key, value in tuned_param_summary.items())

@@ -22,7 +22,6 @@ class PPNet(nn.Module):
         # feature toggles
         use_Metric_anisotropy=False,
         predict_height=False,
-        use_gating=False,
         predict_boundary_params=False,
         predict_tau=False,
         tau_pred_start=0.02,
@@ -38,9 +37,9 @@ class PPNet(nn.Module):
         eps_uv=1e-4,
         max_delta_logit=0.30,
         max_step_uv=0.08,
-
-        # init biases
-        gate_bias_init=0.0,
+        seed_id_dim=16,
+        allow_seed_outside_domain=False,
+        seed_domain_margin=0.25,
 
         # safety
         enable_checks=True,
@@ -50,7 +49,6 @@ class PPNet(nn.Module):
         self.n_seeds = n_seeds
         self.use_Metric_anisotropy = use_Metric_anisotropy
         self.predict_height = predict_height
-        self.use_gating = use_gating
         self.predict_boundary_params = predict_boundary_params
         self.predict_tau = predict_tau
         self.tau_pred_start = float(tau_pred_start)
@@ -63,6 +61,9 @@ class PPNet(nn.Module):
         self.eps_uv = eps_uv
         self.max_delta_logit = max_delta_logit
         self.max_step_uv = max_step_uv
+        self.seed_id_dim = int(seed_id_dim)
+        self.allow_seed_outside_domain = bool(allow_seed_outside_domain)
+        self.seed_domain_margin = float(seed_domain_margin)
 
         self.enable_checks = enable_checks
 
@@ -92,8 +93,13 @@ class PPNet(nn.Module):
         # -------------------------
         # per-seed refinement
         # -------------------------
+        if self.seed_id_dim > 0:
+            self.seed_id_embed = nn.Embedding(self.n_seeds, self.seed_id_dim)
+        else:
+            self.seed_id_embed = None
+
         self.seed_refine = nn.Sequential(
-            nn.Linear(hidden + 2, hidden),
+            nn.Linear(hidden + 2 + max(self.seed_id_dim, 0), hidden),
             nn.ReLU(),
             nn.Linear(hidden, hidden),
             nn.ReLU(),
@@ -110,11 +116,6 @@ class PPNet(nn.Module):
 
         if self.predict_height:
             self.h_head = nn.Linear(hidden, 1)
-
-        if self.use_gating:
-            self.gate_head = nn.Linear(hidden, 1)
-            nn.init.zeros_(self.gate_head.weight)
-            nn.init.constant_(self.gate_head.bias, gate_bias_init)
 
         if self.use_Metric_anisotropy:
             self.theta_head = nn.Linear(hidden, 1)
@@ -162,7 +163,10 @@ class PPNet(nn.Module):
         else:
             raise ValueError("uv_init must be (S,2) or (B,S,2)")
 
-        uv_base = uv_init_b.clamp(eps_uv, 1.0 - eps_uv)
+        if self.allow_seed_outside_domain:
+            uv_base = uv_init_b
+        else:
+            uv_base = uv_init_b.clamp(eps_uv, 1.0 - eps_uv)
         self._check(uv_base, "uv_base")
 
         # -------------------------
@@ -172,7 +176,12 @@ class PPNet(nn.Module):
         self._check(z, "z")
 
         z_rep = z.unsqueeze(1).expand(-1, S, -1)
-        seed_in = torch.cat([z_rep, uv_base], dim=-1)
+        if self.seed_id_embed is not None:
+            seed_ids = torch.arange(S, device=uv_base.device, dtype=torch.long)
+            seed_id_features = self.seed_id_embed(seed_ids).unsqueeze(0).expand(B, -1, -1)
+            seed_in = torch.cat([z_rep, uv_base, seed_id_features], dim=-1)
+        else:
+            seed_in = torch.cat([z_rep, uv_base], dim=-1)
         self._check(seed_in, "seed_in")
 
         h = self.seed_refine(seed_in)
@@ -194,19 +203,26 @@ class PPNet(nn.Module):
             device=uv_base.device,
             dtype=uv_base.dtype,
         )
-        room_lo = (uv_base - eps_uv).clamp_min(0.0)
-        room_hi = (1.0 - eps_uv - uv_base).clamp_min(0.0)
-        step_lo = torch.minimum(room_lo, step_cap)
-        step_hi = torch.minimum(room_hi, step_cap)
-
-        delta_uv = torch.where(
-            delta_dir >= 0.0,
-            delta_dir * step_hi,
-            delta_dir * step_lo,
-        )
+        if self.allow_seed_outside_domain:
+            delta_uv = delta_dir * step_cap
+        else:
+            room_lo = (uv_base - eps_uv).clamp_min(0.0)
+            room_hi = (1.0 - eps_uv - uv_base).clamp_min(0.0)
+            step_lo = torch.minimum(room_lo, step_cap)
+            step_hi = torch.minimum(room_hi, step_cap)
+            delta_uv = torch.where(
+                delta_dir >= 0.0,
+                delta_dir * step_hi,
+                delta_dir * step_lo,
+            )
         self._check(delta_uv, "delta_uv")
 
-        seeds_uv = (uv_base + delta_uv).clamp(eps_uv, 1.0 - eps_uv)
+        seeds_uv = uv_base + delta_uv
+        if self.allow_seed_outside_domain:
+            margin = max(float(self.seed_domain_margin), 0.0)
+            seeds_uv = seeds_uv.clamp(-margin, 1.0 + margin)
+        else:
+            seeds_uv = seeds_uv.clamp(eps_uv, 1.0 - eps_uv)
         self._check(seeds_uv, "seeds_uv_final")
 
         out = {
@@ -235,20 +251,6 @@ class PPNet(nn.Module):
         else:
             h_raw = None
         out["h_raw"] = h_raw
-
-        # -------------------------
-        # gating
-        # -------------------------
-        if self.use_gating:
-            gate_logits = self.gate_head(h).squeeze(-1)
-            self._check(gate_logits, "gate_logits")
-            seed_gates = torch.sigmoid(gate_logits)
-        else:
-            gate_logits = None
-            seed_gates = None
-
-        out["gate_logits"] = gate_logits
-        out["seed_gates"] = seed_gates
 
         # -------------------------
         # anisotropy

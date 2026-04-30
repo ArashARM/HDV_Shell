@@ -56,10 +56,12 @@ class VoronoiDecoder(nn.Module):
         # union sharpness for combining pair bands
         alpha_union: float = 16.0,
 
-        # smooth duplicate-seed suppression
+        # duplicate-seed activation. Seeds closer than this radius compete,
+        # and one survivor remains effective in each connected duplicate cluster.
         duplicate_merge_sigma: float = 0.05,
-        duplicate_merge_temp: float = 0.5,
-        duplicate_tiebreak_scale: float = 0.02,
+        duplicate_effect_temp_ratio: float = 0.20,
+        duplicate_effect_strength: float = 6.0,
+        duplicate_effect_floor: float = 0.05,
 
         # height controls
         h_min: float = 0.50,
@@ -118,8 +120,9 @@ class VoronoiDecoder(nn.Module):
         self.raw_temp = float(raw_temp)
         self.alpha_union = float(alpha_union)
         self.duplicate_merge_sigma = float(duplicate_merge_sigma)
-        self.duplicate_merge_temp = float(duplicate_merge_temp)
-        self.duplicate_tiebreak_scale = float(duplicate_tiebreak_scale)
+        self.duplicate_effect_temp_ratio = float(duplicate_effect_temp_ratio)
+        self.duplicate_effect_strength = float(duplicate_effect_strength)
+        self.duplicate_effect_floor = float(duplicate_effect_floor)
 
         self.h_min = float(h_min)
         self.h_max = float(h_max)
@@ -165,11 +168,17 @@ class VoronoiDecoder(nn.Module):
             raise ValueError(f"junction_triple_power must be > 0, got {self.junction_triple_power}")
         if self.duplicate_merge_sigma <= 0:
             raise ValueError(f"duplicate_merge_sigma must be > 0, got {self.duplicate_merge_sigma}")
-        if self.duplicate_merge_temp <= 0:
-            raise ValueError(f"duplicate_merge_temp must be > 0, got {self.duplicate_merge_temp}")
-        if self.duplicate_tiebreak_scale < 0:
+        if self.duplicate_effect_temp_ratio <= 0:
             raise ValueError(
-                f"duplicate_tiebreak_scale must be >= 0, got {self.duplicate_tiebreak_scale}"
+                f"duplicate_effect_temp_ratio must be > 0, got {self.duplicate_effect_temp_ratio}"
+            )
+        if self.duplicate_effect_strength < 0:
+            raise ValueError(
+                f"duplicate_effect_strength must be >= 0, got {self.duplicate_effect_strength}"
+            )
+        if not (0.0 < self.duplicate_effect_floor <= 1.0):
+            raise ValueError(
+                f"duplicate_effect_floor must be in (0, 1], got {self.duplicate_effect_floor}"
             )
 
         if boundary_solid_idx is None:
@@ -224,43 +233,82 @@ class VoronoiDecoder(nn.Module):
         v[..., 1] = dv
         return torch.norm(v, dim=-1)
 
-    def _duplicate_seed_gate(
+    def _seed_activation_state(
         self,
         seeds: torch.Tensor,
-        base_gates: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         s = seeds.shape[0]
         if s <= 1:
-            return torch.ones((s,), device=seeds.device, dtype=seeds.dtype)
+            if s == 0:
+                active = torch.ones((s,), device=seeds.device, dtype=torch.bool)
+                return torch.ones((s,), device=seeds.device, dtype=seeds.dtype), active
+            u = seeds[:, 0]
+            v = seeds[:, 1]
+            active = (u >= 0.0) & (u <= 1.0) & (v >= 0.0) & (v <= 1.0)
+            temp = torch.as_tensor(
+                max(float(self.duplicate_merge_sigma) * float(self.duplicate_effect_temp_ratio), self.eps),
+                device=seeds.device,
+                dtype=seeds.dtype,
+            )
+            floor = torch.as_tensor(self.duplicate_effect_floor, device=seeds.device, dtype=seeds.dtype)
+            domain_weight = (
+                torch.sigmoid(u / temp)
+                * torch.sigmoid((1.0 - u) / temp)
+                * torch.sigmoid(v / temp)
+                * torch.sigmoid((1.0 - v) / temp)
+            )
+            weights = (floor + (1.0 - floor) * domain_weight) * active.to(seeds.dtype)
+            return weights, active
 
         dist = self._pairwise_seed_dist(seeds).to(device=seeds.device, dtype=seeds.dtype)
-        sigma = torch.as_tensor(self.duplicate_merge_sigma, device=seeds.device, dtype=seeds.dtype)
-        temp = torch.as_tensor(self.duplicate_merge_temp, device=seeds.device, dtype=seeds.dtype)
+        radius = torch.as_tensor(self.duplicate_merge_sigma, device=seeds.device, dtype=seeds.dtype)
+        close = dist <= radius
+        close.fill_diagonal_(True)
 
-        eye = torch.eye(s, dtype=torch.bool, device=seeds.device)
-        closeness = torch.exp(-(dist.pow(2)) / (sigma.pow(2) + self.eps))
-        closeness = closeness.masked_fill(eye, 0.0)
-        # Soft local cluster size: isolated seeds stay near 1, dense duplicate
-        # groups grow toward their effective membership count.
-        cluster_mass = 1.0 + closeness.sum(dim=1)
+        close_cpu = close.detach().cpu().numpy()
+        visited = [False] * s
+        active_cpu = np.zeros((s,), dtype=bool)
+        for start in range(s):
+            if visited[start]:
+                continue
+            stack = [start]
+            component = []
+            visited[start] = True
+            while stack:
+                i = stack.pop()
+                component.append(i)
+                for j in np.nonzero(close_cpu[i])[0].tolist():
+                    if not visited[j]:
+                        visited[j] = True
+                        stack.append(int(j))
+            active_cpu[min(component)] = True
 
-        idx = torch.arange(s, device=seeds.device, dtype=seeds.dtype)
-        if base_gates is not None:
-            pref = base_gates.to(device=seeds.device, dtype=seeds.dtype).clamp_min(self.eps).log()
-        else:
-            # Exact duplicate seeds are symmetric; this tiny bias only breaks
-            # ties smoothly when geometry alone cannot decide a winner.
-            pref = torch.zeros((s,), device=seeds.device, dtype=seeds.dtype)
+        active = torch.as_tensor(active_cpu, device=seeds.device, dtype=torch.bool)
+        temp = (radius * float(self.duplicate_effect_temp_ratio)).clamp_min(self.eps)
+        soft_close = torch.sigmoid((radius - dist) / temp)
+        soft_close = soft_close.masked_fill(torch.eye(s, dtype=torch.bool, device=seeds.device), 0.0)
+        lower_priority = torch.tril(
+            torch.ones((s, s), dtype=seeds.dtype, device=seeds.device),
+            diagonal=-1,
+        )
+        suppress_mass = (soft_close * lower_priority).sum(dim=1)
+        raw_weights = torch.exp(-float(self.duplicate_effect_strength) * suppress_mass)
+        floor = torch.as_tensor(self.duplicate_effect_floor, device=seeds.device, dtype=seeds.dtype)
+        weights = floor + (1.0 - floor) * raw_weights
+        u = seeds[:, 0]
+        v = seeds[:, 1]
+        inside_domain = (u >= 0.0) & (u <= 1.0) & (v >= 0.0) & (v <= 1.0)
+        active = active & inside_domain
 
-        crowding = (cluster_mass - 1.0).clamp_min(0.0)
-        adaptive_tiebreak = self.duplicate_tiebreak_scale * torch.tanh(crowding)   
-        pref = pref - adaptive_tiebreak * idx
-
-        pref_scaled = torch.exp(pref / temp.clamp_min(self.eps))
-        local_affinity = closeness + eye.to(seeds.dtype)
-        local_norm = local_affinity @ pref_scaled
-        merge_gate = pref_scaled / local_norm.clamp_min(self.eps)
-        return merge_gate.clamp_min(self.eps).clamp_max(1.0)
+        domain_weight = (
+            torch.sigmoid(u / temp)
+            * torch.sigmoid((1.0 - u) / temp)
+            * torch.sigmoid(v / temp)
+            * torch.sigmoid((1.0 - v) / temp)
+        )
+        weights = weights * (floor + (1.0 - floor) * domain_weight)
+        weights = weights * active.to(seeds.dtype)
+        return weights, active
 
     def _pair_distinctness(
         self,
@@ -782,7 +830,7 @@ class VoronoiDecoder(nn.Module):
         w_soft: torch.Tensor,          # (N, S)
         w_geo: torch.Tensor,
         beta: float | torch.Tensor,
-        seed_gates: torch.Tensor | None = None,
+        seed_active_weights: torch.Tensor | None = None,
     ):
         N, S = d.shape
 
@@ -791,13 +839,13 @@ class VoronoiDecoder(nn.Module):
         # --------------------------------------------------
         w_struct = w_soft
 
-        if seed_gates is not None:
-            if seed_gates.ndim != 1 or seed_gates.shape[0] != S:
+        if seed_active_weights is not None:
+            if seed_active_weights.ndim != 1 or seed_active_weights.shape[0] != S:
                 raise ValueError(
-                    f"seed_gates must have shape ({S},), got {tuple(seed_gates.shape)}"
+                    f"seed_active_weights must have shape ({S},), got {tuple(seed_active_weights.shape)}"
                 )
 
-            g = seed_gates.to(device=d.device, dtype=d.dtype).clamp_min(self.eps)
+            g = seed_active_weights.to(device=d.device, dtype=d.dtype).clamp_min(self.eps)
             w_struct = w_soft * g.unsqueeze(0)
             w_struct = w_struct / w_struct.sum(dim=1, keepdim=True).clamp_min(self.eps)
 
@@ -999,7 +1047,6 @@ class VoronoiDecoder(nn.Module):
         boundary_width_raw: torch.Tensor | None = None,
         boundary_alpha_raw: torch.Tensor | None = None,
         boundary_beta_raw: torch.Tensor | None = None,
-        seed_gates: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         self._validate_inputs(
             points_uv=points_uv,
@@ -1037,22 +1084,8 @@ class VoronoiDecoder(nn.Module):
 
         logits = -d / tau
 
-        gates = None
-        merge_gates = self._duplicate_seed_gate(seeds=seeds, base_gates=seed_gates)
-        if seed_gates is not None:
-            if seed_gates.ndim != 1 or seed_gates.shape[0] != S:
-                raise ValueError(
-                    f"seed_gates must have shape ({S},), got {tuple(seed_gates.shape)}"
-                )
-            gates = seed_gates.to(device=d.device, dtype=d.dtype)
-            gates = (gates * merge_gates).clamp_min(self.eps)
-        else:
-            gates = merge_gates
-        zero_gate_mask = gates <= 0
-        if bool((~zero_gate_mask).any()):
-            logits = logits + torch.log(gates.clamp_min(1e-8)).unsqueeze(0)
-        if bool(zero_gate_mask.any()):
-            logits = logits.masked_fill(zero_gate_mask.unsqueeze(0), -1e9)
+        seed_active_weights, seed_active_mask = self._seed_activation_state(seeds=seeds)
+        logits = logits + torch.log(seed_active_weights.clamp_min(self.eps)).unsqueeze(0)
 
         logits = logits - logits.max(dim=-1, keepdim=True).values
         logits = logits.clamp(min=-80.0, max=0.0)
@@ -1067,7 +1100,7 @@ class VoronoiDecoder(nn.Module):
             w_soft=w_soft,
             w_geo=w_geo,
             beta=self.beta,
-            seed_gates=gates,
+            seed_active_weights=seed_active_weights,
         )
 
         if self.use_boundary_attachment:
@@ -1148,8 +1181,11 @@ class VoronoiDecoder(nn.Module):
             "d": d,
             "M": M,
             "seeds": seeds,
-            "merge_gates": merge_gates,
-            "seed_gates_effective": gates,
+            "seed_active_weights": seed_active_weights,
+            "seed_active_mask": seed_active_mask,
+            "inactive_seed_indices": torch.nonzero(~seed_active_mask, as_tuple=False).flatten(),
+            "active_seed_count": seed_active_mask.to(seeds.dtype).sum(),
+            "inactive_seed_count": (~seed_active_mask).to(seeds.dtype).sum(),
             "rho": rho,
             "rho_s": rho_s,
             "rho_v": rho_v,
@@ -1201,7 +1237,6 @@ class VoronoiDecoder(nn.Module):
         boundary_width_raw=None,
         boundary_alpha_raw=None,
         boundary_beta_raw=None,
-        seed_gates=None,
     ):
         return self.evaluate_at_uv(
             points_uv=points_uv,
@@ -1219,7 +1254,6 @@ class VoronoiDecoder(nn.Module):
             boundary_width_raw=boundary_width_raw,
             boundary_alpha_raw=boundary_alpha_raw,
             boundary_beta_raw=boundary_beta_raw,
-            seed_gates=seed_gates,
         )
 
 
@@ -1261,7 +1295,6 @@ class VoronoiModelVisualizer:
         boundary_face_id=None,
         eps: float = 1e-8,
         use_metric_anisotropy: bool = False,
-        duplicate_tiebreak_scale: float = 0.1,
         w_min: float = 0.005,
         fixed_height: float | None = None,
         use_boundary_attachment: bool = False,
@@ -1301,7 +1334,6 @@ class VoronoiModelVisualizer:
             face_u_periodic=face_u_periodic,
             face_v_periodic=face_v_periodic,
             seed_face_id=seed_face_id,
-            duplicate_tiebreak_scale =duplicate_tiebreak_scale,
             **decoder_kwargs,
         ).to(device=self.device, dtype=self.dtype)
         self.decoder.eval()
@@ -1420,7 +1452,6 @@ class VoronoiModelVisualizer:
         h_raw=None,
         theta=None,
         a_raw=None,
-        seed_gates=None,
         query: MeshQueryData | None = None,
         boundary_uv=None,
         boundary_face_id=None,
@@ -1458,7 +1489,6 @@ class VoronoiModelVisualizer:
                 boundary_width_raw=self._to_tensor(boundary_width_raw, dtype=self.dtype),
                 boundary_alpha_raw=self._to_tensor(boundary_alpha_raw, dtype=self.dtype),
                 boundary_beta_raw=self._to_tensor(boundary_beta_raw, dtype=self.dtype),
-                seed_gates=self._to_tensor(seed_gates, dtype=self.dtype),
             )
 
     def compute_case_volume(
@@ -1503,258 +1533,15 @@ class VoronoiModelVisualizer:
             "volfrac_sharp": float(volfrac_sharp.detach().cpu().item()),
         }
 
-    def evaluate_cases(
-        self,
-        *,
-        seeds_raw,
-        gate_vectors: dict[str, torch.Tensor | list[float]],
-        w_raw,
-        h_raw=None,
-        theta=None,
-        a_raw=None,
-        query: MeshQueryData | None = None,
-        boundary_uv=None,
-        boundary_face_id=None,
-        boundary_width_raw=None,
-        boundary_alpha_raw=None,
-        boundary_beta_raw=None,
-    ) -> dict[str, dict[str, torch.Tensor]]:
-        seeds_raw_t = self._to_tensor(seeds_raw, dtype=self.dtype)
-        w_raw_t = self._to_tensor(w_raw, dtype=self.dtype)
-
-        outputs: dict[str, dict[str, torch.Tensor]] = {}
-        for name, gates in gate_vectors.items():
-            outputs[name] = self.run_case(
-                seeds_raw=seeds_raw_t,
-                w_raw=w_raw_t,
-                h_raw=h_raw,
-                theta=theta,
-                a_raw=a_raw,
-                seed_gates=gates,
-                query=query,
-                boundary_uv=boundary_uv,
-                boundary_face_id=boundary_face_id,
-                boundary_width_raw=boundary_width_raw,
-                boundary_alpha_raw=boundary_alpha_raw,
-                boundary_beta_raw=boundary_beta_raw,
-            )
-        return outputs
-
-    def sweep_single_seed(
-        self,
-        *,
-        seeds_raw,
-        w_raw,
-        seed_index: int,
-        gate_values: list[float],
-        h_raw=None,
-        theta=None,
-        a_raw=None,
-        query: MeshQueryData | None = None,
-        boundary_uv=None,
-        boundary_face_id=None,
-        boundary_width_raw=None,
-        boundary_alpha_raw=None,
-        boundary_beta_raw=None,
-        baseline_gate: float = 1.0,
-    ) -> dict[str, dict[str, torch.Tensor]]:
-        seed_index = int(seed_index)
-        if not (0 <= seed_index < self.n_seeds):
-            raise ValueError(f"seed_index must be in [0, {self.n_seeds}), got {seed_index}")
-
-        base = torch.full(
-            (self.n_seeds,),
-            float(baseline_gate),
-            device=self.device,
-            dtype=self.dtype,
-        )
-
-        gate_vectors: dict[str, torch.Tensor] = {}
-        for gate_value in gate_values:
-            g = base.clone()
-            g[seed_index] = float(gate_value)
-            gate_vectors[f"seed_{seed_index}_gate_{gate_value:.4f}"] = g
-
-        return self.evaluate_cases(
-            seeds_raw=seeds_raw,
-            gate_vectors=gate_vectors,
-            w_raw=w_raw,
-            h_raw=h_raw,
-            theta=theta,
-            a_raw=a_raw,
-            query=query,
-            boundary_uv=boundary_uv,
-            boundary_face_id=boundary_face_id,
-            boundary_width_raw=boundary_width_raw,
-            boundary_alpha_raw=boundary_alpha_raw,
-            boundary_beta_raw=boundary_beta_raw,
-        )
-
     # ---------------------------
     # plotting
     # ---------------------------
-
-    def plot_uv_cases(
-        self,
-        *,
-        cases: dict[str, dict[str, torch.Tensor]],
-        seeds_raw,
-        gate_vectors: dict[str, torch.Tensor | list[float]],
-        active_threshold: float = 0.05,
-        cmap: str = "viridis",
-        figsize_scale: float = 5.0,
-        query: MeshQueryData | None = None,
-    ):
-        q = self.query if query is None else query
-        uv_plot = q.points_uv.detach().cpu()
-        seeds_plot = self._to_tensor(seeds_raw, dtype=self.dtype).detach().cpu()
-
-        n_cases = len(cases)
-        ncols = min(3, n_cases)
-        nrows = math.ceil(n_cases / ncols)
-
-        fig, axes = plt.subplots(
-            nrows,
-            ncols,
-            figsize=(figsize_scale * ncols, figsize_scale * nrows),
-            squeeze=False,
-        )
-
-        for ax, (case_name, out) in zip(axes.ravel(), cases.items()):
-            rho_plot = out["rho"].detach().cpu()
-            gates_plot = self._to_tensor(gate_vectors[case_name], dtype=self.dtype).detach().cpu()
-            active_mask = gates_plot > active_threshold
-
-            ax.scatter(
-                uv_plot[:, 0],
-                uv_plot[:, 1],
-                c=rho_plot,
-                s=8,
-                cmap=cmap,
-                vmin=0.0,
-                vmax=1.0,
-            )
-
-            if (~active_mask).any():
-                ax.scatter(
-                    seeds_plot[~active_mask, 0],
-                    seeds_plot[~active_mask, 1],
-                    s=90,
-                    c="lightgray",
-                    edgecolors="black",
-                    linewidths=1.0,
-                    label="inactive seed",
-                )
-
-            if active_mask.any():
-                ax.scatter(
-                    seeds_plot[active_mask, 0],
-                    seeds_plot[active_mask, 1],
-                    s=90,
-                    c="red",
-                    edgecolors="white",
-                    linewidths=1.0,
-                    label="active seed",
-                )
-
-            ax.set_title(case_name)
-            ax.set_aspect("equal")
-            ax.set_xlabel("u")
-            ax.set_ylabel("v")
-
-        for ax in axes.ravel()[n_cases:]:
-            ax.axis("off")
-
-        handles, labels = axes[0, 0].get_legend_handles_labels()
-        if handles:
-            fig.legend(handles, labels, loc="upper center", ncol=min(3, len(labels)))
-
-        fig.subplots_adjust(top=0.88, wspace=0.25, hspace=0.30)
-        return fig
-
-    def plot_3d_cases(
-        self,
-        *,
-        cases: dict[str, dict[str, torch.Tensor]],
-        seeds_raw,
-        gate_vectors: dict[str, torch.Tensor | list[float]],
-        active_threshold: float = 0.05,
-        cmap: str = "viridis",
-        window_size: tuple[int, int] = (1400, 900),
-        clim: tuple[float, float] = (0.0, 1.0),
-        show_edges: bool = False,
-        query: MeshQueryData | None = None,
-    ):
-        q = self.query if query is None else query
-
-        seed_xyz = self.seeds_uv_to_xyz_nearest(
-            seeds_uv=self._to_tensor(seeds_raw, dtype=self.dtype),
-            uv=q.points_uv,
-            points_xyz=q.points_xyz,
-        )
-        pv_faces = self.faces_ijk_to_pv_faces(q.faces_ijk)
-
-        n_cases = len(cases)
-        ncols = min(3, n_cases)
-        nrows = int(np.ceil(n_cases / ncols))
-
-        plotter = pv.Plotter(shape=(nrows, ncols), window_size=window_size)
-
-        for idx, (case_name, out) in enumerate(cases.items()):
-            r = idx // ncols
-            c = idx % ncols
-            plotter.subplot(r, c)
-
-            rho_plot = out["rho"].detach().cpu().numpy().astype(np.float32)
-            gates_plot = self._to_tensor(gate_vectors[case_name], dtype=self.dtype).detach().cpu().numpy()
-            active_mask = gates_plot > active_threshold
-
-            mesh = pv.PolyData(
-                q.points_xyz.detach().cpu().numpy(),
-                pv_faces,
-            )
-            mesh["rho"] = rho_plot
-
-            plotter.add_text(case_name, font_size=10)
-            plotter.add_mesh(
-                mesh,
-                scalars="rho",
-                cmap=cmap,
-                clim=list(clim),
-                show_edges=show_edges,
-            )
-
-            if active_mask.any():
-                active_cloud = pv.PolyData(seed_xyz[active_mask].detach().cpu().numpy())
-                plotter.add_mesh(
-                    active_cloud,
-                    color="red",
-                    render_points_as_spheres=True,
-                    point_size=14,
-                )
-
-            if (~active_mask).any():
-                inactive_cloud = pv.PolyData(seed_xyz[~active_mask].detach().cpu().numpy())
-                plotter.add_mesh(
-                    inactive_cloud,
-                    color="gray",
-                    opacity=0.45,
-                    render_points_as_spheres=True,
-                    point_size=12,
-                )
-
-            plotter.show_axes()
-
-        plotter.link_views()
-        return plotter
 
     def plot_uv_fields(
         self,
         *,
         out: dict[str, torch.Tensor],
         seeds_raw,
-        seed_gates=None,
-        active_threshold: float = 0.05,
         cmap: str = "viridis",
         figsize: tuple[float, float] = (12.0, 5.0),
         fiber_stride: int = 20,
@@ -1767,11 +1554,11 @@ class VoronoiModelVisualizer:
         uv_plot = q.points_uv.detach().cpu()
         seeds_plot = self._to_tensor(seeds_raw, dtype=self.dtype).detach().cpu()
 
-        if seed_gates is None:
-            gates_plot = torch.ones(seeds_plot.shape[0], dtype=self.dtype)
+        active_mask_out = out.get("seed_active_mask")
+        if active_mask_out is None:
+            active_mask = torch.ones(seeds_plot.shape[0], dtype=torch.bool)
         else:
-            gates_plot = self._to_tensor(seed_gates, dtype=self.dtype).detach().cpu()
-        active_mask = gates_plot > active_threshold
+            active_mask = active_mask_out.detach().cpu().bool()
 
         rho_plot = out["rho"].detach().cpu()
         t_uv_plot = out["t_uv_raw"].detach().cpu()
@@ -1894,8 +1681,6 @@ class VoronoiModelVisualizer:
         *,
         out: dict[str, torch.Tensor],
         seeds_raw,
-        seed_gates=None,
-        active_threshold: float = 0.05,
         cmap: str = "viridis",
         window_size: tuple[int, int] = (1500, 700),
         clim: tuple[float, float] = (0.0, 1.0),
@@ -1913,11 +1698,11 @@ class VoronoiModelVisualizer:
             uv=q.points_uv,
             points_xyz=q.points_xyz,
         )
-        if seed_gates is None:
-            gates_plot = torch.ones(seed_xyz.shape[0], dtype=self.dtype)
+        active_mask_out = out.get("seed_active_mask")
+        if active_mask_out is None:
+            active_mask = torch.ones(seed_xyz.shape[0], dtype=torch.bool)
         else:
-            gates_plot = self._to_tensor(seed_gates, dtype=self.dtype).detach().cpu()
-        active_mask = gates_plot > active_threshold
+            active_mask = active_mask_out.detach().cpu().bool()
 
         pv_faces = self.faces_ijk_to_pv_faces(q.faces_ijk)
         mesh = pv.PolyData(
@@ -2026,14 +1811,12 @@ class VoronoiModelVisualizer:
         h_raw=None,
         theta=None,
         a_raw=None,
-        seed_gates=None,
         query: MeshQueryData | None = None,
         boundary_uv=None,
         boundary_face_id=None,
         boundary_width_raw=None,
         boundary_alpha_raw=None,
         boundary_beta_raw=None,
-        active_threshold: float = 0.05,
         show_uv: bool = True,
         show_3d: bool = True,
         cmap: str = "viridis",
@@ -2049,7 +1832,6 @@ class VoronoiModelVisualizer:
             h_raw=h_raw,
             theta=theta,
             a_raw=a_raw,
-            seed_gates=seed_gates,
             query=query,
             boundary_uv=boundary_uv,
             boundary_face_id=boundary_face_id,
@@ -2064,8 +1846,6 @@ class VoronoiModelVisualizer:
             result["uv_fig"] = self.plot_uv_fields(
                 out=out,
                 seeds_raw=seeds_raw,
-                seed_gates=seed_gates,
-                active_threshold=active_threshold,
                 cmap=cmap,
                 fiber_stride=fiber_stride,
                 fiber_scale=fiber_scale_uv,
@@ -2078,8 +1858,6 @@ class VoronoiModelVisualizer:
             result["plotter"] = self.plot_3d_fields(
                 out=out,
                 seeds_raw=seeds_raw,
-                seed_gates=seed_gates,
-                active_threshold=active_threshold,
                 cmap=cmap,
                 fiber_stride=fiber_stride,
                 fiber_scale=fiber_scale_3d,
@@ -2087,67 +1865,5 @@ class VoronoiModelVisualizer:
                 show_fiber_density_background=show_fiber_density_background,
                 query=query,
             )
-
-        return result
-
-    # ---------------------------
-    # one-shot interface
-    # ---------------------------
-
-    def visualize(
-        self,
-        *,
-        seeds_raw,
-        gate_vectors: dict[str, torch.Tensor | list[float]],
-        w_raw,
-        h_raw=None,
-        theta=None,
-        a_raw=None,
-        query: MeshQueryData | None = None,
-        boundary_uv=None,
-        boundary_face_id=None,
-        boundary_width_raw=None,
-        boundary_alpha_raw=None,
-        boundary_beta_raw=None,
-        active_threshold: float = 0.05,
-        show_uv: bool = True,
-        show_3d: bool = True,
-    ) -> dict[str, Any]:
-        cases = self.evaluate_cases(
-            seeds_raw=seeds_raw,
-            gate_vectors=gate_vectors,
-            w_raw=w_raw,
-            h_raw=h_raw,
-            theta=theta,
-            a_raw=a_raw,
-            query=query,
-            boundary_uv=boundary_uv,
-            boundary_face_id=boundary_face_id,
-            boundary_width_raw=boundary_width_raw,
-            boundary_alpha_raw=boundary_alpha_raw,
-            boundary_beta_raw=boundary_beta_raw,
-        )
-
-        result: dict[str, Any] = {"cases": cases}
-
-        if show_uv:
-            fig = self.plot_uv_cases(
-                cases=cases,
-                seeds_raw=seeds_raw,
-                gate_vectors=gate_vectors,
-                active_threshold=active_threshold,
-                query=query,
-            )
-            result["uv_fig"] = fig
-
-        if show_3d:
-            plotter = self.plot_3d_cases(
-                cases=cases,
-                seeds_raw=seeds_raw,
-                gate_vectors=gate_vectors,
-                active_threshold=active_threshold,
-                query=query,
-            )
-            result["plotter"] = plotter
 
         return result
