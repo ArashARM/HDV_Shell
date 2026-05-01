@@ -70,6 +70,7 @@ class TrainingConfig:
     lam_strut_edge: float = 1.0
     lam_strut_void: float = 0.25
     lam_width_active: float = 0.05
+    lam_seed_active: float = 0.0
     width_target_frac: float = 0.20
     width_target_sparse_boost: float = 1.5
     width_target_frac_max: float = 0.85
@@ -109,24 +110,12 @@ class TrainingConfig:
     anchor_guard_width_factor_min: float = 1.20
     anchor_guard_min_seed_dist_factor: float = 2.0
 
-    restore_best_on_collapse: bool = True
-    collapse_rep_threshold: float = 0.80
-    collapse_bnd_threshold: float = 0.90
-    collapse_vol_eff_threshold: float = 0.05
-    collapse_width_factor: float = 1.10
     collapse_min_seed_dist_factor: float = 2.0
-    collapse_restore_cooldown: int = 75
-    collapse_lr_shrink: float = 0.5
-    post_restore_seed_freeze_steps: int = 100
-    post_restore_offset_scale: float = 0.25
-    repair_collapsed_seed_anchors: bool = True
-    seed_repair_iters: int = 8
     project_seed_spacing_each_step: bool = True
     seed_projection_iters: int = 4
-    allow_seed_outside_domain: bool = False
+    allow_seed_outside_domain: bool = True
+    allow_seed_outside_domain_warmup_frac: float = 0.50
     seed_domain_margin: float = 0.25
-    respawn_inactive_seeds_on_collapse: bool = True
-    seed_respawn_margin: float = 0.04
 
     lr_seed_refine: float = 1e-1
     lr_delta_head: float = 2e-4
@@ -230,39 +219,20 @@ class TrainingConfig:
                 "anchor_guard_min_seed_dist_factor must be >= 0, "
                 f"got {self.anchor_guard_min_seed_dist_factor}"
             )
-        if self.collapse_width_factor < 1.0:
-            raise ValueError(f"collapse_width_factor must be >= 1, got {self.collapse_width_factor}")
         if self.collapse_min_seed_dist_factor < 0.0:
             raise ValueError(
                 "collapse_min_seed_dist_factor must be >= 0, "
                 f"got {self.collapse_min_seed_dist_factor}"
             )
-        if self.collapse_restore_cooldown < 0:
-            raise ValueError(
-                f"collapse_restore_cooldown must be >= 0, got {self.collapse_restore_cooldown}"
-            )
-        if not (0.0 < self.collapse_lr_shrink <= 1.0):
-            raise ValueError(f"collapse_lr_shrink must be in (0,1], got {self.collapse_lr_shrink}")
-        if self.post_restore_seed_freeze_steps < 0:
-            raise ValueError(
-                "post_restore_seed_freeze_steps must be >= 0, "
-                f"got {self.post_restore_seed_freeze_steps}"
-            )
-        if self.post_restore_offset_scale <= 0.0:
-            raise ValueError(
-                f"post_restore_offset_scale must be > 0, got {self.post_restore_offset_scale}"
-            )
-        if self.seed_repair_iters < 0:
-            raise ValueError(f"seed_repair_iters must be >= 0, got {self.seed_repair_iters}")
         if self.seed_projection_iters < 0:
             raise ValueError(f"seed_projection_iters must be >= 0, got {self.seed_projection_iters}")
+        if not (0.0 <= self.allow_seed_outside_domain_warmup_frac <= 1.0):
+            raise ValueError(
+                "allow_seed_outside_domain_warmup_frac must be in [0,1], "
+                f"got {self.allow_seed_outside_domain_warmup_frac}"
+            )
         if self.seed_domain_margin < 0.0:
             raise ValueError(f"seed_domain_margin must be >= 0, got {self.seed_domain_margin}")
-        if not (0.0 <= self.seed_respawn_margin < 0.5):
-            raise ValueError(
-                "seed_respawn_margin must be in [0, 0.5), "
-                f"got {self.seed_respawn_margin}"
-            )
         if self.seed_offset_scale_start is not None and self.seed_offset_scale_start <= 0.0:
             raise ValueError(
                 f"seed_offset_scale_start must be > 0, got {self.seed_offset_scale_start}"
@@ -278,6 +248,8 @@ class TrainingConfig:
             )
         if self.min_active_seeds is not None and self.min_active_seeds < 1:
             raise ValueError(f"min_active_seeds must be >= 1, got {self.min_active_seeds}")
+        if self.lam_seed_active < 0.0:
+            raise ValueError(f"lam_seed_active must be >= 0, got {self.lam_seed_active}")
 
 class RunningNorm:
     def __init__(self, momentum: float = 0.99, eps: float = 1e-12):
@@ -457,6 +429,7 @@ class NN_Trainer:
         self._tb_add_scalar("Loss/StrutVoid", row["loss_strut_void"], step)
         self._tb_add_scalar("Loss/FEM", row["loss_fem"], step)
         self._tb_add_scalar("Loss/Compliance", row["loss_comp"], step)
+        self._tb_add_scalar("Loss/SeedActive", row["loss_seed_active"], step)
 
         self._tb_add_scalar("Physics/ComplianceRaw", row["comp"], step)
         self._tb_add_scalar("Physics/VolumeFraction", row["vol_frac"], step)
@@ -505,6 +478,7 @@ class NN_Trainer:
         self._tb_add_scalar("seed_activation/weight_mean", row["seed_active_weight_mean"], step)
         self._tb_add_scalar("seed_activation/weight_max", row["seed_active_weight_max"], step)
         self._tb_add_scalar("seed_activation/hard_refine_on", row["hard_refine_on"], step)
+        self._tb_add_scalar("seed_activation/collapse_active", row["collapse_active"], step)
         self._tb_add_scalar("Loss/WidthActive", row["loss_width_active"], step)
         self._tb_add_scalar("Geometry/lam_width_active_eff", row["lam_width_active_eff"], step)
         self._tb_add_scalar("Train/BestHardScore", row["best_hard_score"], step)
@@ -665,6 +639,13 @@ class NN_Trainer:
         t = t * t * (3.0 - 2.0 * t)
         return float((1.0 - t) * float(start) + t * float(final))
 
+    def allow_seed_outside_domain_for_step(self, step: int) -> bool:
+        cfg = self.cfg
+        if not bool(cfg.allow_seed_outside_domain):
+            return False
+        warmup_step = int(round(float(cfg.allow_seed_outside_domain_warmup_frac) * float(cfg.num_steps)))
+        return int(step) >= warmup_step
+
     @staticmethod
     def min_pairwise_seed_distance(seeds_list: list[torch.Tensor]) -> float:
         min_seed_dist = float("inf")
@@ -724,70 +705,6 @@ class NN_Trainer:
                 if clamp_to_domain:
                     seeds.clamp_(float(eps_uv), 1.0 - float(eps_uv))
         return repaired
-
-    @staticmethod
-    def respawn_inactive_seed_anchors(
-        seeds_list: list[torch.Tensor],
-        pred_list: list[dict] | None,
-        margin: float = 0.04,
-        grid_res: int = 17,
-    ) -> tuple[list[torch.Tensor], int]:
-        repaired = [s.detach().clone() for s in seeds_list]
-        if pred_list is None:
-            return repaired, 0
-
-        margin = min(max(float(margin), 0.0), 0.49)
-        grid_res = max(int(grid_res), 3)
-        respawned = 0
-
-        for face_idx, seeds in enumerate(repaired):
-            if face_idx >= len(pred_list):
-                continue
-            active_mask = pred_list[face_idx].get("seed_active_mask", None)
-            if active_mask is None:
-                continue
-
-            active_mask = active_mask.detach().to(device=seeds.device, dtype=torch.bool).reshape(-1)
-            if active_mask.numel() != seeds.shape[0]:
-                continue
-
-            inactive_idx = torch.nonzero(~active_mask, as_tuple=False).flatten()
-            if inactive_idx.numel() == 0:
-                continue
-
-            coords = torch.linspace(
-                margin,
-                1.0 - margin,
-                grid_res,
-                device=seeds.device,
-                dtype=seeds.dtype,
-            )
-            uu, vv = torch.meshgrid(coords, coords, indexing="ij")
-            candidates = torch.stack((uu.reshape(-1), vv.reshape(-1)), dim=-1)
-
-            keep_points = seeds[active_mask]
-            for local_rank, seed_idx_t in enumerate(inactive_idx):
-                if keep_points.numel() == 0:
-                    chosen = candidates[(local_rank * 37) % candidates.shape[0]]
-                else:
-                    d = torch.cdist(candidates, keep_points)
-                    min_d = d.min(dim=1).values
-                    # Tiny deterministic bias prevents every respawn from choosing
-                    # the same symmetric point when distances tie.
-                    bias = torch.linspace(
-                        0.0,
-                        1e-6,
-                        candidates.shape[0],
-                        device=seeds.device,
-                        dtype=seeds.dtype,
-                    )
-                    chosen = candidates[torch.argmax(min_d + bias)]
-                seed_idx = int(seed_idx_t.item())
-                seeds[seed_idx] = chosen
-                keep_points = torch.cat([keep_points, chosen.reshape(1, 2)], dim=0)
-                respawned += 1
-
-        return repaired, respawned
 
     @staticmethod
     def active_width_loss(
@@ -1418,7 +1335,10 @@ class NN_Trainer:
                 if self.cfg.w_head_bias_init is None
                 else float(self.cfg.w_head_bias_init)
             ),
-            allow_seed_outside_domain=self.cfg.allow_seed_outside_domain,
+            allow_seed_outside_domain=(
+                bool(self.cfg.allow_seed_outside_domain)
+                and float(self.cfg.allow_seed_outside_domain_warmup_frac) <= 0.0
+            ),
             seed_domain_margin=self.cfg.seed_domain_margin,
         ).to(device)
 
@@ -3550,7 +3470,6 @@ class NN_Trainer:
         best_fiber_surface = None
         best_seeds = None
         best_pred = None
-        best_ppnet_state = None
         best_hard_score = float("inf")
         best_hard_vol_frac = None
         best_hard_comp = None
@@ -3575,9 +3494,6 @@ class NN_Trainer:
         rho0 = None
         seeds0 = None
         anchor_update_allowed = True
-        collapse_restore_count = 0
-        last_collapse_restore_step = -10**9
-        seed_freeze_until_step = -1
         history = []
 
         self.current_face_tensors = face_tensors
@@ -3599,6 +3515,9 @@ class NN_Trainer:
                 # if cfg.predict_tau is none , always use cfg.tau as the tau value.
                 # if cfg.predict_tau is true,  it returns  cfg.tau_predic_start
                 # if Cfg.predict_tau is false, it returns annealed value.
+                allow_seed_outside_domain_step = self.allow_seed_outside_domain_for_step(step)
+                for ppnet in ppnets:
+                    ppnet.allow_seed_outside_domain = allow_seed_outside_domain_step
                 tau_step = self._tau_for_step(step)
                 use_hard_refine_step = step >= int(round(float(cfg.hard_refine_start_frac) * float(cfg.num_steps)))
                 rho_acc = torch.zeros((vertices_number,), dtype=dtype, device=device)
@@ -3624,6 +3543,7 @@ class NN_Trainer:
                 strut_terms = []
                 strut_edge_terms = []
                 strut_void_terms = []
+                seed_active_terms = []
                 w_geo_terms = []
                 h_terms = []
 
@@ -3654,15 +3574,13 @@ class NN_Trainer:
                 compute_strut_loss = cfg.lam_strut != 0.0
                 compute_vol_loss = cfg.lam_vol != 0.0
                 compute_width_active_loss = cfg.lam_width_active != 0.0
+                compute_seed_active_loss = cfg.lam_seed_active != 0.0
                 update_seed_anchors = (
                     cfg.use_rolling_seed_anchors
                     and step >= int(round(float(cfg.seed_anchor_warmup_frac) * float(cfg.num_steps)))
                     and (anchor_update_allowed or not cfg.guard_seed_anchor_updates)
                 )
                 seed_offset_scale_step = self.seed_offset_scale_for_step(step)
-                seed_motion_frozen = step < seed_freeze_until_step
-                if seed_motion_frozen:
-                    seed_offset_scale_step = min(seed_offset_scale_step, float(cfg.post_restore_offset_scale))
                 uv_anchor_next_list = []
 
                 for ft, decoder, ppnet, uv_anchor_i, context_i, A_local, face_weight_i in zip(
@@ -3683,7 +3601,7 @@ class NN_Trainer:
                             min_dist=float(cfg.collapse_min_seed_dist_factor) * float(cfg.w_min),
                             iters=int(cfg.seed_projection_iters),
                             detach=False,
-                            clamp_to_domain=not bool(cfg.allow_seed_outside_domain),
+                            clamp_to_domain=not allow_seed_outside_domain_step,
                         )[0]
                         pred_i["seeds_raw"] = pred_i["seeds_raw"].clone()
                         pred_i["seeds_raw"][0] = seeds_raw_i
@@ -3780,6 +3698,18 @@ class NN_Trainer:
                     active_weight_mean_sum += float(seed_active_weights_i.detach().mean().item())
                     active_weight_max_list.append(float(seed_active_weights_i.detach().max().item()))
                     active_face_count += 1
+
+                    if compute_seed_active_loss:
+                        target_active = float(cfg.min_active_seeds or total_seed_i)
+                        active_mass = seed_active_weights_i.clamp(0.0, 1.0).sum()
+                        target_active_t = torch.as_tensor(
+                            target_active,
+                            device=device,
+                            dtype=dtype,
+                        )
+                        seed_active_terms.append(
+                            torch.relu(target_active_t - active_mass).pow(2)
+                        )
 
                     boundary_width_i = decoder_out["boundary_width"]
                     boundary_alpha_i = decoder_out["boundary_alpha"]
@@ -3976,6 +3906,7 @@ class NN_Trainer:
                 loss_strut = self._safe_weighted_mean(strut_terms, face_weights_this_step, dtype, device, cfg.eps) if compute_strut_loss else zero
                 loss_strut_edge = self._safe_weighted_mean(strut_edge_terms, face_weights_this_step, dtype, device, cfg.eps) if compute_strut_loss else zero
                 loss_strut_void = self._safe_weighted_mean(strut_void_terms, face_weights_this_step, dtype, device, cfg.eps) if compute_strut_loss else zero
+                loss_seed_active = self._safe_weighted_mean(seed_active_terms, face_weights_this_step, dtype, device, cfg.eps) if compute_seed_active_loss else zero
 
                 w_geo_mean = self._safe_weighted_mean(w_geo_terms, face_weights_this_step, dtype, device, cfg.eps)
                 h_mean = self._safe_weighted_mean(h_terms, face_weights_this_step, dtype, device, cfg.eps)
@@ -4140,6 +4071,9 @@ class NN_Trainer:
                 if lam_width_active_eff != 0.0:
                     L_total = L_total + lam_width_active_eff * loss_width_active
 
+                if cfg.lam_seed_active != 0.0:
+                    L_total = L_total + cfg.lam_seed_active * loss_seed_active
+
                 if cfg.lam_fem != 0.0:
                     if fem_is_valid:
                         L_total = L_total + cfg.lam_fem * (loss_fem / n_fem)
@@ -4201,13 +4135,6 @@ class NN_Trainer:
                                     if cfg.freeze_tau_head_during_hard_refine and hasattr(ppnet, "tau_head"):
                                         for p in ppnet.tau_head.parameters():
                                             p.grad = None
-                            if seed_motion_frozen:
-                                for ppnet in ppnets:
-                                    for p in ppnet.seed_refine.parameters():
-                                        p.grad = None
-                                    for p in ppnet.delta_head.parameters():
-                                        p.grad = None
-
                             opt.step()
 
                             bad_param_info = self._nonfinite_param_info(ppnets)
@@ -4276,13 +4203,6 @@ class NN_Trainer:
                         best_fiber_surface = fiber_surface.detach().clone()
                         best_seeds = [s.detach().clone() for s in seeds_list]
                         best_pred = self._clone_pred_list(pred_list)
-                        best_ppnet_state = [
-                            {
-                                k: v.detach().clone()
-                                for k, v in ppnet.state_dict().items()
-                            }
-                            for ppnet in ppnets
-                        ]
 
                         if improvement_gap is None or improvement_gap > 50:
                             tqdm.write(
@@ -4338,7 +4258,7 @@ class NN_Trainer:
                         "loss_strut_void": self._finite_or_default(loss_strut_void),
                         "loss_fem": self._finite_or_default(loss_fem),
                         "loss_comp": self._finite_or_default(loss_comp),
-                        "loss_seed_active": 0.0,
+                        "loss_seed_active": self._finite_or_default(loss_seed_active),
                         "comp": self._finite_or_default(comp_val),
                         "vol_frac": float(vol_frac.detach().item()),
                         "vol_frac_internal": float(vol_frac_v.detach().item()),
@@ -4394,8 +4314,11 @@ class NN_Trainer:
                         "loss_width_active": self._finite_or_default(loss_width_active),
                         "lam_width_active_eff": lam_width_active_eff,
                         "anchor_update_allowed": 1.0 if anchor_update_allowed else 0.0,
-                        "collapse_restore_count": float(collapse_restore_count),
-                        "seed_motion_frozen": 1.0 if seed_motion_frozen else 0.0,
+                        "collapse_active": (
+                            1.0
+                            if participating_count_total < float(cfg.min_active_seeds or 1)
+                            else 0.0
+                        ),
                     }
                     history.append(row)
 
@@ -4426,6 +4349,7 @@ class NN_Trainer:
                             "L_Total": row["L_total"],
                             "L_Volume": row["loss_vol"],
                             "L_FEM": row["loss_fem"],
+                            "L_Active": row["loss_seed_active"],
                             "L_St": row["loss_strut"],
                             "L_Bnd": row["loss_bnd"],
                             "L_Rep": row["loss_rep"],
@@ -4468,11 +4392,11 @@ class NN_Trainer:
                         fem_status = "OK" if fem_is_valid else f"BAD({fem_failure_reason})"
                         tqdm.write(
                             f"[{step:05d}] | "
-                            f"active(total/mean)={participating_count_total:.0f}/{participating_count_mean:.2f} | "
-                            f"inactive(total/mean)={inactive_count_total:.0f}/{inactive_count_mean:.2f} | "
+                            f"Active Seeds/Total={participating_count_total:.0f}/{participating_count_total+inactive_count_total:.0f} | "
                             f"L_total={row['L_total']:.4e} | "
                             f"L_vol={row['loss_vol']:.3e} "
                             f"L_fem={row['loss_fem']:.3e} "
+                            f"L_active={row['loss_seed_active']:.3e}"
                             f"L_strut={row['loss_strut']:.3e} "
                             f"L_rep={row['loss_rep']:.3e} "
                             f"L_bnd={row['loss_bnd']:.3e} "
@@ -4510,8 +4434,6 @@ class NN_Trainer:
                     w_geo_value = float(row["w_geo_mean"])
                     min_seed_dist_value = float(row["min_seed_dist"])
                     min_seed_dist_limit = float(cfg.anchor_guard_min_seed_dist_factor) * float(cfg.w_min)
-                    collapse_seed_dist_limit = float(cfg.collapse_min_seed_dist_factor) * float(cfg.w_min)
-                    min_active_seed_count = float(cfg.min_active_seeds or 1)
 
                     anchor_update_allowed = (
                         rep_value <= float(cfg.anchor_guard_rep_max)
@@ -4520,58 +4442,6 @@ class NN_Trainer:
                         and w_geo_value >= float(cfg.anchor_guard_width_factor_min) * float(cfg.w_min)
                         and min_seed_dist_value >= min_seed_dist_limit
                     )
-
-                    active_seed_count_collapsed = participating_count_total < min_active_seed_count
-                    seed_spacing_collapsed = min_seed_dist_value < collapse_seed_dist_limit
-                    can_restore_from_best = (
-                        cfg.restore_best_on_collapse
-                        and active_seed_count_collapsed
-                        and best_ppnet_state is not None
-                        and best_seeds is not None
-                        and step > best_step
-                        and (step - last_collapse_restore_step) >= int(cfg.collapse_restore_cooldown)
-                    )
-                    if can_restore_from_best:
-                        for ppnet, state in zip(ppnets, best_ppnet_state):
-                            ppnet.load_state_dict(state)
-                            ppnet.zero_grad(set_to_none=True)
-                        opt.state.clear()
-                        for group in opt.param_groups:
-                            group["lr"] = max(float(group["lr"]) * float(cfg.collapse_lr_shrink), 1e-8)
-                        if cfg.repair_collapsed_seed_anchors and seed_spacing_collapsed:
-                            uv_anchor_list = self.project_seed_spacing(
-                                seeds_list=best_seeds,
-                                min_dist=collapse_seed_dist_limit,
-                                iters=int(cfg.seed_repair_iters),
-                                clamp_to_domain=not bool(cfg.allow_seed_outside_domain),
-                            )
-                            repaired_dmin = self.min_pairwise_seed_distance(uv_anchor_list)
-                            anchor_source = f"repaired collapsed seeds dmin={repaired_dmin:.3e}"
-                        else:
-                            uv_anchor_list = [s.detach().clone() for s in best_seeds]
-                            anchor_source = "best seeds"
-
-                        if cfg.respawn_inactive_seeds_on_collapse:
-                            uv_anchor_list, respawned_seed_count = self.respawn_inactive_seed_anchors(
-                                seeds_list=uv_anchor_list,
-                                pred_list=best_pred,
-                                margin=float(cfg.seed_respawn_margin),
-                            )
-                            if respawned_seed_count > 0:
-                                anchor_source = f"{anchor_source}; respawned inactive seeds={respawned_seed_count}"
-
-                        anchor_update_allowed = False
-                        seed_freeze_until_step = step + int(cfg.post_restore_seed_freeze_steps)
-                        collapse_restore_count += 1
-                        last_collapse_restore_step = step
-                        steps_since_improve = 0
-                        tqdm.write(
-                            f"[step {step}] Collapse detected; restored best_step={best_step}, "
-                            f"shrunk optimizer LRs by {float(cfg.collapse_lr_shrink):.3g}, "
-                            f"froze seed motion until step {seed_freeze_until_step}, "
-                            f"anchors={anchor_source}, "
-                            f"restores={collapse_restore_count}."
-                        )
 
                     if step >= cfg.early_stop_start and steps_since_improve >= cfg.patience:
                         tqdm.write(
@@ -4774,6 +4644,7 @@ class NN_Trainer:
                     "L_Total": float(best_score),
                     "L_Volume": float(best_row["loss_vol"]) if best_row is not None else float("nan"),
                     "L_FEM": float(best_row["loss_fem"]) if best_row is not None else float("nan"),
+                    "L_Active": float(best_row["loss_seed_active"]) if best_row is not None else float("nan"),
                     "L_Strut": float(best_row["loss_strut"]) if best_row is not None else float("nan"),
                     "L_Bnd": float(best_row["loss_bnd"]) if best_row is not None else float("nan"),
                     "L_Rep": float(best_row["loss_rep"]) if best_row is not None else float("nan"),
