@@ -25,8 +25,10 @@ class VoronoiDecoder(nn.Module):
         n_seeds: int,
         eps: float = 1e-8,
         use_Metric_anisotropy: bool = True,
-        use_band_weighted_fiber_pairs: bool = False,
+        use_band_weighted_fiber_pairs: bool = True,
         use_boundary_tangent_fibers: bool = True,
+        fiber_band_prior_power: float = 2.0,
+        fiber_band_prior_floor: float = 0.05,
         pair_boost_strength: float = 0.05,
         pair_boost_enabled: bool = True,
         
@@ -103,6 +105,8 @@ class VoronoiDecoder(nn.Module):
         self.use_Metric_anisotropy = bool(use_Metric_anisotropy)
         self.use_band_weighted_fiber_pairs = bool(use_band_weighted_fiber_pairs)
         self.use_boundary_tangent_fibers = bool(use_boundary_tangent_fibers)
+        self.fiber_band_prior_power = float(fiber_band_prior_power)
+        self.fiber_band_prior_floor = float(fiber_band_prior_floor)
 
         self.w_min = float(w_min)
         self.w_max_ratio = float(w_max_ratio)
@@ -180,6 +184,12 @@ class VoronoiDecoder(nn.Module):
             raise ValueError(
                 f"duplicate_effect_floor must be in (0, 1], got {self.duplicate_effect_floor}"
             )
+        if self.fiber_band_prior_power <= 0.0:
+            raise ValueError(f"fiber_band_prior_power must be > 0, got {self.fiber_band_prior_power}")
+        if not (0.0 <= self.fiber_band_prior_floor <= 1.0):
+            raise ValueError(
+                f"fiber_band_prior_floor must be in [0, 1], got {self.fiber_band_prior_floor}"
+            )
 
         if boundary_solid_idx is None:
             boundary_solid_idx = torch.empty(0, dtype=torch.long)
@@ -236,6 +246,7 @@ class VoronoiDecoder(nn.Module):
     def _seed_activation_state(
         self,
         seeds: torch.Tensor,
+        hard_seed_mask: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         s = seeds.shape[0]
         if s <= 1:
@@ -257,7 +268,9 @@ class VoronoiDecoder(nn.Module):
                 * torch.sigmoid(v / temp)
                 * torch.sigmoid((1.0 - v) / temp)
             )
-            weights = (floor + (1.0 - floor) * domain_weight) * active.to(seeds.dtype)
+            weights = floor + (1.0 - floor) * domain_weight
+            if hard_seed_mask:
+                weights = weights * active.to(seeds.dtype)
             return weights, active
 
         dist = self._pairwise_seed_dist(seeds).to(device=seeds.device, dtype=seeds.dtype)
@@ -307,7 +320,8 @@ class VoronoiDecoder(nn.Module):
             * torch.sigmoid((1.0 - v) / temp)
         )
         weights = weights * (floor + (1.0 - floor) * domain_weight)
-        weights = weights * active.to(seeds.dtype)
+        if hard_seed_mask:
+            weights = weights * active.to(seeds.dtype)
         return weights, active
 
     def _pair_distinctness(
@@ -578,7 +592,9 @@ class VoronoiDecoder(nn.Module):
     def _principal_axial_direction(self, Q: torch.Tensor) -> torch.Tensor:
         evals, evecs = torch.linalg.eigh(Q)                # (N,2), (N,2,2)
         t_uv = evecs[..., -1]                              # principal eigenvector
-        return t_uv / torch.norm(t_uv, dim=-1, keepdim=True).clamp_min(self.eps)
+        t_uv = t_uv / torch.norm(t_uv, dim=-1, keepdim=True).clamp_min(self.eps)
+        has_orientation = evals.sum(dim=-1, keepdim=True) > self.eps
+        return torch.where(has_orientation, t_uv, torch.zeros_like(t_uv))
 
     def _axial_coherence_from_tensor(self, Q: torch.Tensor) -> torch.Tensor:
         evals = torch.linalg.eigvalsh(Q)
@@ -622,9 +638,16 @@ class VoronoiDecoder(nn.Module):
         if band_ij is None or pair_relevance is None:
             return soft_pair
 
-        # More selective than w_i w_j alone: prefer pairs that are both
-        # structurally active and locally close to their bisector.
-        raw_pair = band_ij * pair_relevance
+        # Prefer pairs whose visible band is present at this point, but keep a
+        # small soft-pair floor so clipped ends/junctions do not jump abruptly.
+        band_prior = band_ij.clamp(0.0, 1.0).pow(float(self.fiber_band_prior_power))
+        floor = torch.as_tensor(
+            self.fiber_band_prior_floor,
+            device=band_prior.device,
+            dtype=band_prior.dtype,
+        )
+        band_prior = floor + (1.0 - floor) * band_prior
+        raw_pair = soft_pair * band_prior
         pair_norm, ok_mask = self._normalize_upper_tri_pair_weights(raw_pair)
         return torch.where(ok_mask, pair_norm, soft_pair)
 
@@ -831,6 +854,7 @@ class VoronoiDecoder(nn.Module):
         w_geo: torch.Tensor,
         beta: float | torch.Tensor,
         seed_active_weights: torch.Tensor | None = None,
+        hard_seed_mask: bool = True,
     ):
         N, S = d.shape
 
@@ -845,9 +869,14 @@ class VoronoiDecoder(nn.Module):
                     f"seed_active_weights must have shape ({S},), got {tuple(seed_active_weights.shape)}"
                 )
 
-            g = seed_active_weights.to(device=d.device, dtype=d.dtype).clamp_min(self.eps)
+            g = seed_active_weights.to(device=d.device, dtype=d.dtype).clamp(0.0, 1.0)
             w_struct = w_soft * g.unsqueeze(0)
-            w_struct = w_struct / w_struct.sum(dim=1, keepdim=True).clamp_min(self.eps)
+            w_struct_sum = w_struct.sum(dim=1, keepdim=True)
+            w_struct = torch.where(
+                w_struct_sum > self.eps,
+                w_struct / w_struct_sum.clamp_min(self.eps),
+                w_soft,
+            )
 
         # --------------------------------------------------
         # 2. Pairwise distance difference
@@ -906,6 +935,10 @@ class VoronoiDecoder(nn.Module):
             device=d.device,
             dtype=d.dtype,
         )
+        if hard_seed_mask and seed_active_weights is not None:
+            active_seed = seed_active_weights.to(device=d.device).reshape(-1) > 0.0
+            active_pair = active_seed[:, None] & active_seed[None, :]
+            pair_distinctness = pair_distinctness * active_pair.to(dtype=d.dtype)
 
         # --------------------------------------------------
         # 6. Uniform-width bisector band
@@ -1047,6 +1080,7 @@ class VoronoiDecoder(nn.Module):
         boundary_width_raw: torch.Tensor | None = None,
         boundary_alpha_raw: torch.Tensor | None = None,
         boundary_beta_raw: torch.Tensor | None = None,
+        hard_seed_mask: bool = True,
     ) -> dict[str, torch.Tensor]:
         self._validate_inputs(
             points_uv=points_uv,
@@ -1084,12 +1118,19 @@ class VoronoiDecoder(nn.Module):
 
         logits = -d / tau
 
-        seed_active_weights, seed_active_mask = self._seed_activation_state(seeds=seeds)
+        seed_active_weights, seed_active_mask = self._seed_activation_state(
+            seeds=seeds,
+            hard_seed_mask=hard_seed_mask,
+        )
         logits = logits + torch.log(seed_active_weights.clamp_min(self.eps)).unsqueeze(0)
 
         logits = logits - logits.max(dim=-1, keepdim=True).values
         logits = logits.clamp(min=-80.0, max=0.0)
         w_soft = torch.softmax(logits, dim=-1)
+        if hard_seed_mask and bool(seed_active_mask.any()):
+            active_float = seed_active_mask.to(device=w_soft.device, dtype=w_soft.dtype).unsqueeze(0)
+            w_soft = w_soft * active_float
+            w_soft = w_soft / w_soft.sum(dim=-1, keepdim=True).clamp_min(self.eps)
 
         w_geo = self.width(w_raw, seeds=seeds)
 
@@ -1101,6 +1142,7 @@ class VoronoiDecoder(nn.Module):
             w_geo=w_geo,
             beta=self.beta,
             seed_active_weights=seed_active_weights,
+            hard_seed_mask=hard_seed_mask,
         )
 
         if self.use_boundary_attachment:
@@ -1237,6 +1279,7 @@ class VoronoiDecoder(nn.Module):
         boundary_width_raw=None,
         boundary_alpha_raw=None,
         boundary_beta_raw=None,
+        hard_seed_mask=False,
     ):
         return self.evaluate_at_uv(
             points_uv=points_uv,
@@ -1254,6 +1297,7 @@ class VoronoiDecoder(nn.Module):
             boundary_width_raw=boundary_width_raw,
             boundary_alpha_raw=boundary_alpha_raw,
             boundary_beta_raw=boundary_beta_raw,
+            hard_seed_mask=hard_seed_mask,
         )
 
 
@@ -1489,6 +1533,7 @@ class VoronoiModelVisualizer:
                 boundary_width_raw=self._to_tensor(boundary_width_raw, dtype=self.dtype),
                 boundary_alpha_raw=self._to_tensor(boundary_alpha_raw, dtype=self.dtype),
                 boundary_beta_raw=self._to_tensor(boundary_beta_raw, dtype=self.dtype),
+                hard_seed_mask=True,
             )
 
     def compute_case_volume(

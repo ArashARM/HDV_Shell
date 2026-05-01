@@ -1,6 +1,8 @@
 from dataclasses import dataclass
 import math
 import os
+import shutil
+import time
 from datetime import datetime
 
 import cv2
@@ -75,6 +77,9 @@ class TrainingConfig:
     width_warmup_ramp_frac: float = 0.20
     lam_width_active_hard_multiplier: float = 8.0
     decoder_raw_temp: float = 1.25
+    use_band_weighted_fiber_pairs: bool = True
+    fiber_band_prior_power: float = 2.0
+    fiber_band_prior_floor: float = 0.05
     w_head_bias_init: float | None = None
 
     comp_normalize_by: float | None = 1e10
@@ -169,6 +174,7 @@ class TrainingConfig:
     tb_log_histograms_every: int = 200
 
     MakeTimelaps: bool = True
+    timelapse_output_folder: str | None = None
 
     timelapse_frame_step: int = 20
     TM_laps_res_u: int = 100
@@ -301,6 +307,7 @@ class NN_Trainer:
         fem,
         shell_problem,
         config: TrainingConfig,
+        loading_img=None,
     ):
         self.generator = generator
         self.viz = viz
@@ -312,6 +319,9 @@ class NN_Trainer:
 
         self.last_fem_debug = {}
         self.fem_debug_history = []
+        self.timelapse_loading_img = (
+            None if loading_img is None else self._composite_to_white(np.asarray(loading_img))
+        )
 
         self.writer = None
         self.tensorboard_log_dir = None
@@ -853,6 +863,51 @@ class NN_Trainer:
             return float(cfg.tau_pred_start)
         return float(cfg.tau)
 
+    @staticmethod
+    def _format_elapsed_time(seconds: float) -> str:
+        seconds = max(0.0, float(seconds))
+        total = int(round(seconds))
+        hours, rem = divmod(total, 3600)
+        minutes, secs = divmod(rem, 60)
+        if hours > 0:
+            return f"{hours:d} h {minutes:02d} min {secs:02d} sec"
+        return f"{minutes:d} min {secs:02d} sec"
+
+    def _timelapse_geometry_summary(self, face_tensors) -> str:
+        if self.shell_problem is not None and getattr(self.shell_problem, "mesh", None) is not None:
+            fem_mesh = self.shell_problem.mesh
+            fem_elems = int(fem_mesh["nelx"]) * int(fem_mesh["nely"]) * int(fem_mesh["nelz"])
+        else:
+            fem_elems = 0
+
+        surface_pts = int(sum(int(ft["points_xyz"].shape[0]) for ft in face_tensors))
+
+        if self.shell_problem is not None and getattr(self.shell_problem, "brep_bbox", None) is not None:
+            bbox = self.shell_problem.brep_bbox
+            bbox_dims = (
+                float(bbox["xmax"] - bbox["xmin"]),
+                float(bbox["ymax"] - bbox["ymin"]),
+                float(bbox["zmax"] - bbox["zmin"]),
+            )
+        else:
+            xyz_all = torch.cat([ft["points_xyz"].detach() for ft in face_tensors], dim=0)
+            bbox_t = xyz_all.amax(dim=0) - xyz_all.amin(dim=0)
+            bbox_dims = tuple(float(v) for v in bbox_t.detach().cpu().tolist())
+
+        load_value = (
+            float(getattr(self.shell_problem, "Load_magnitude", 0.0))
+            if self.shell_problem is not None
+            else 0.0
+        )
+
+        bbox_text = " x ".join(f"{dim:.4g}" for dim in bbox_dims)
+        return (
+            f"BBox: {bbox_text}, "
+            f"F={load_value:.6g}, "
+            f"SurfacePts={surface_pts}, "
+            f"FEM elements={fem_elems}"
+        )
+
     def _timelapse_optimized_parameter_summary(self) -> str:
         cfg = self.cfg
         params = [
@@ -1324,6 +1379,9 @@ class NN_Trainer:
             w_max_ratio=self.cfg.w_max_ratio,
             duplicate_merge_sigma=self.cfg.duplicate_merge_sigma,
             raw_temp=self.cfg.decoder_raw_temp,
+            use_band_weighted_fiber_pairs=self.cfg.use_band_weighted_fiber_pairs,
+            fiber_band_prior_power=self.cfg.fiber_band_prior_power,
+            fiber_band_prior_floor=self.cfg.fiber_band_prior_floor,
             fixed_height=self.cfg.fixed_height,
 
             use_boundary_attachment=self.cfg.use_boundary_attachment,
@@ -1828,6 +1886,7 @@ class NN_Trainer:
             boundary_width_raw=pred.get("boundary_width_raw", None),
             boundary_alpha_raw=pred.get("boundary_alpha_raw", None),
             boundary_beta_raw=pred.get("boundary_beta_raw", None),
+            hard_seed_mask=True,
         )
 
         return {
@@ -2051,6 +2110,7 @@ class NN_Trainer:
         pred_list,
         render_cache,
         thr=0.5,
+        loading_img=None,
     ):
 
 
@@ -2162,7 +2222,7 @@ class NN_Trainer:
                 out_i=first_out,
                 seeds_i=seeds_list[first_seed_idx],
                 pred_i=pred_by_face_id[first_face_id],
-                window_size=(820, 820),
+                window_size=(1050, 1050),
             )
 
         def make_plotter(title, mode, window_size):
@@ -2259,23 +2319,32 @@ class NN_Trainer:
             ("3D Material Distribution | Side View", "density", "yz"),
             ("3D Material Distribution | Top View", "density", "xy"),
         ]
-        bottom_specs = [
-            ("3D Material Distribution | Perspective View", "density", "iso"),
-        ]
+        perspective_spec = ("3D Material Distribution | Perspective View", "density", "iso")
+        top_window_size = (560, 430)
+        bottom_window_size = (1050, 1050)
 
         top_imgs = []
+        if loading_img is not None:
+            loading_panel_img = cv2.resize(
+                loading_img,
+                top_window_size,
+                interpolation=cv2.INTER_AREA if loading_img.shape[1] > top_window_size[0] else cv2.INTER_CUBIC,
+            )
+            top_imgs.append(
+                self._add_panel_border(
+                    self._add_image_title(
+                        loading_panel_img,
+                        "Voxel Loading And Boundary Conditions",
+                    )
+                )
+            )
         for title, mode, view in top_specs:
-            pl = make_plotter(title, mode, window_size=(520, 280))
+            pl = make_plotter(title, mode, window_size=top_window_size)
             img = self._render_offscreen_plotter(pl, view)
             top_imgs.append(self._add_panel_border(self._add_image_title(img, title)))
             pl.close()
 
         bottom_imgs = []
-        for title, mode, view in bottom_specs:
-            pl = make_plotter(title, mode, window_size=(820, 820))
-            img = self._render_offscreen_plotter(pl, view)
-            bottom_imgs.append(self._add_panel_border(self._add_image_title(img, title)))
-            pl.close()
         if first_face_density_img is not None:
             bottom_imgs.append(
                 self._add_panel_border(
@@ -2285,6 +2354,11 @@ class NN_Trainer:
                         )
                 )
             )
+        title, mode, view = perspective_spec
+        pl = make_plotter(title, mode, window_size=bottom_window_size)
+        img = self._render_offscreen_plotter(pl, view)
+        bottom_imgs.append(self._add_panel_border(self._add_image_title(img, title)))
+        pl.close()
 
         col_gap = 22
         row_gap = 28
@@ -2682,6 +2756,7 @@ class NN_Trainer:
             boundary_width_raw=boundary_width_raw,
             boundary_alpha_raw=None,
             boundary_beta_raw=None,
+            hard_seed_mask=True,
         )
 
         self._require_decoder_keys(
@@ -3325,6 +3400,7 @@ class NN_Trainer:
   
     def train(self, shape_path, face_tensors):
         cfg = self.cfg
+        train_start_time = time.perf_counter()
 
         # validate the input shape tensors before training
         self._validate_face_tensors(face_tensors)
@@ -3405,17 +3481,32 @@ class NN_Trainer:
         # ------------------------------------------------------------
         recorder = None
         render_cache = None
+        timelapse_output_folder = None
         if cfg.MakeTimelaps:
             case_name = shape_path.stem
+            timelapse_output_folder = getattr(cfg, "timelapse_output_folder", None)
+            if timelapse_output_folder:
+                timelapse_output_folder = os.path.normpath(str(timelapse_output_folder))
+                os.makedirs(timelapse_output_folder, exist_ok=True)
+                frame_out_dir = os.path.join(timelapse_output_folder, "timelapse_frames")
+                video_path = os.path.join(timelapse_output_folder, case_name + "_timelapse.avi")
+            else:
+                frame_out_dir = "timelapse_frames"
+                video_path = case_name + "_timelapse.avi"
             # defining the timelapse recorder, which will save the training progress as a video. 
             # The output directory for the frames is "timelapse_frames", 
             # the video will be saved with the name "{case_name}_timelapse.avi". 
             # The frames per second (fps) for the video is set to 8.
+            geometry_summary = self._timelapse_geometry_summary(face_tensors)
             recorder = TimelapseRecorder(
-                out_dir="timelapse_frames",
-                video_path=case_name + "_timelapse.avi",
+                out_dir=frame_out_dir,
+                video_path=video_path,
                 fps=8,
-                header_title=f"File: {shape_path.name} |  Loading case: {cfg.LoadingCasee} | Target volfrac: {cfg.target_volfrac:.3f}",
+                header_title=(
+                    f"{shape_path.name} ({geometry_summary}) | "
+                    f"Loading case: {cfg.LoadingCasee} | "
+                    f"Target volfrac: {cfg.target_volfrac:.3f}"
+                ),
                 header_subtitle=self._timelapse_optimized_parameter_summary(),
             )
             # building a cache for rendering the timelapse, which likely includes precomputing certain data or settings that will be used 
@@ -3423,6 +3514,16 @@ class NN_Trainer:
             render_cache = self.build_timelapse_render_cache(
                 face_tensors=face_tensors,
             )
+            if self.timelapse_loading_img is None and self.shell_problem is not None:
+                try:
+                    self.timelapse_loading_img = self.shell_problem.show_voxels_surface_and_bc(
+                        return_img=True,
+                        off_screen=True,
+                        window_size=(520, 280),
+                    )
+                    self.timelapse_loading_img = self._composite_to_white(self.timelapse_loading_img)
+                except Exception as e:
+                    tqdm.write(f"Failed to render timelapse loading panel: {e}")
 
         # ------------------------------------------------------------
         # Loss normalizers
@@ -4318,6 +4419,7 @@ class NN_Trainer:
                             pred_list=pred_list,
                             render_cache=render_cache,
                             thr=getattr(cfg, "vis_thr", cfg.TM_laps_Thr),
+                            loading_img=self.timelapse_loading_img,
                         )
 
                         loss_dict = {
@@ -4518,9 +4620,63 @@ class NN_Trainer:
         # Final outputs
         # ------------------------------------------------------------
         with torch.no_grad():
-            final_shape_density = best_rho.clone()
-            final_shape_fiber_direction = (
-                None if best_fiber_surface is None else best_fiber_surface.clone()
+            hard_rho_acc = torch.zeros((vertices_number,), dtype=dtype, device=device)
+            hard_rho_wgt = torch.zeros((vertices_number,), dtype=dtype, device=device)
+            hard_fiber_acc = torch.zeros((vertices_number, 3), dtype=dtype, device=device)
+            hard_fiber_wgt = torch.zeros((vertices_number,), dtype=dtype, device=device)
+            pred_by_face_id = {p["face_id"]: p for p in best_pred} if best_pred else {}
+
+            for ft, decoder, A_local in zip(face_tensors, decoders, local_vertex_areas):
+                pred_i = pred_by_face_id.get(ft["face_id"], None)
+                if pred_i is None:
+                    continue
+
+                local_face_id = torch.zeros(ft["uv"].shape[0], dtype=torch.long, device=device)
+                boundary_uv_i = None
+                boundary_face_id_i = None
+                true_bidx_i = self._true_open_boundary_idx(ft)
+                if true_bidx_i.numel() > 0:
+                    boundary_uv_i = ft["uv"][true_bidx_i]
+                    boundary_face_id_i = torch.zeros(
+                        boundary_uv_i.shape[0],
+                        dtype=torch.long,
+                        device=device,
+                    )
+
+                tau_i = self._fallback_tau_value() if pred_i.get("tau") is None else pred_i["tau"]
+                hard_out_i = decoder.evaluate_at_uv(
+                    points_uv=ft["uv"],
+                    Xu=ft["Xu"],
+                    Xv=ft["Xv"],
+                    tau=tau_i,
+                    seeds_raw=pred_i["seeds_raw"],
+                    w_raw=pred_i["w_raw"],
+                    h_raw=pred_i.get("h_raw", None),
+                    theta=pred_i.get("theta", None),
+                    a_raw=pred_i.get("a_raw", None),
+                    points_face_id=local_face_id,
+                    boundary_uv=boundary_uv_i,
+                    boundary_face_id=boundary_face_id_i,
+                    boundary_width_raw=pred_i.get("boundary_width_raw", None),
+                    boundary_alpha_raw=pred_i.get("boundary_alpha_raw", None),
+                    boundary_beta_raw=pred_i.get("boundary_beta_raw", None),
+                    hard_seed_mask=True,
+                )
+
+                gidx = ft["global_vertex_idx"]
+                w_local = A_local.clamp_min(cfg.eps)
+                hard_rho_acc[gidx] += hard_out_i["rho"] * w_local
+                hard_rho_wgt[gidx] += w_local
+                hard_fiber_acc[gidx] += hard_out_i["fiber3d"] * w_local[:, None]
+                hard_fiber_wgt[gidx] += w_local
+
+            final_shape_density = hard_rho_acc / hard_rho_wgt.clamp_min(cfg.eps)
+            final_shape_fiber_direction = hard_fiber_acc / hard_fiber_wgt.clamp_min(cfg.eps)[:, None]
+            final_fiber_norm = final_shape_fiber_direction.norm(dim=1, keepdim=True)
+            final_shape_fiber_direction = torch.where(
+                final_fiber_norm > cfg.eps,
+                final_shape_fiber_direction / final_fiber_norm.clamp_min(cfg.eps),
+                torch.zeros_like(final_shape_fiber_direction),
             )
             seed_points_final = self._seed_points_xyz_all_faces(best_seeds, face_tensors)
 
@@ -4528,11 +4684,14 @@ class NN_Trainer:
                 mid_shape_density = final_shape_density.clone()
                 seed_points_mid = seed_points_final
 
+        computation_time_sec = time.perf_counter() - train_start_time
+
         tqdm.write(
             f"FINAL RETURNED: best_step={best_step}, best_score={best_score:.6f} | "
             f"vol_eff={best_vol_frac:.3e}, comp={best_comp:.3e}, w_geo={best_w_geo:.3e} | "
             f"active={float(best_active_count or 0.0):.0f}, inactive={float(best_inactive_count or 0.0):.0f} | "
-            f"source={'hard' if use_hard_result else 'global'}"
+            f"source={'hard' if use_hard_result else 'global'} | "
+            f"time={self._format_elapsed_time(computation_time_sec)}"
         )
 
         if self.writer is not None:
@@ -4599,9 +4758,6 @@ class NN_Trainer:
                     tuned_param_summary = {
                         "best_step": f"{int(best_step)}",
                         "active_seeds": f"{active_seed_count}/{total_seed_slots}",
-                        "Vol_total": f"{best_vol_total:.6g}",
-                        "Vol_internal": f"{best_vol_internal:.6g}",
-                        "Vol_eff": f"{best_vol_eff:.6g}",
                         "w": f"{float(best_w_geo):.6g}",
                         "tau": (
                             f"{(tau_mean if math.isfinite(tau_mean) else self._fallback_tau_value()):.6g}"
@@ -4626,7 +4782,8 @@ class NN_Trainer:
                     f"vol_total={best_vol_total:.6g} | "
                     f"vol_internal={best_vol_internal:.6g} | "
                     f"vol_eff={best_vol_eff:.6g} | "
-                    f"fem={float(best_comp):.6g}"
+                    f"fem={float(best_comp):.6g} | "
+                    f"compute_time={self._format_elapsed_time(computation_time_sec)}"
                 )
                 tuned_param_title = " | ".join(f"{key}={value}" for key, value in tuned_param_summary.items())
 
@@ -4636,8 +4793,9 @@ class NN_Trainer:
                     pred_list=best_pred,
                     render_cache=render_cache,
                     thr=getattr(cfg, "vis_thr", cfg.TM_laps_Thr),
+                    loading_img=self.timelapse_loading_img,
                 )
-                recorder.add_frame(
+                best_frame_path = recorder.add_frame(
                     step=cfg.num_steps + 1,
                     cad_img=best_cad_img,
                     loss_dict=best_loss_dict,
@@ -4649,6 +4807,11 @@ class NN_Trainer:
                     results_title="Results",
                     results_text=results_text,
                 )
+                if timelapse_output_folder:
+                    shutil.copy2(
+                        best_frame_path,
+                        os.path.join(timelapse_output_folder, "best_result_frame.png"),
+                    )
                 recorder.build_video(hold_last_seconds=10.0)
             except Exception as e:
                 tqdm.write(f"Failed to build timelapse video: {e}")

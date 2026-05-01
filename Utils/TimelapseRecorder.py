@@ -89,8 +89,8 @@ class TimelapseRecorder:
             if not chunk:
                 continue
             if "=" in chunk:
-                for key, value in re.findall(r"([A-Za-z0-9_Δ]+)\s*=\s*([^\s|]+)", chunk):
-                    metrics.append((key, value))
+                key, value = chunk.split("=", 1)
+                metrics.append((key.strip(), value.strip()))
             else:
                 metrics.append(("stage", chunk))
         return metrics
@@ -108,6 +108,11 @@ class TimelapseRecorder:
             "Vol_eff": "Eff_VolFrac",
             "W": "Mean Width",
             "bw": "Bw",
+            "compute_time": "Com. Time",
+            "fem_elems": "FEM Elems",
+            "mesh_pts": "SurfacePts",
+            "bbox": "BBox",
+            "load_F": "F",
             "Δrho": "Delta Rho",
             "Δseed": "Delta Seed",
             "grad_mean": "Mean Grad.",
@@ -166,14 +171,25 @@ class TimelapseRecorder:
         font = cv2.FONT_HERSHEY_SIMPLEX
 
         if self.header_title:
+            max_title_width = self.frame_width - (2 * x)
+            title_scale = 1.0
+            title_thickness = 2
+            title_width = cv2.getTextSize(
+                self.header_title,
+                font,
+                title_scale,
+                title_thickness,
+            )[0][0]
+            if title_width > max_title_width:
+                title_scale = max(0.68, title_scale * max_title_width / max(title_width, 1))
             cv2.putText(
                 canvas,
                 self.header_title,
                 (x, title_y),
                 font,
-                1.0,
+                title_scale,
                 text,
-                2,
+                title_thickness,
                 cv2.LINE_AA,
             )
 
@@ -228,26 +244,26 @@ class TimelapseRecorder:
         )
 
         fig = plt.figure(figsize=(width / 100, height / 100), dpi=100, facecolor=fig_bg)
-        if highlight_best and results_title is not None:
+        if highlight_best:
             gs = fig.add_gridspec(
-                3,
+                2,
                 1,
-                height_ratios=[0.62, 1.55, 1.0],
-                left=0.10,
+                height_ratios=[1.42, 1.24],
+                left=0.18,
                 right=0.96,
                 top=0.94,
                 bottom=0.07,
-                hspace=0.24,
+                hspace=0.20,
             )
-            ax_results = fig.add_subplot(gs[0, 0])
-            ax = fig.add_subplot(gs[1, 0])
-            ax_text = fig.add_subplot(gs[2, 0])
+            ax_results = None
+            ax = fig.add_subplot(gs[0, 0])
+            ax_text = fig.add_subplot(gs[1, 0])
         else:
             gs = fig.add_gridspec(
                 2,
                 1,
                 height_ratios=[1.8, 1.0],
-                left=0.10,
+                left=0.16,
                 right=0.96,
                 top=0.94,
                 bottom=0.07,
@@ -290,106 +306,27 @@ class TimelapseRecorder:
                 weight="semibold",
             )
 
-        if ax_results is not None:
-            ax_results.axis("off")
-            result_metrics = self._parse_summary_metrics(results_text)
-
-            result_banner = plt.Rectangle(
-                (0.0, 0.72),
-                0.94,
-                0.28,
-                transform=ax_results.transAxes,
-                facecolor=header_bg,
-                edgecolor=header_bg,
-                linewidth=0.0,
-            )
-            ax_results.add_patch(result_banner)
-            ax_results.text(
-                0.02,
-                0.86,
-                results_title,
-                fontsize=15,
-                weight="bold",
-                va="center",
-                ha="left",
-                color=header_fg,
-                transform=ax_results.transAxes,
-            )
-
-            result_card = plt.Rectangle(
-                (0.0, 0.02),
-                0.94,
-                0.60,
-                transform=ax_results.transAxes,
-                facecolor=card_bg,
-                edgecolor=card_edge,
-                linewidth=2.0,
-            )
-            ax_results.add_patch(result_card)
-
-            if result_metrics:
-                n_cols = min(2, len(result_metrics))
-                n_rows = int(np.ceil(len(result_metrics) / n_cols))
-                for idx, (key, value) in enumerate(result_metrics):
-                    col_idx = idx // n_rows
-                    row_idx = idx % n_rows
-                    left_x = 0.04 + col_idx * 0.44
-                    right_x = left_x + 0.16
-                    y0 = 0.42 - row_idx * 0.24
-                    ax_results.text(
-                        left_x,
-                        y0,
-                        self._format_metric_label(key),
-                        fontsize=11,
-                        weight="semibold",
-                        va="center",
-                        ha="left",
-                        color="#374151",
-                        transform=ax_results.transAxes,
-                    )
-                    ax_results.text(
-                        right_x,
-                        y0,
-                        value,
-                        fontsize=11,
-                        va="center",
-                        ha="left",
-                        color="#111827",
-                        family="monospace",
-                        transform=ax_results.transAxes,
-                    )
-
         ax_text.axis("off")
         metrics = self._parse_summary_metrics(title_text)
-
-        if highlight_best:
-            banner = plt.Rectangle(
-                (0.0, 0.88),
-                0.94,
-                0.12,
-                transform=ax_text.transAxes,
-                facecolor=header_bg,
-                edgecolor=header_bg,
-                linewidth=0.0,
-            )
-            ax_text.add_patch(banner)
+        if highlight_best and results_text:
+            metrics = self._parse_summary_metrics(results_text) + metrics
 
         ax_text.text(
-            0.02 if highlight_best else 0.0,
-            0.94 if highlight_best else 1.0,
-            summary_title,
-            fontsize=16,
+            0.0,
+            1.0,
+            "Best Result Summary" if highlight_best else summary_title,
+            fontsize=18 if highlight_best else 16,
             weight="bold",
             va="top",
             ha="left",
-            color=header_fg,
+            color="#111827",
             transform=ax_text.transAxes,
         )
 
         card_x = 0.0
         card_y = 0.08
         card_w = 0.94
-        card_h = 0.76
+        card_h = 0.82 if highlight_best else 0.76
         card = plt.Rectangle(
             (card_x, card_y),
             card_w,
@@ -405,21 +342,21 @@ class TimelapseRecorder:
         if rows:
             n_cols = 2 if len(rows) > 7 else 1
             n_rows = int(np.ceil(len(rows) / n_cols))
-            start_y = card_y + card_h - 0.12
-            row_step = min(0.14, (card_h - 0.12) / max(n_rows, 1))
+            start_y = card_y + card_h - (0.12 if highlight_best else 0.12)
+            row_step = min(0.16 if highlight_best else 0.14, (card_h - 0.13) / max(n_rows, 1))
 
             for idx, (key, value) in enumerate(rows):
                 col_idx = idx // n_rows
                 row_idx = idx % n_rows
                 left_x = card_x + 0.04 + col_idx * 0.46
-                right_x = left_x + 0.18
+                right_x = left_x + (0.20 if highlight_best else 0.18)
                 y = start_y - row_idx * row_step
                 ax_text.text(
                     left_x,
                     y,
                     self._format_metric_label(key),
-                    fontsize=11,
-                    weight="semibold",
+                    fontsize=12 if highlight_best else 11,
+                    weight="bold" if highlight_best else "semibold",
                     va="center",
                     ha="left",
                     color="#374151",
@@ -429,10 +366,11 @@ class TimelapseRecorder:
                     right_x,
                     y,
                     value,
-                    fontsize=11,
+                    fontsize=12 if highlight_best else 11,
                     va="center",
                     ha="left",
                     color="#111827",
+                    weight="bold" if highlight_best else "normal",
                     family="monospace",
                     transform=ax_text.transAxes,
                 )
@@ -486,7 +424,7 @@ class TimelapseRecorder:
             loss_dict=loss_dict,
             title_text=summary_text,
             height=h_left,
-            width=max(920, int(0.55 * w_left)),
+            width=max(780, int(0.34 * w_left)),
             highlight_best=highlight_best,
             chart_title=chart_title,
             summary_title=summary_title,
@@ -550,6 +488,7 @@ class TimelapseRecorder:
         frame_path = os.path.join(self.out_dir, f"frame_{step:06d}.png")
         cv2.imwrite(frame_path, canvas)
         self.frame_paths.append(frame_path)
+        return frame_path
 
     def build_video(self, delete_frames=True, hold_last_seconds=0.0):
         if not self.frame_paths:

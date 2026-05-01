@@ -1070,6 +1070,63 @@ class CADTensorGenerator:
         return areas
 
     @staticmethod
+    def mesh_edge_length_stats(points_xyz: torch.Tensor, faces_ijk: torch.Tensor) -> dict:
+        if faces_ijk.numel() == 0 or points_xyz.numel() == 0:
+            return {
+                "min": 0.0,
+                "max": 0.0,
+                "mean": 0.0,
+                "median": 0.0,
+                "num_edges": 0,
+            }
+
+        edges = torch.cat(
+            (
+                faces_ijk[:, [0, 1]],
+                faces_ijk[:, [1, 2]],
+                faces_ijk[:, [2, 0]],
+            ),
+            dim=0,
+        )
+        edges = torch.sort(edges, dim=1).values
+        edges = torch.unique(edges, dim=0)
+
+        valid = (
+            (edges[:, 0] >= 0)
+            & (edges[:, 1] >= 0)
+            & (edges[:, 0] < points_xyz.shape[0])
+            & (edges[:, 1] < points_xyz.shape[0])
+        )
+        edges = edges[valid]
+        if edges.numel() == 0:
+            return {
+                "min": 0.0,
+                "max": 0.0,
+                "mean": 0.0,
+                "median": 0.0,
+                "num_edges": 0,
+            }
+
+        lengths = torch.linalg.norm(points_xyz[edges[:, 1]] - points_xyz[edges[:, 0]], dim=1)
+        lengths = lengths[torch.isfinite(lengths) & (lengths > 0.0)]
+        if lengths.numel() == 0:
+            return {
+                "min": 0.0,
+                "max": 0.0,
+                "mean": 0.0,
+                "median": 0.0,
+                "num_edges": 0,
+            }
+
+        return {
+            "min": float(lengths.min().detach().cpu().item()),
+            "max": float(lengths.max().detach().cpu().item()),
+            "mean": float(lengths.mean().detach().cpu().item()),
+            "median": float(lengths.median().detach().cpu().item()),
+            "num_edges": int(lengths.numel()),
+        }
+
+    @staticmethod
     def material_amount_from_vertex_density(
         density_v: torch.Tensor,
         faces_ijk: torch.Tensor,
@@ -1202,12 +1259,14 @@ class CADTensorGenerator:
             boundary_idx_ring1 = self.k_ring(boundary_idx, adj, k=input_ring)
             boundary_idx_ring2 = self.k_ring(boundary_idx, adj, k=8)
             face_areas = self.precompute_face_areas(points_xyz, faces_ijk)
+            mesh_edge_stats = self.mesh_edge_length_stats(points_xyz, faces_ijk)
             min_vol_frac = self.compute_min_fraction(points_xyz, faces_ijk, boundary_idx_ring1)
         else:
             boundary_idx = self._empty_long(device)
             boundary_idx_ring1 = self._empty_long(device)
             boundary_idx_ring2 = self._empty_long(device)
             face_areas = torch.empty((0,), dtype=torch.float32, device=device)
+            mesh_edge_stats = self.mesh_edge_length_stats(points_xyz, faces_ijk)
             min_vol_frac = 0.0
 
         row0 = mesh_face_df.iloc[0]
@@ -1230,6 +1289,11 @@ class CADTensorGenerator:
             "faces_ijk": faces_ijk,
             "pv_faces": pv_faces,
             "face_areas": face_areas,
+            "mesh_edge_min": mesh_edge_stats["min"],
+            "mesh_edge_max": mesh_edge_stats["max"],
+            "mesh_edge_mean": mesh_edge_stats["mean"],
+            "mesh_edge_median": mesh_edge_stats["median"],
+            "mesh_edge_num_edges": mesh_edge_stats["num_edges"],
             "boundary_idx": boundary_idx,
             "boundary_idx_ring1": boundary_idx_ring1,
             "boundary_idx_ring2": boundary_idx_ring2,
@@ -1285,12 +1349,14 @@ class CADTensorGenerator:
             boundary_idx_ring1 = self.k_ring(boundary_idx, adj, k=input_ring)
             boundary_idx_ring2 = self.k_ring(boundary_idx, adj, k=8)
             face_areas = self.precompute_face_areas(points_xyz, faces_ijk)
+            mesh_edge_stats = self.mesh_edge_length_stats(points_xyz, faces_ijk)
             min_vol_frac = self.compute_min_fraction(points_xyz, faces_ijk, boundary_idx_ring1)
         else:
             boundary_idx = self._empty_long(self.device)
             boundary_idx_ring1 = self._empty_long(self.device)
             boundary_idx_ring2 = self._empty_long(self.device)
             face_areas = torch.empty((0,), dtype=torch.float32, device=self.device)
+            mesh_edge_stats = self.mesh_edge_length_stats(points_xyz, faces_ijk)
             min_vol_frac = 0.0
 
         face_id = torch.tensor(
@@ -1336,6 +1402,12 @@ class CADTensorGenerator:
             }
 
         print("MinVolFrac:", min_vol_frac)
+        print(
+            "Mesh edge length:",
+            f"min={mesh_edge_stats['min']:.6g}",
+            f"max={mesh_edge_stats['max']:.6g}",
+            f"median={mesh_edge_stats['median']:.6g}",
+        )
 
         return {
             "uv": uv,
@@ -1350,6 +1422,11 @@ class CADTensorGenerator:
             "boundary_idx_ring1": boundary_idx_ring1,
             "boundary_idx_ring2": boundary_idx_ring2,
             "min_vol_frac": min_vol_frac,
+            "mesh_edge_min": mesh_edge_stats["min"],
+            "mesh_edge_max": mesh_edge_stats["max"],
+            "mesh_edge_mean": mesh_edge_stats["mean"],
+            "mesh_edge_median": mesh_edge_stats["median"],
+            "mesh_edge_num_edges": mesh_edge_stats["num_edges"],
             "BBX": BBX,
             "face_tensors": face_tensors,
             "face_tensors_by_id": face_tensors_by_id,
