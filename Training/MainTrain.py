@@ -21,6 +21,23 @@ except Exception:
 
 import matplotlib.pyplot as plt
 
+try:
+    from .Loss_Boundary import Loss_Boundary
+    from .Loss_FEM import Loss_FEM
+    from .Loss_SeedActive import Loss_SeedActive
+    from .Loss_Volume import Loss_Volume
+    from .Loss_Wactive import Loss_Wactive
+    from .Loss_rep import Loss_rep
+    from .Loss_strut import Loss_strut
+except ImportError:
+    from Loss_Boundary import Loss_Boundary
+    from Loss_FEM import Loss_FEM
+    from Loss_SeedActive import Loss_SeedActive
+    from Loss_Volume import Loss_Volume
+    from Loss_Wactive import Loss_Wactive
+    from Loss_rep import Loss_rep
+    from Loss_strut import Loss_strut
+
 
 @dataclass
 class TrainingConfig:
@@ -100,6 +117,9 @@ class TrainingConfig:
     tau_anneal_start_frac: float = 0.0
     tau_anneal_ramp_frac: float = 0.5
     beta: float = 0.05
+    density_projection_strength: float = 0.0
+    density_projection_threshold: float = 0.5
+    density_projection_gamma: float = 0.05
     seed_anchor_momentum: float = 0.20
     seed_anchor_warmup_frac: float = 0.05
     use_rolling_seed_anchors: bool = True
@@ -116,6 +136,11 @@ class TrainingConfig:
     allow_seed_outside_domain: bool = True
     allow_seed_outside_domain_warmup_frac: float = 0.50
     seed_domain_margin: float = 0.25
+    use_seed_domain_mask: bool = True
+    seed_domain_mask_threshold: float = 0.5
+    seed_domain_temp: float = 0.05
+    seed_domain_mask_support_scale: float = 2.5
+    seed_domain_mask_max_points: int = 2048
 
     lr_seed_refine: float = 1e-1
     lr_delta_head: float = 2e-4
@@ -201,6 +226,15 @@ class TrainingConfig:
             )
         if self.tau_anneal_final is not None and self.tau_anneal_final <= 0.0:
             raise ValueError(f"tau_anneal_final must be > 0, got {self.tau_anneal_final}")
+        if not (0.0 <= self.density_projection_strength <= 1.0):
+            raise ValueError(
+                "density_projection_strength must be in [0,1], "
+                f"got {self.density_projection_strength}"
+            )
+        if self.density_projection_gamma <= 0.0:
+            raise ValueError(
+                f"density_projection_gamma must be > 0, got {self.density_projection_gamma}"
+            )
         if not (0.0 <= self.seed_anchor_momentum <= 1.0):
             raise ValueError(
                 f"seed_anchor_momentum must be in [0,1], got {self.seed_anchor_momentum}"
@@ -233,6 +267,23 @@ class TrainingConfig:
             )
         if self.seed_domain_margin < 0.0:
             raise ValueError(f"seed_domain_margin must be >= 0, got {self.seed_domain_margin}")
+        if not (0.0 <= self.seed_domain_mask_threshold <= 1.0):
+            raise ValueError(
+                "seed_domain_mask_threshold must be in [0,1], "
+                f"got {self.seed_domain_mask_threshold}"
+            )
+        if self.seed_domain_temp <= 0.0:
+            raise ValueError(f"seed_domain_temp must be > 0, got {self.seed_domain_temp}")
+        if self.seed_domain_mask_support_scale <= 0.0:
+            raise ValueError(
+                "seed_domain_mask_support_scale must be > 0, "
+                f"got {self.seed_domain_mask_support_scale}"
+            )
+        if self.seed_domain_mask_max_points < 1:
+            raise ValueError(
+                "seed_domain_mask_max_points must be >= 1, "
+                f"got {self.seed_domain_mask_max_points}"
+            )
         if self.seed_offset_scale_start is not None and self.seed_offset_scale_start <= 0.0:
             raise ValueError(
                 f"seed_offset_scale_start must be > 0, got {self.seed_offset_scale_start}"
@@ -291,6 +342,13 @@ class NN_Trainer:
 
         self.last_fem_debug = {}
         self.fem_debug_history = []
+        self.loss_volume = Loss_Volume()
+        self.loss_fem = Loss_FEM(self)
+        self.loss_strut = Loss_strut()
+        self.loss_wactive = Loss_Wactive()
+        self.loss_boundary = Loss_Boundary()
+        self.loss_rep = Loss_rep()
+        self.loss_seed_active = Loss_SeedActive()
         self.timelapse_loading_img = (
             None if loading_img is None else self._composite_to_white(np.asarray(loading_img))
         )
@@ -588,9 +646,12 @@ class NN_Trainer:
         target_volfrac: float,
         eps: float = 1e-12,
     ) -> torch.Tensor:
-        vol_frac = (rho * A_v).sum() / (A_v.sum() + eps)
-        vol_loss = (vol_frac - target_volfrac) ** 2
-        return vol_loss
+        return Loss_Volume.constant_height(
+            rho=rho,
+            A_v=A_v,
+            target_volfrac=target_volfrac,
+            eps=eps,
+        )
 
     @staticmethod
     def powered_volume_fraction(
@@ -599,8 +660,7 @@ class NN_Trainer:
         power: float = 2.0,
         eps: float = 1e-12,
     ) -> torch.Tensor:
-        rho_eff = rho.clamp(0.0, 1.0).pow(power)
-        return (rho_eff * A_v).sum() / (A_v.sum() + eps)
+        return Loss_Volume.powered_fraction(rho=rho, A_v=A_v, power=power, eps=eps)
 
     @classmethod
     def volume_loss_powered(
@@ -611,9 +671,13 @@ class NN_Trainer:
         power: float = 2.0,
         eps: float = 1e-12,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        vol_frac_eff = cls.powered_volume_fraction(rho=rho, A_v=A_v, power=power, eps=eps)
-        loss = (vol_frac_eff - target_volfrac) ** 2
-        return loss, vol_frac_eff
+        return Loss_Volume().powered(
+            rho=rho,
+            A_v=A_v,
+            target_volfrac=target_volfrac,
+            power=power,
+            eps=eps,
+        )
 
     @staticmethod
     def ramp_weight(step: int, total_steps: int, start_frac: float, ramp_frac: float) -> float:
@@ -719,41 +783,18 @@ class NN_Trainer:
         w_min: float,
         eps: float = 1e-8,
     ) -> torch.Tensor:
-        if w_raw.ndim != 2 or w_raw.shape[0] != w_raw.shape[1]:
-            raise ValueError(f"w_raw must be square, got {tuple(w_raw.shape)}")
-        if seeds.ndim != 2 or seeds.shape[1] != 2:
-            raise ValueError(f"seeds must be (S,2), got {tuple(seeds.shape)}")
-
-        s = w_raw.shape[0]
-        if s < 2:
-            return torch.zeros((), dtype=w_raw.dtype, device=w_raw.device)
-
-        tri_mask = torch.triu(torch.ones((s, s), dtype=torch.bool, device=w_raw.device), diagonal=1)
-        if seed_active_weights is None:
-            target_frac_eff = float(width_target_frac)
-            active_pair = tri_mask
-        else:
-            g = seed_active_weights.to(device=w_raw.device, dtype=w_raw.dtype).reshape(-1)
-            active_seed_mask = g >= float(active_threshold)
-            if not bool(active_seed_mask.any()):
-                active_seed_mask = g > eps
-            if not bool(active_seed_mask.any()):
-                active_seed_mask = torch.zeros_like(g, dtype=torch.bool)
-                active_seed_mask[torch.argmax(g)] = True
-            active_pair = (active_seed_mask[:, None] & active_seed_mask[None, :] & tri_mask)
-            active_seed_count = max(int(active_seed_mask.sum().item()), 1)
-            sparse_ratio = float(s) / float(active_seed_count)
-            target_frac_eff = float(width_target_frac) * (sparse_ratio ** float(width_target_sparse_boost))
-            target_frac_eff = min(max(target_frac_eff, 0.0), float(width_target_frac_max))
-
-        if not bool(active_pair.any()):
-            return torch.zeros((), dtype=w_raw.dtype, device=w_raw.device)
-
-        target_frac_eff = min(max(float(target_frac_eff), 1e-4), 1.0 - 1e-4)
-        target_logit = math.log(target_frac_eff / (1.0 - target_frac_eff))
-        logits = w_raw / max(float(raw_temp), eps)
-        shortfall = torch.relu(float(target_logit) - logits[active_pair])
-        return shortfall.square().mean()
+        return Loss_Wactive()(
+            w_raw=w_raw,
+            seeds=seeds,
+            seed_active_weights=seed_active_weights,
+            width_target_frac=width_target_frac,
+            width_target_sparse_boost=width_target_sparse_boost,
+            width_target_frac_max=width_target_frac_max,
+            active_threshold=active_threshold,
+            raw_temp=raw_temp,
+            w_min=w_min,
+            eps=eps,
+        )
 
     def _tau_for_step(self, step: int) -> float:
         cfg = self.cfg
@@ -888,10 +929,14 @@ class NN_Trainer:
         boundary_weight: float = 0.20,
         eps: float = 1e-12,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        weight = 1.0 - rho_boundary + boundary_weight * rho_boundary
-        vol_frac_eff = (rho * weight * A_v).sum() / ((weight * A_v).sum() + eps)
-        loss = (vol_frac_eff - target_volfrac) ** 2
-        return loss, vol_frac_eff
+        return Loss_Volume.with_boundary_discount(
+            rho=rho,
+            A_v=A_v,
+            rho_boundary=rho_boundary,
+            target_volfrac=target_volfrac,
+            boundary_weight=boundary_weight,
+            eps=eps,
+        )
 
     @staticmethod
     def seed_repulsion_term(
@@ -901,31 +946,13 @@ class NN_Trainer:
         min_dist: float | None = None,
         eps: float = 1e-12,
     ) -> torch.Tensor:
-        S = seeds.shape[0]
-        if S < 2:
-            return torch.zeros((), dtype=seeds.dtype, device=seeds.device)
-
-        d = torch.cdist(seeds, seeds)
-        pair_mask = torch.triu(
-            torch.ones((S, S), dtype=torch.bool, device=seeds.device),
-            diagonal=1,
+        return Loss_rep()(
+            seeds=seeds,
+            seed_active_weights=seed_active_weights,
+            sigma=sigma,
+            min_dist=min_dist,
+            eps=eps,
         )
-
-        if min_dist is not None and min_dist > 0.0:
-            target = torch.as_tensor(min_dist, dtype=seeds.dtype, device=seeds.device)
-            penalty = torch.relu(target - d).pow(2) / (target.pow(2) + eps)
-        else:
-            penalty = torch.exp(-d.pow(2) / (sigma**2 + eps))
-
-        if seed_active_weights is None:
-            return penalty[pair_mask].max()
-
-        g = seed_active_weights.view(-1).clamp(0.0, 1.0)
-        G = g[:, None] * g[None, :]
-        active_pair = pair_mask & (G > eps)
-        if not bool(active_pair.any()):
-            return torch.zeros((), dtype=seeds.dtype, device=seeds.device)
-        return (G * penalty)[active_pair].max()
 
     @staticmethod
     def boundary_repulsion_term(
@@ -935,19 +962,13 @@ class NN_Trainer:
         margin: float = 0.05,
         eps: float = 1e-12,
     ) -> torch.Tensor:
-        if boundary_uv is None or boundary_uv.numel() == 0:
-            return torch.zeros((), dtype=seeds.dtype, device=seeds.device)
-
-        dmin = torch.cdist(seeds, boundary_uv).amin(dim=1)
-        penalty = torch.exp(-dmin / (margin + eps))
-
-        if seed_active_weights is None:
-            return penalty.mean()
-
-        g = seed_active_weights.view(-1)
-        penalty =(g * penalty).sum() / (g.sum() + eps)
-        penalty =torch.zeros((), dtype=seeds.dtype, device=seeds.device) 
-        return penalty
+        return Loss_Boundary()(
+            seeds=seeds,
+            boundary_uv=boundary_uv,
+            seed_active_weights=seed_active_weights,
+            margin=margin,
+            eps=eps,
+        )
 
     @staticmethod
     def compliance_loss(
@@ -955,10 +976,7 @@ class NN_Trainer:
         normalize_by: float | None = None,
         eps: float = 1e-12,
     ) -> torch.Tensor:
-        comp = comp.reshape(())
-        if normalize_by is not None:
-            return comp / (float(normalize_by) + eps)
-        return comp
+        return Loss_FEM.compliance(comp=comp, normalize_by=normalize_by, eps=eps)
 
     @staticmethod
     def hollow_cell_loss(
@@ -973,44 +991,18 @@ class NN_Trainer:
         lam_edge: float = 1.0,
         eps: float = 1e-12,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Encourage a hollow Voronoi strut network.
-
-        - Cell interiors should be void: rho -> 0
-        - Voronoi edges/junctions should contain material: rho >= rho_edge_min
-        - Boundary attachment rho_b is exempt from void penalty
-        """
-
-        rho = rho.clamp(0.0, 1.0)
-
-        # Interior mask:
-        # max_w high means this point strongly belongs to one seed = inside a cell.
-        max_w = w_soft.max(dim=1).values
-        void_mask = torch.sigmoid((max_w - void_threshold) / (temp + eps))
-
-        # Edge mask:
-        # ambiguity high means multiple seeds compete = near Voronoi edge/junction.
-        ambiguity = (1.0 - w_soft.pow(2).sum(dim=1)).clamp(0.0, 1.0)
-        edge_mask = torch.sigmoid((ambiguity - edge_threshold) / (temp + eps))
-
-        if rho_b is not None:
-            rho_b = rho_b.to(device=rho.device, dtype=rho.dtype).clamp(0.0, 1.0)
-
-            # Do not punish boundary-attached material as filled interior.
-            void_mask = void_mask * (1.0 - rho_b)
-
-            # Boundary attachment is also valid structural support.
-            edge_mask = torch.maximum(edge_mask, rho_b)
-
-        loss_void = (void_mask * rho.pow(2)).sum() / (void_mask.sum() + eps)
-
-        loss_edge = (
-            edge_mask * torch.relu(rho_edge_min - rho).pow(2)
-        ).sum() / (edge_mask.sum() + eps)
-
-        loss = lam_void * loss_void + lam_edge * loss_edge
-
-        return loss, loss_edge, loss_void, edge_mask, void_mask
+        return Loss_strut.with_components(
+            rho=rho,
+            w_soft=w_soft,
+            rho_b=rho_b,
+            void_threshold=void_threshold,
+            edge_threshold=edge_threshold,
+            temp=temp,
+            rho_edge_min=rho_edge_min,
+            lam_void=lam_void,
+            lam_edge=lam_edge,
+            eps=eps,
+        )
 
     @staticmethod
     def _scalar_tensor_is_finite(x: torch.Tensor | float | int) -> bool:
@@ -1049,6 +1041,15 @@ class NN_Trainer:
         eps: float = 1e-12,
         save_debug_history: bool = True,
     ) -> dict:
+        return self.loss_fem.evaluate(
+            rho_surface=rho_surface,
+            fiber_surface=fiber_surface,
+            comp_normalize_by=comp_normalize_by,
+            density_floor=density_floor,
+            eps=eps,
+            save_debug_history=save_debug_history,
+        )
+
         device = rho_surface.device
         dtype = rho_surface.dtype
 
@@ -1191,7 +1192,7 @@ class NN_Trainer:
         zero = torch.zeros((), dtype=rho.dtype, device=rho.device)
 
         if w_vol != 0.0:
-            loss_vol = self.volume_loss_constant_height(
+            loss_vol = self.loss_volume(
                 rho=rho,
                 A_v=A_v,
                 target_volfrac=target_volfrac,
@@ -1201,7 +1202,7 @@ class NN_Trainer:
             loss_vol = zero
 
         if w_seed != 0.0:
-            loss_seed = self.seed_repulsion_term(
+            loss_seed = self.loss_rep(
                 seeds=seeds,
                 seed_active_weights=seed_active_weights,
                 sigma=sigma,
@@ -1211,7 +1212,7 @@ class NN_Trainer:
             loss_seed = zero
 
         if w_boundary != 0.0:
-            loss_boundary = self.boundary_repulsion_term(
+            loss_boundary = self.loss_boundary(
                 seeds=seeds,
                 boundary_uv=boundary_uv,
                 seed_active_weights=seed_active_weights,
@@ -1244,7 +1245,7 @@ class NN_Trainer:
             if fiber_surface is None:
                 raise ValueError("fiber_surface must be provided when w_fem != 0")
 
-            fem_out = self.fem_loss(
+            fem_out = self.loss_fem.evaluate(
                 rho_surface=rho,
                 fiber_surface=fiber_surface,
                 comp_normalize_by=comp_normalize_by,
@@ -1294,6 +1295,10 @@ class NN_Trainer:
             face_v_periodic=face_v_periodic,
             w_min=self.cfg.w_min,
             w_max_ratio=self.cfg.w_max_ratio,
+            beta=self.cfg.beta,
+            density_projection_strength=self.cfg.density_projection_strength,
+            density_projection_threshold=self.cfg.density_projection_threshold,
+            density_projection_gamma=self.cfg.density_projection_gamma,
             duplicate_merge_sigma=self.cfg.duplicate_merge_sigma,
             raw_temp=self.cfg.decoder_raw_temp,
             use_band_weighted_fiber_pairs=self.cfg.use_band_weighted_fiber_pairs,
@@ -1377,38 +1382,46 @@ class NN_Trainer:
                 {"params": ppnet.mlp.parameters(), "lr": cfg.lr_mlp},
             ])
 
-            if hasattr(ppnet, "w_head"):
-                param_groups.append({"params": ppnet.w_head.parameters(), "lr": cfg.lr_w_head})
+            w_head = getattr(ppnet, "w_head", None)
+            if w_head is not None:
+                param_groups.append({"params": w_head.parameters(), "lr": cfg.lr_w_head})
 
-            if (self.cfg.fixed_height is None) and hasattr(ppnet, "h_head"):
-                param_groups.append({"params": ppnet.h_head.parameters(), "lr": cfg.lr_h_head})
+            h_head = getattr(ppnet, "h_head", None)
+            if (self.cfg.fixed_height is None) and h_head is not None:
+                param_groups.append({"params": h_head.parameters(), "lr": cfg.lr_h_head})
 
             if cfg.use_Metric_anisotropy:
-                if hasattr(ppnet, "theta_head"):
-                    param_groups.append({"params": ppnet.theta_head.parameters(), "lr": cfg.lr_mlp})
-                if hasattr(ppnet, "a_head"):
-                    param_groups.append({"params": ppnet.a_head.parameters(), "lr": cfg.lr_mlp})
+                theta_head = getattr(ppnet, "theta_head", None)
+                if theta_head is not None:
+                    param_groups.append({"params": theta_head.parameters(), "lr": cfg.lr_mlp})
+                a_head = getattr(ppnet, "a_head", None)
+                if a_head is not None:
+                    param_groups.append({"params": a_head.parameters(), "lr": cfg.lr_mlp})
 
             if cfg.predict_boundary_params:
-                if hasattr(ppnet, "boundary_width_head"):
+                boundary_width_head = getattr(ppnet, "boundary_width_head", None)
+                if boundary_width_head is not None:
                     param_groups.append({
-                        "params": ppnet.boundary_width_head.parameters(),
+                        "params": boundary_width_head.parameters(),
                         "lr": cfg.lr_boundary_heads,
                     })
-                if hasattr(ppnet, "boundary_alpha_head"):
+                boundary_alpha_head = getattr(ppnet, "boundary_alpha_head", None)
+                if boundary_alpha_head is not None:
                     param_groups.append({
-                        "params": ppnet.boundary_alpha_head.parameters(),
+                        "params": boundary_alpha_head.parameters(),
                         "lr": cfg.lr_boundary_heads,
                     })
-                if hasattr(ppnet, "boundary_beta_head"):
+                boundary_beta_head = getattr(ppnet, "boundary_beta_head", None)
+                if boundary_beta_head is not None:
                     param_groups.append({
-                        "params": ppnet.boundary_beta_head.parameters(),
+                        "params": boundary_beta_head.parameters(),
                         "lr": cfg.lr_boundary_heads,
                     })
 
-            if cfg.predict_tau and hasattr(ppnet, "tau_head"):
+            tau_head = getattr(ppnet, "tau_head", None)
+            if cfg.predict_tau and tau_head is not None:
                 param_groups.append({
-                    "params": ppnet.tau_head.parameters(),
+                    "params": tau_head.parameters(),
                     "lr": cfg.lr_mlp,
                 })
 
@@ -1706,6 +1719,65 @@ class NN_Trainer:
             return float(fallback)
         return float(max(scale * float(spacing.item()), 1e-6))
 
+    def _seed_domain_mask_for_face(self, ft):
+        cfg = self.cfg
+        if not bool(cfg.use_seed_domain_mask):
+            return None
+        cached = ft.get("_seed_domain_mask_callable", None)
+        if cached is not None:
+            return cached
+        mask_grid = ft.get("seed_domain_mask_grid", None)
+        if mask_grid is not None:
+            return mask_grid
+
+        uv_face = ft.get("seed_domain_uv_support", ft["uv"])
+        if uv_face.numel() == 0:
+            return None
+
+        uv_support = uv_face.detach()
+        max_points = int(cfg.seed_domain_mask_max_points)
+        if uv_support.shape[0] > max_points:
+            sample_idx = torch.linspace(
+                0,
+                uv_support.shape[0] - 1,
+                max_points,
+                device=uv_support.device,
+            ).round().to(torch.long)
+            uv_support = uv_support[sample_idx]
+
+        sigma_value = ft.get("seed_domain_sigma", None)
+        if sigma_value is None:
+            sigma = self._estimate_uv_mask_tol(
+                uv_support,
+                u_periodic=bool(ft.get("u_periodic", False)),
+                v_periodic=bool(ft.get("v_periodic", False)),
+                fallback=float(cfg.boundary_margin),
+                scale=float(cfg.seed_domain_mask_support_scale),
+            )
+        elif torch.is_tensor(sigma_value):
+            sigma = float(sigma_value.detach().cpu().item())
+        else:
+            sigma = float(sigma_value)
+        sigma = max(float(sigma), float(cfg.eps))
+        u_periodic = bool(ft.get("u_periodic", False))
+        v_periodic = bool(ft.get("v_periodic", False))
+
+        def mask_fn(seeds):
+            support = uv_support.to(device=seeds.device, dtype=seeds.dtype)
+            diff = seeds.unsqueeze(1) - support.unsqueeze(0)
+            if u_periodic:
+                du = diff[..., 0]
+                diff[..., 0] = du - torch.round(du)
+            if v_periodic:
+                dv = diff[..., 1]
+                diff[..., 1] = dv - torch.round(dv)
+            dmin = torch.norm(diff, dim=-1).amin(dim=1)
+            sigma_t = torch.as_tensor(sigma, device=seeds.device, dtype=seeds.dtype)
+            return torch.exp(-0.5 * (dmin / sigma_t.clamp_min(cfg.eps)).pow(2))
+
+        ft["_seed_domain_mask_callable"] = mask_fn
+        return mask_fn
+
     @staticmethod
     def _wrapped_grid_next(idx, size, periodic):
         nxt = idx + 1
@@ -1783,6 +1855,7 @@ class NN_Trainer:
                 "local_face_id": local_face_id,
                 "boundary_uv": boundary_uv_i,
                 "boundary_face_id": boundary_face_id_i,
+                "seed_domain_mask": self._seed_domain_mask_for_face(ft),
                 "faces_ijk": ft["faces_ijk"],
             })
 
@@ -1807,6 +1880,9 @@ class NN_Trainer:
             boundary_alpha_raw=pred.get("boundary_alpha_raw", None),
             boundary_beta_raw=pred.get("boundary_beta_raw", None),
             hard_seed_mask=True,
+            seed_domain_mask=render_cache.get("seed_domain_mask", None),
+            seed_domain_mask_threshold=self.cfg.seed_domain_mask_threshold,
+            seed_domain_temp=self.cfg.seed_domain_temp,
         )
 
         return {
@@ -2677,6 +2753,9 @@ class NN_Trainer:
             boundary_alpha_raw=None,
             boundary_beta_raw=None,
             hard_seed_mask=True,
+            seed_domain_mask=self._seed_domain_mask_for_face(ft),
+            seed_domain_mask_threshold=self.cfg.seed_domain_mask_threshold,
+            seed_domain_temp=self.cfg.seed_domain_temp,
         )
 
         self._require_decoder_keys(
@@ -3512,13 +3591,17 @@ class NN_Trainer:
             dynamic_ncols=True,
         ) as pbar:
             for step in pbar:
-                # if cfg.predict_tau is none , always use cfg.tau as the tau value.
-                # if cfg.predict_tau is true,  it returns  cfg.tau_predic_start
-                # if Cfg.predict_tau is false, it returns annealed value.
+                
+                
+                # if cfg.allow_seed_outside_domain is true and the warmup period is over, allow seeds to be placed outside the domain
                 allow_seed_outside_domain_step = self.allow_seed_outside_domain_for_step(step)
                 for ppnet in ppnets:
                     ppnet.allow_seed_outside_domain = allow_seed_outside_domain_step
+                # if cfg.predict_tau is none , always use cfg.tau as the tau value.
+                # if cfg.predict_tau is true,  it returns  cfg.tau_predic_start
+                # if Cfg.predict_tau is false, it returns annealed value.
                 tau_step = self._tau_for_step(step)
+                # if cfg.use_hard_refine_step is true, it will return true when the current step is greater than or equal to the step defined by hard_refine_start_frac, which is a fraction of the total number of steps.
                 use_hard_refine_step = step >= int(round(float(cfg.hard_refine_start_frac) * float(cfg.num_steps)))
                 rho_acc = torch.zeros((vertices_number,), dtype=dtype, device=device)
                 rho_wgt = torch.zeros((vertices_number,), dtype=dtype, device=device)
@@ -3566,15 +3649,16 @@ class NN_Trainer:
                 active_weight_max_list = []
                 active_face_count = 0
 
-                # ----------------------------------------------------
-                # Per-face forward pass
-                # ----------------------------------------------------
+                # Activate losses based on their lambda values in the configuration (cfg). If a lambda value is set to 0.0, the corresponding loss will not be computed during training
                 compute_rep_loss = cfg.lam_rep != 0.0
                 compute_bnd_loss = cfg.lam_bnd != 0.0
                 compute_strut_loss = cfg.lam_strut != 0.0
                 compute_vol_loss = cfg.lam_vol != 0.0
                 compute_width_active_loss = cfg.lam_width_active != 0.0
                 compute_seed_active_loss = cfg.lam_seed_active != 0.0
+
+                # Determine whether to update seed anchors based on the configuration and current step, seed anchors are reference points used in the training process.
+                # if it is on, it will update the seed anchors after a certain warmup period, and the update is allowed based on the configuration settings.
                 update_seed_anchors = (
                     cfg.use_rolling_seed_anchors
                     and step >= int(round(float(cfg.seed_anchor_warmup_frac) * float(cfg.num_steps)))
@@ -3637,6 +3721,7 @@ class NN_Trainer:
                             dtype=torch.long,
                             device=device,
                         )
+                    seed_domain_mask_i = self._seed_domain_mask_for_face(ft)
 
                     decoder_out = decoder(
                         points_uv=ft["uv"],
@@ -3654,6 +3739,9 @@ class NN_Trainer:
                         boundary_width_raw=boundary_width_raw_i,
                         boundary_alpha_raw=boundary_alpha_raw_i,
                         boundary_beta_raw=boundary_beta_raw_i,
+                        seed_domain_mask=seed_domain_mask_i,
+                        seed_domain_mask_threshold=cfg.seed_domain_mask_threshold,
+                        seed_domain_temp=cfg.seed_domain_temp,
                     )
 
                     self._require_decoder_keys(
@@ -3701,14 +3789,12 @@ class NN_Trainer:
 
                     if compute_seed_active_loss:
                         target_active = float(cfg.min_active_seeds or total_seed_i)
-                        active_mass = seed_active_weights_i.clamp(0.0, 1.0).sum()
-                        target_active_t = torch.as_tensor(
-                            target_active,
-                            device=device,
-                            dtype=dtype,
-                        )
                         seed_active_terms.append(
-                            torch.relu(target_active_t - active_mass).pow(2)
+                            self.loss_seed_active(
+                                seed_active_weights=seed_active_weights_i,
+                                target_active=target_active,
+                                eps=cfg.eps,
+                            )
                         )
 
                     boundary_width_i = decoder_out["boundary_width"]
@@ -3737,10 +3823,10 @@ class NN_Trainer:
 
                     if compute_width_active_loss:
                         width_active_terms.append(
-                            self.active_width_loss(
+                            self.loss_wactive(
                                 w_raw=w_raw_i,
                                 seeds=seeds_i,
-                                seed_active_weights=None,
+                                seed_active_weights=seed_active_weights_i,
                                 width_target_frac=cfg.width_target_frac,
                                 width_target_sparse_boost=cfg.width_target_sparse_boost,
                                 width_target_frac_max=cfg.width_target_frac_max,
@@ -3807,7 +3893,7 @@ class NN_Trainer:
 
                     if compute_rep_loss:
                         rep_terms.append(
-                            self.seed_repulsion_term(
+                            self.loss_rep(
                                 seeds=seeds_i,
                                 seed_active_weights=None,
                                 sigma=cfg.seed_repulsion_sigma,
@@ -3818,7 +3904,7 @@ class NN_Trainer:
 
                     if compute_bnd_loss:
                         bnd_terms.append(
-                            self.boundary_repulsion_term(
+                            self.loss_boundary(
                                 seeds=seeds_i,
                                 boundary_uv=boundary_uv_i,
                                 seed_active_weights=None,
@@ -3851,7 +3937,7 @@ class NN_Trainer:
                             loss_strut_void_i,
                             edge_mask_i,
                             void_mask_i,
-                        ) = self.hollow_cell_loss(
+                        ) = self.loss_strut.with_components(
                             rho=rho_i,
                             w_soft=w_soft_i,
                             rho_b=rho_b_i,
@@ -3931,20 +4017,20 @@ class NN_Trainer:
                 loss_vol = zero
 
                 if compute_vol_loss:
-                    loss_vol_v = self.volume_loss_constant_height(
+                    loss_vol_v = self.loss_volume(
                         rho=rho_v_all,
                         A_v=A_v,
                         target_volfrac=cfg.target_volfrac,
                         eps=cfg.eps,
                     )
-                    loss_vol_total = self.volume_loss_constant_height(
+                    loss_vol_total = self.loss_volume(
                         rho=rho,
                         A_v=A_v,
                         target_volfrac=cfg.target_volfrac,
                         eps=cfg.eps,
                     )
 
-                    loss_vol_eff_v, vol_frac_eff = self.volume_loss_powered(
+                    loss_vol_eff_v, vol_frac_eff = self.loss_volume.powered(
                         rho=rho_v_all,
                         A_v=A_v,
                         target_volfrac=cfg.target_volfrac,
@@ -3957,7 +4043,7 @@ class NN_Trainer:
                         start_frac=cfg.sharp_vol_start_frac,
                         ramp_frac=cfg.sharp_vol_ramp_frac,
                     )
-                    loss_vol_sharp, vol_frac_sharp = self.volume_loss_constant_height(
+                    loss_vol_sharp, vol_frac_sharp = self.loss_volume(
                         rho=rho_s_all,
                         A_v=A_v,
                         target_volfrac=cfg.target_volfrac,
@@ -3972,7 +4058,7 @@ class NN_Trainer:
                     )
 
                     if cfg.use_boundary_weighted_volume:
-                        loss_vol_base, vol_frac_weighted = self.volume_loss_with_boundary_discount(
+                        loss_vol_base, vol_frac_weighted = self.loss_volume.with_boundary_discount(
                             rho=rho,
                             A_v=A_v,
                             rho_boundary=rho_boundary,
@@ -3980,7 +4066,7 @@ class NN_Trainer:
                             boundary_weight=cfg.boundary_vol_weight,
                             eps=cfg.eps,
                         )
-                        loss_vol_eff_weighted, vol_frac_eff = self.volume_loss_powered(
+                        loss_vol_eff_weighted, vol_frac_eff = self.loss_volume.powered(
                             rho=rho,
                             A_v=(1.0 - rho_boundary + cfg.boundary_vol_weight * rho_boundary) * A_v,
                             target_volfrac=cfg.target_volfrac,
@@ -3988,7 +4074,7 @@ class NN_Trainer:
                             eps=cfg.eps,
                         )
                         sharp_weights = (1.0 - rho_boundary + cfg.boundary_vol_weight * rho_boundary) * A_v
-                        loss_vol_sharp, vol_frac_sharp = self.volume_loss_constant_height(
+                        loss_vol_sharp, vol_frac_sharp = self.loss_volume(
                             rho=rho_s_all,
                             A_v=sharp_weights,
                             target_volfrac=cfg.target_volfrac,
@@ -4020,7 +4106,7 @@ class NN_Trainer:
                 }
 
                 if cfg.lam_fem != 0.0:
-                    fem_out = self.fem_loss(
+                    fem_out = self.loss_fem.evaluate(
                         rho_surface=rho,
                         fiber_surface=fiber_surface,
                         comp_normalize_by=cfg.comp_normalize_by,
@@ -4132,8 +4218,9 @@ class NN_Trainer:
                         else:
                             if use_hard_refine_step:
                                 for ppnet in ppnets:
-                                    if cfg.freeze_tau_head_during_hard_refine and hasattr(ppnet, "tau_head"):
-                                        for p in ppnet.tau_head.parameters():
+                                    tau_head = getattr(ppnet, "tau_head", None)
+                                    if cfg.freeze_tau_head_during_hard_refine and tau_head is not None:
+                                        for p in tau_head.parameters():
                                             p.grad = None
                             opt.step()
 
@@ -4208,6 +4295,7 @@ class NN_Trainer:
                             tqdm.write(
                                 f"New best_step={best_step} | "
                                 f"best_score={best_score:.6f} | "
+                                f"best_active_count={best_active_count:.1f} | "
                                 f"vol_eff={best_vol_frac:.6f} | "
                                 f"comp={best_comp:.6e} | "
                                 f"w={best_w_geo:.6e}"
@@ -4396,11 +4484,11 @@ class NN_Trainer:
                             f"L_total={row['L_total']:.4e} | "
                             f"L_vol={row['loss_vol']:.3e} "
                             f"L_fem={row['loss_fem']:.3e} "
-                            f"L_active={row['loss_seed_active']:.3e}"
+                            f"L_wact={row['loss_width_active']:.3e} "
+                            f"L_active={row['loss_seed_active']:.3e} "
                             f"L_strut={row['loss_strut']:.3e} "
                             f"L_rep={row['loss_rep']:.3e} "
-                            f"L_bnd={row['loss_bnd']:.3e} "
-                            f"L_wact={row['loss_width_active']:.3e} | "
+                            f"L_bnd={row['loss_bnd']:.3e} |"
                             f"vol={row['vol_frac']:.3f} "
                             f"vol_eff={row['vol_frac_eff']:.3f} "
                             f"(/{cfg.target_volfrac:.3f}) "
@@ -4512,6 +4600,7 @@ class NN_Trainer:
                         dtype=torch.long,
                         device=device,
                     )
+                seed_domain_mask_i = self._seed_domain_mask_for_face(ft)
 
                 tau_i = self._fallback_tau_value() if pred_i.get("tau") is None else pred_i["tau"]
                 hard_out_i = decoder.evaluate_at_uv(
@@ -4531,6 +4620,9 @@ class NN_Trainer:
                     boundary_alpha_raw=pred_i.get("boundary_alpha_raw", None),
                     boundary_beta_raw=pred_i.get("boundary_beta_raw", None),
                     hard_seed_mask=True,
+                    seed_domain_mask=seed_domain_mask_i,
+                    seed_domain_mask_threshold=cfg.seed_domain_mask_threshold,
+                    seed_domain_temp=cfg.seed_domain_temp,
                 )
 
                 gidx = ft["global_vertex_idx"]

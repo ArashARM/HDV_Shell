@@ -49,6 +49,8 @@ class CADTensorGenerator:
         freeform_mesher: str = "auto",
         gmsh_size_scale: float = 1.0,
         gmsh_algorithm: int = 6,
+        seed_domain_mask_res: int = 128,
+        seed_domain_trim_tol: float = 1e-7,
     ):
         self.deflection = float(deflection)
         self.angle = float(angle)
@@ -60,6 +62,8 @@ class CADTensorGenerator:
         self.freeform_mesher = str(freeform_mesher).lower()
         self.gmsh_size_scale = float(gmsh_size_scale)
         self.gmsh_algorithm = int(gmsh_algorithm)
+        self.seed_domain_mask_res = int(seed_domain_mask_res)
+        self.seed_domain_trim_tol = float(seed_domain_trim_tol)
 
     # =========================================================================
     # 1) Load + face helpers
@@ -1127,6 +1131,72 @@ class CADTensorGenerator:
         }
 
     @staticmethod
+    def uv_support_radius(
+        uv: torch.Tensor,
+        u_periodic: bool = False,
+        v_periodic: bool = False,
+        fallback: float = 0.05,
+        scale: float = 2.5,
+        max_points: int = 2048,
+        chunk_size: int = 512,
+    ) -> float:
+        if uv.shape[0] < 2:
+            return float(fallback)
+
+        uv_cpu = uv.detach().to(device="cpu", dtype=torch.float32)
+        n = uv_cpu.shape[0]
+        if n > max_points:
+            sample_idx = torch.linspace(0, n - 1, max_points).round().long()
+            uv_cpu = uv_cpu[sample_idx]
+            n = uv_cpu.shape[0]
+
+        min_vals = []
+        for start in range(0, n, chunk_size):
+            q = uv_cpu[start:start + chunk_size]
+            diff = q.unsqueeze(1) - uv_cpu.unsqueeze(0)
+            if u_periodic:
+                du = diff[..., 0]
+                diff[..., 0] = du - torch.round(du)
+            if v_periodic:
+                dv = diff[..., 1]
+                diff[..., 1] = dv - torch.round(dv)
+
+            dist = torch.norm(diff, dim=-1)
+            rows = q.shape[0]
+            dist[torch.arange(rows), start:start + rows] = float("inf")
+            min_vals.append(dist.min(dim=1).values)
+
+        spacing = torch.cat(min_vals, dim=0).median()
+        if not torch.isfinite(spacing):
+            return float(fallback)
+        return float(max(scale * float(spacing.item()), 1e-6))
+
+    @classmethod
+    def build_seed_domain_mask_grid(
+        cls,
+        face,
+        u_raw_bounds: tuple[float, float],
+        v_raw_bounds: tuple[float, float],
+        res: int = 128,
+        trim_tol: float = 1e-7,
+    ) -> np.ndarray:
+        res = int(res)
+        if res < 2:
+            raise ValueError(f"seed domain mask resolution must be >= 2, got {res}")
+
+        u_lin = np.linspace(0.0, 1.0, res, dtype=np.float32)
+        v_lin = np.linspace(0.0, 1.0, res, dtype=np.float32)
+        uu, vv = np.meshgrid(u_lin, v_lin, indexing="xy")
+        uv_norm = np.stack([uu.reshape(-1), vv.reshape(-1)], axis=1)
+        uv_raw = cls.uv_norm_to_raw_from_bounds(
+            uv_norm=uv_norm,
+            u_raw_bounds=u_raw_bounds,
+            v_raw_bounds=v_raw_bounds,
+        )
+        inside = cls.classify_uv_points_on_face(face, uv_raw, tol=trim_tol)
+        return inside.astype(np.float32).reshape(res, res)
+
+    @staticmethod
     def material_amount_from_vertex_density(
         density_v: torch.Tensor,
         faces_ijk: torch.Tensor,
@@ -1210,7 +1280,7 @@ class CADTensorGenerator:
 
         return faces
 
-    def _build_single_face_tensor_dict(self, mesh_face_df, faces_face_df, input_ring: int):
+    def _build_single_face_tensor_dict(self, mesh_face_df, faces_face_df, input_ring: int, face=None):
         mesh_face_df = mesh_face_df.sort_values("gvid").reset_index(drop=True)
         device = self.device
 
@@ -1270,6 +1340,29 @@ class CADTensorGenerator:
             min_vol_frac = 0.0
 
         row0 = mesh_face_df.iloc[0]
+        u_periodic = bool(row0["face_u_periodic"])
+        v_periodic = bool(row0["face_v_periodic"])
+        u_raw_bounds = (float(row0["face_u_raw_min"]), float(row0["face_u_raw_max"]))
+        v_raw_bounds = (float(row0["face_v_raw_min"]), float(row0["face_v_raw_max"]))
+        seed_domain_sigma = self.uv_support_radius(
+            uv,
+            u_periodic=u_periodic,
+            v_periodic=v_periodic,
+            fallback=0.05,
+            scale=2.5,
+        )
+        seed_domain_mask_grid = None
+        seed_domain_mask_kind = "sampled_uv_gaussian"
+        if face is not None and int(self.seed_domain_mask_res) >= 2:
+            mask_grid_np = self.build_seed_domain_mask_grid(
+                face=face,
+                u_raw_bounds=u_raw_bounds,
+                v_raw_bounds=v_raw_bounds,
+                res=int(self.seed_domain_mask_res),
+                trim_tol=float(self.seed_domain_trim_tol),
+            )
+            seed_domain_mask_grid = torch.tensor(mask_grid_np, dtype=torch.float32, device=device)
+            seed_domain_mask_kind = "cad_trim_grid"
         bbox = {
             "xmin": float(row0["bbox_xmin"]),
             "xmax": float(row0["bbox_xmax"]),
@@ -1299,12 +1392,16 @@ class CADTensorGenerator:
             "boundary_idx_ring2": boundary_idx_ring2,
             "min_vol_frac": float(min_vol_frac),
             "BBX": bbox,
-            "u_periodic": bool(row0["face_u_periodic"]),
-            "v_periodic": bool(row0["face_v_periodic"]),
+            "u_periodic": u_periodic,
+            "v_periodic": v_periodic,
             "u_period": None if pd.isna(row0["face_u_period"]) else float(row0["face_u_period"]),
             "v_period": None if pd.isna(row0["face_v_period"]) else float(row0["face_v_period"]),
-            "u_raw_bounds": (float(row0["face_u_raw_min"]), float(row0["face_u_raw_max"])),
-            "v_raw_bounds": (float(row0["face_v_raw_min"]), float(row0["face_v_raw_max"])),
+            "u_raw_bounds": u_raw_bounds,
+            "v_raw_bounds": v_raw_bounds,
+            "seed_domain_uv_support": uv.detach().clone(),
+            "seed_domain_sigma": torch.tensor(seed_domain_sigma, dtype=torch.float32, device=device),
+            "seed_domain_mask_grid": seed_domain_mask_grid,
+            "seed_domain_mask_kind": seed_domain_mask_kind,
             "global_vertex_idx": global_vertex_idx,
             "global_face_idx": global_face_idx,
             "num_vertices": num_verts,
@@ -1313,6 +1410,7 @@ class CADTensorGenerator:
 
     def generate_input_tensors_from_dataframes(self,shape_path, mesh_df, faces_df, input_ring: int):
         mesh_df_ord = mesh_df.sort_values("gvid").reset_index(drop=True)
+        shape = self.load_shape(shape_path) if shape_path is not None else None
 
         uv = torch.tensor(
             mesh_df_ord[["u", "v"]].to_numpy(),
@@ -1390,7 +1488,13 @@ class CADTensorGenerator:
             }
 
             faces_face_df = faces_df[faces_df["face_id"] == fid].copy().reset_index(drop=False)
-            face_dict = self._build_single_face_tensor_dict(grp.copy(), faces_face_df, input_ring=input_ring)
+            face = None if shape is None else self.get_face_by_id(shape, fid)
+            face_dict = self._build_single_face_tensor_dict(
+                grp.copy(),
+                faces_face_df,
+                input_ring=input_ring,
+                face=face,
+            )
 
             face_tensors.append(face_dict)
             face_tensors_by_id[fid] = face_dict
