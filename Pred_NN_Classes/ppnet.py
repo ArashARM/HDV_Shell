@@ -3,7 +3,6 @@ import torch.nn as nn
 
 from .anisotropy_predictor import AnisotropyPredictor
 from .boundary_predictor import BoundaryPredictor
-from .context_encoder import ContextEncoder
 from .height_predictor import HeightPredictor
 from .seed_identity import SeedIdentityEmbedding
 from .seed_refiner import SeedRefiner
@@ -16,13 +15,12 @@ class PPNet(nn.Module):
     """
     PPNet predicts the full VoronoiDecoder control dictionary.
 
-    The model uses one shared context backbone, then small specialized heads for
+    The model uses a learned latent vector, then small specialized heads for
     seeds, pair widths, height, anisotropy, boundary parameters, and tau.
     """
 
     def __init__(
         self,
-        context_dim,
         n_seeds,
         hidden=256,
 
@@ -74,7 +72,8 @@ class PPNet(nn.Module):
 
         self.enable_checks = enable_checks
 
-        self.context_encoder = ContextEncoder(context_dim, hidden)
+        # This model is used as an optimization parameterization for a single problem instance, so no external context conditioning is required.
+        self.global_latent = nn.Parameter(torch.zeros(1, hidden))
         self.seed_identity = SeedIdentityEmbedding(self.n_seeds, self.seed_id_dim)
         self.seed_refiner = SeedRefiner(
             hidden=hidden,
@@ -117,10 +116,6 @@ class PPNet(nn.Module):
         )
 
     # Compatibility properties for existing training code.
-    @property
-    def mlp(self):
-        return self.context_encoder.mlp
-
     @property
     def seed_id_embed(self):
         return self.seed_identity.embedding
@@ -168,17 +163,16 @@ class PPNet(nn.Module):
     def _check(self, tensor, name):
         check_finite(tensor, name, self.enable_checks)
 
-    def forward(self, context, uv_init, offset_scale=1.0):
-        batch_size = context.shape[0]
+    def forward(self, uv_init, offset_scale=1.0):
         n_seeds = self.n_seeds
         eps_uv = self.eps_uv
 
-        self._check(context, "context")
-
         # uv_init may be shared across the batch or already batched.
         if uv_init.dim() == 2:
+            batch_size = 1
             uv_init_b = uv_init.unsqueeze(0).expand(batch_size, -1, -1)
         elif uv_init.dim() == 3:
+            batch_size = uv_init.shape[0]
             uv_init_b = uv_init
         else:
             raise ValueError("uv_init must be (S,2) or (B,S,2)")
@@ -189,8 +183,7 @@ class PPNet(nn.Module):
             uv_base = uv_init_b.clamp(eps_uv, 1.0 - eps_uv)
         self._check(uv_base, "uv_base")
 
-        # context -> ContextEncoder -> z
-        z = self.context_encoder(context)
+        z = self.global_latent.expand(batch_size, -1)
         self._check(z, "z")
 
         # z + uv + seed_id_features -> SeedRefiner -> h, seeds_uv

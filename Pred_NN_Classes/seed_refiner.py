@@ -35,7 +35,7 @@ class SeedRefiner(nn.Module):
     def forward(self, z, uv_base, seed_id_features=None, offset_scale=1.0):
         batch_size, n_seeds, _ = uv_base.shape
 
-        # Per-seed input combines shared context, seed UV, and optional seed ID.
+        # Per-seed input combines the shared latent, seed UV, and optional seed ID.
         z_rep = z.unsqueeze(1).expand(-1, n_seeds, -1)
         if seed_id_features is not None:
             seed_in = torch.cat([z_rep, uv_base, seed_id_features], dim=-1)

@@ -52,8 +52,8 @@ Backpropagation (Update Neural Parameters)
 
 * Inputs:
 
-  * Latent context vector
   * Initial seed positions (UV)
+  * Learned per-instance latent parameter
 * Outputs:
 
   * Refined Voronoi seeds

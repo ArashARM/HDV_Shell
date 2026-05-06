@@ -106,8 +106,6 @@ class TrainingConfig:
     skip_bad_fem_steps: bool = True
 
     num_steps: int = 10000
-    context_vector_size: int = 8
-
     tau: float = 0.02
     tau_pred_start: float = 0.02
     tau_pred_min: float = 1e-4
@@ -1320,7 +1318,6 @@ class NN_Trainer:
         ).to(device)
 
         ppnet = self.ppnet_cls(
-            context_dim=self.cfg.context_vector_size,
             n_seeds=seed_number,
             use_Metric_anisotropy=self.cfg.use_Metric_anisotropy,
             predict_boundary_params=self.cfg.predict_boundary_params,
@@ -1379,7 +1376,7 @@ class NN_Trainer:
             param_groups.extend([
                 {"params": seed_refine_params, "lr": cfg.lr_seed_refine},
                 {"params": ppnet.delta_head.parameters(), "lr": cfg.lr_delta_head},
-                {"params": ppnet.mlp.parameters(), "lr": cfg.lr_mlp},
+                {"params": [ppnet.global_latent], "lr": cfg.lr_mlp},
             ])
 
             w_head = getattr(ppnet, "w_head", None)
@@ -3441,10 +3438,6 @@ class NN_Trainer:
         uv_init_list = self._init_face_seeds(face_tensors)
         uv_anchor_list = [uv_i.clone() for uv_i in uv_init_list]
 
-        contexts = [
-            torch.zeros(1, cfg.context_vector_size, device=device, dtype=dtype)
-            for _ in face_tensors
-        ]
         # Build the optimizer for all ppnet parameters. It includes the learning parameters,  optimizer type and learning rate are determined by the configuration (cfg).
         opt = self._build_optimizer(ppnets, decoders)
         # getatt(A,"S",None) is try to reach attribute "S" in object A, if it doesn't exist, it will return None instead of raising an error. 
@@ -3667,16 +3660,15 @@ class NN_Trainer:
                 seed_offset_scale_step = self.seed_offset_scale_for_step(step)
                 uv_anchor_next_list = []
 
-                for ft, decoder, ppnet, uv_anchor_i, context_i, A_local, face_weight_i in zip(
+                for ft, decoder, ppnet, uv_anchor_i, A_local, face_weight_i in zip(
                     face_tensors,
                     decoders,
                     ppnets,
                     uv_anchor_list,
-                    contexts,
                     local_vertex_areas,
                     local_face_weights,
                 ):
-                    pred_i = ppnet(context_i, uv_anchor_i, offset_scale=seed_offset_scale_step)
+                    pred_i = ppnet(uv_anchor_i, offset_scale=seed_offset_scale_step)
 
                     seeds_raw_i = pred_i["seeds_raw"][0]
                     if cfg.project_seed_spacing_each_step:

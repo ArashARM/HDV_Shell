@@ -8,10 +8,9 @@ from Pred_NN_Classes import PPNet
 
 
 def main():
-    model = PPNet(context_dim=8, n_seeds=5)
-    context = torch.randn(2, 8)
+    model = PPNet(n_seeds=5)
     uv_init = torch.rand(5, 2)
-    out = model(context, uv_init)
+    out = model(uv_init)
 
     expected_keys = {
         "seeds_raw",
